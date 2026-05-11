@@ -486,6 +486,20 @@ def spyre_softplus(
     return torch.ops.spyre.softplus(input, beta, threshold)
 
 
+
+@register_spyre_decomposition([torch.ops.aten._softmax.default])
+def spyre_softmax(
+    input: torch.Tensor, dim: int, half_to_float: bool
+) -> torch.Tensor:
+    max_val = torch.amax(input, dim=dim, keepdim=True)
+    shifted = input - max_val
+    exp_shifted = torch.exp(shifted)
+    sum_exp = torch.sum(exp_shifted, dim=dim, keepdim=True)
+    result = exp_shifted / sum_exp    
+    return result
+
+
+
 @register_spyre_decomposition([torch.ops.aten.linear.default])
 def spyre_linear(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
