@@ -1446,6 +1446,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_4d_dim3",
             ],
         },
+        ("test_softmax_half_to_float", "test_dim_op_cpu_eager"): {
+            "ops_dict": {
+                "softmax": lambda dim, x: torch.softmax(
+                    x, dim=dim, dtype=torch.float32
+                ),
+            },
+            "param_sets": {
+                "2d_dim0": (0, cached_randn((512, 1024), dtype=torch.float16)),
+                "2d_dim1": (1, cached_randn((512, 1024), dtype=torch.float16)),
+                "3d_dim0": (0, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "3d_dim2": (2, cached_randn((256, 64, 128), dtype=torch.float16)),
+                "4d_dim0": (0, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim1": (1, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim2": (2, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+                "4d_dim3": (3, cached_randn((6, 17, 32, 64), dtype=torch.float16)),
+            },
+            "expect_fail": [
+                "2d_dim0",
+                "2d_dim1",
+                "3d_dim0",
+                "3d_dim1",
+                "3d_dim2",
+                "4d_dim0",
+                "4d_dim1",
+                "4d_dim2",
+                "4d_dim3",
+            ],
+        },
         (
             "test_size_one",
             "test_unary_op_cpu",
