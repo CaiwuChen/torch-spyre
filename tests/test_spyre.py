@@ -235,16 +235,16 @@ class TestSpyre(TestCase):
         ):
             b = a.to(device="spyre").add(2.0).to(device="cpu")
 
-        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.ndim, 0)
         self.assertEqual(b.numel(), 1)
 
         expected = a + 2
         if dtype == torch.float8_e4m3fn:
-            torch.testing.assert_close(b.float(), expected.reshape(1).float())
+            torch.testing.assert_close(b.float(), expected.float())
         else:
             torch.testing.assert_close(
                 b,
-                expected.reshape(1),
+                expected,
                 rtol=2e-3,
                 atol=1e-5,
                 check_dtype=False,
