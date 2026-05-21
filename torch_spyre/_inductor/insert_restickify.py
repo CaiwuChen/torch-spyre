@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import logging
-import os
 from collections import defaultdict
 
 import torch
 
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .pass_utils import host_coordinates, device_coordinates
+from .pass_utils import host_coordinates, device_coordinates, stick_compatible
 from .pass_utils import compute_restickify_target_layout
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import (
@@ -29,6 +28,7 @@ from torch._inductor.ir import (
     InputBuffer,
     MutationLayoutSHOULDREMOVE,
     Operation,
+    ReinterpretView,
     StorageBox,
     TensorBox,
 )
@@ -41,9 +41,6 @@ from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
 
 logger = get_inductor_logger("insert_restickify")
-
-# Populated by finalize_layouts when SPYRE_CAPTURE_RESTICKIFY_PLAN is set. For testing only.
-restickify_plan: dict = {}
 
 
 def _fixed_tiled(layout: FixedLayout, stl: SpyreTensorLayout) -> FixedTiledLayout:
@@ -218,7 +215,6 @@ def insert_restickify(operations: list[Operation]) -> None:
 
 
 def finalize_layouts(operations: list) -> None:
-    global restickify_plan
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
     V.graph.restickify_plan for insert_restickify.
 
@@ -284,7 +280,10 @@ def finalize_layouts(operations: list) -> None:
     for op in operations:
         if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             continue
-        target_layout = op.layout.target.get_layout()
+        target = op.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data  # Traverse view chain to underlying buffer
+        target_layout = target.get_layout()
         assert isinstance(target_layout, FixedTiledLayout), (
             f"mutation op {op.get_name()} target has no committed FixedTiledLayout"
         )
@@ -300,14 +299,17 @@ def finalize_layouts(operations: list) -> None:
                 continue
             in_stl = in_layout.device_layout
             host_coords = host_coordinates(in_layout, dep)
-            device_coords = device_coordinates(in_stl, dep)
-            target_stick_expr = device_coordinates(target_stl, output_dep)[-1]
-            in_stick_expr = device_coords[-1]
+            in_device_coords = device_coordinates(in_stl, dep)
+            target_device_coords = device_coordinates(target_stl, output_dep)
 
-            if in_stick_expr == target_stick_expr:
+            if stick_compatible([in_device_coords, target_device_coords]):
                 continue
             restick_stl = compute_restickify_target_layout(
-                in_stl, in_layout, target_stick_expr, host_coords, device_coords
+                in_stl,
+                in_layout,
+                target_device_coords[-1],
+                host_coords,
+                in_device_coords,
             )
             if restick_stl is None:
                 raise Unsupported(
@@ -356,5 +358,3 @@ def finalize_layouts(operations: list) -> None:
             logger.debug("\n".join(lines))
         else:
             logger.debug("restickify plan: (none)")
-    if os.getenv("SPYRE_CAPTURE_RESTICKIFY_PLAN"):
-        restickify_plan = dict(plan)

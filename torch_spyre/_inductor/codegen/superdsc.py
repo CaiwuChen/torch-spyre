@@ -27,12 +27,13 @@ from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
-    SEGMENT_OFFSETS,
     TOPK_OPS,
 )
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import generate_sdsc
 
@@ -150,6 +151,48 @@ def _get_core_to_slice_mapping(
     return dim_to_expr
 
 
+def _k_fast_core_to_slice_mapping(
+    iteration_space, dim_splits: dict[Symbol, int], num_cores: int
+) -> dict[Symbol, Expr]:
+    """K-cohort-adjacent core-to-slice mapping for matmul.
+
+    Computed directly from the same `(iteration_space, dim_splits, num_cores)`
+    inputs as `_get_core_to_slice_mapping`, by treating the K (reduction) dim
+    as the innermost/fastest-varying axis along `core_id`. K-cohort members
+    (varying `i_k`, fixed `i_m, i_n`) then sit at adjacent physical core IDs,
+    so the PSUM ring reduction traverses 1 hop per output tile instead of
+    `m * n`.
+
+    Caller is responsible for the gating decision (matmul + k_fast flag + k>1).
+    """
+    dim_list = list(iteration_space.keys())
+    k_dim = dim_list[-1]
+    reordered = {k_dim: iteration_space[k_dim]}
+    for d in dim_list[:-1]:
+        reordered[d] = iteration_space[d]
+    return _get_core_to_slice_mapping(reordered, dim_splits, num_cores)
+
+
+def _should_use_k_fast_mapping(
+    is_matmul: bool, iteration_space, dim_splits: dict[Symbol, int]
+) -> bool:
+    """Decide whether the k_fast mapping should be used for this op.
+
+    Fires only when all three hold: this op is a matmul, the feature flag is
+    on, and the planner has chosen a K-split (k > 1). When k == 1 the k_fast
+    mapping is identical to the default, so we just use the default to keep
+    the code path explicit.
+    """
+    if not is_matmul:
+        return False
+    if not _spyre_config.core_id_k_fast_emission:
+        return False
+    dim_list = list(iteration_space.keys())
+    if len(dim_list) < 3:
+        return False
+    return dim_splits[dim_list[-1]] > 1
+
+
 def _get_mask_value(op: str) -> float:
     return float("-inf") if op == "max" else float("inf") if op == "min" else 0
 
@@ -245,10 +288,53 @@ def _is_topk(op: str) -> bool:
     return op in TOPK_OPS
 
 
-def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
-    if is_matmul:
-        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
+def _get_op_dim_labels(ndim: int) -> list[str]:
     return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+
+
+def _get_matmul_symbol_mapping(op_spec: OpSpec) -> dict[Symbol, Symbol]:
+    """
+    Assign dim labels in specific order to work around backend bug.
+    https://github.com/torch-spyre/torch-spyre/issues/2070
+    """
+
+    def syms(arg):
+        return {s for c in arg.device_coordinates for s in c.free_symbols}
+
+    inp0, inp1, out = (
+        syms(op_spec.args[0]),
+        syms(op_spec.args[1]),
+        syms(op_spec.args[2]),
+    )
+
+    mapping = {}
+    row_batch_syms = set()
+
+    for sym in op_spec.iteration_space:
+        if sym in inp0 and sym in inp1 and sym in out:
+            row_batch_syms.add(sym)
+        elif sym in inp0 and sym in inp1 and sym not in out:
+            # Reduction dim
+            mapping[sym] = Symbol("in")
+        elif sym not in inp0 and sym in inp1:
+            # Output stick dim
+            mapping[sym] = Symbol("out")
+        else:
+            row_batch_syms.add(sym)
+
+    ordered = list(
+        dict.fromkeys(
+            s
+            for coord in reversed(op_spec.args[2].device_coordinates)
+            for s in coord.free_symbols
+            if s in row_batch_syms
+        )
+    )
+    remaining_labels = MATMUL_DIM_LABELS[: len(MATMUL_DIM_LABELS) - 2]
+    for sym, label in zip(ordered[::-1], remaining_labels[: len(ordered)]):
+        mapping[sym] = Symbol(label)
+
+    return mapping
 
 
 def _create_sdsc_tensors(
@@ -266,7 +352,6 @@ def _create_sdsc_tensors(
     adjusted_output_size = op_spec.args[-1].device_size.copy()
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
-        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
@@ -336,7 +421,11 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address=addr if not arg.allocation else arg.allocation["lx"],
+                start_address=arg.allocation.get("pool")
+                if "pool" in arg.allocation
+                else arg.allocation.get("lx")
+                if "lx" in arg.allocation
+                else arg.allocation.get("hbm"),
                 backGap=backGap,
             )
         )
@@ -345,7 +434,7 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype" or op == "overwrite":
+    if op == "overwrite":
         return IDENTITY_OP
     if (
         is_reduction
@@ -386,14 +475,91 @@ def _ref_arg(op_spec):
     return op_spec.args[-1]
 
 
+def _extend_matmul_k_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
+
+    The IR-level padding pass pads y's K dimension to K_padded rows but keeps
+    the host iteration space (and op_spec.iteration_space) at K.  This function
+    computes K_padded = round_up(K, stick_size) and updates
+    sdsc_iteration_space[K_sym] before _create_sdsc_tensors runs.
+
+    With sdsc_iteration_space[K_sym] = K_padded:
+    - y's dev_dim_size for K == it_dim_size → backGap branch never fires for y.
+    - Strides are computed against K_padded → correct for K_padded-extended iteration.
+    - _get_padded_iteration_space becomes a no-op for K (already aligned).
+
+    K is identified as the symbol that appears in y's (non-stick) device_coordinates
+    but NOT in the output's device_coordinates.  This is the reduction symbol and is
+    layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
+    iteration symbols for this particular ndim.
+    """
+    # y is always args[1]; output is always args[-1] for matmul.
+    y_arg = op_spec.args[1]
+    out_arg = op_spec.args[-1]
+
+    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
+    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
+    # y_stick_dim is the within-stick symbol; the remaining dims include K.
+    y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
+
+    # Collect all symbols in the output's device_coordinates.
+    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
+    out_syms: set = set(out_dim_order)
+
+    # K is in y but not in the output (it's reduced).
+    k_candidates = y_non_stick_syms - out_syms
+    if not k_candidates:
+        logger.warning(
+            "_extend_matmul_k_to_padded: could not identify K symbol "
+            "(y_non_stick=%s, out_syms=%s), skipping",
+            y_non_stick_syms,
+            out_syms,
+        )
+        return
+    k_sym = next(iter(k_candidates))
+
+    if k_sym not in sdsc_iteration_space:
+        logger.warning(
+            "_extend_matmul_k_to_padded: K symbol %s not in sdsc_iteration_space %s, skipping",
+            k_sym,
+            list(sdsc_iteration_space.keys()),
+        )
+        return
+
+    # Compute K_padded by rounding K up to the next stick boundary.
+    # Reading K_padded from y_arg.device_size would be wrong when y is a view
+    # (e.g. a slice) of a larger buffer: device_size reflects the underlying
+    # allocation's K extent, not the slice's logical K, so it can be larger
+    # than the matmul's actual K and would over-extend the iteration space.
+    stick_size = y_arg.device_dtype.elems_per_stick()
+    k_current = sdsc_iteration_space[k_sym]
+    k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
+
+    if k_padded > k_current:
+        logger.debug(
+            "_extend_matmul_k_to_padded: extending K %d -> %d (sym=%s)",
+            k_current,
+            k_padded,
+            k_sym,
+        )
+        sdsc_iteration_space[k_sym] = k_padded
+
+
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
-    dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
-    symbol_mapping = {
-        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-    }
+    if is_matmul:
+        symbol_mapping = _get_matmul_symbol_mapping(op_spec)
+    else:
+        dim_labels = _get_op_dim_labels(ndim)
+        symbol_mapping = {
+            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+        }
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
@@ -423,6 +589,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
+    if is_matmul:
+        _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
         symbol_mapping,
@@ -435,7 +604,10 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
 
-    if is_matmul:
+    # In case of same type conversion (identity op) user gets compile time error & avoid
+    # changing the padding logic here to fix errors with torch.split() for 3d shapes.
+    is_dtype_op = DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
+    if is_matmul or is_dtype_op:
         pad_args, pad_sdsc_args = list(op_spec.args), args
     elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
@@ -454,6 +626,15 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
 
+    if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
+        core_id_to_work_slice = _k_fast_core_to_slice_mapping(
+            sdsc_iteration_space, dim_splits, num_cores
+        )
+    else:
+        core_id_to_work_slice = _get_core_to_slice_mapping(
+            sdsc_iteration_space, dim_splits, num_cores
+        )
+
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
@@ -464,9 +645,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         iteration_space=sdsc_iteration_space,
         num_cores=num_cores,
         work_slices=work_slices,
-        core_id_to_work_slice=_get_core_to_slice_mapping(
-            sdsc_iteration_space, dim_splits, num_cores
-        ),
+        core_id_to_work_slice=core_id_to_work_slice,
         padding=padding,
         layouts=layouts,
         args=args,

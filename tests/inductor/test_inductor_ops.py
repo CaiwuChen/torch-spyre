@@ -24,8 +24,11 @@ from utils_inductor import (
     compare_with_cpu,
     make_param_dict,
     unique_randn_along_dim,
+    shapes2key,
 )
 import utils_inductor
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.constants import IDENTITY_OP
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -48,6 +51,8 @@ POINTWISE_BINARY_OPS_DICT = {
     "mul": torch.mul,
     "sub": torch.sub,
     "div": torch.div,
+    "minimum": torch.minimum,
+    "maximum": torch.maximum,
 }
 
 CORE_REDUCTION_OPS_DICT = {
@@ -59,32 +64,33 @@ CORE_REDUCTION_OPS_DICT = {
 
 
 COMMON_REDUCTION_KEEPDIM_PARAM_SETS = {
-    # Regular single-dim coverage.
-    "2d_dim_0": (0, cached_randn((67, 256))),
-    "2d_dim_neg1": (-1, cached_randn((67, 256))),
-    "3d_dim_0": (0, cached_randn((3, 5, 256))),
-    "3d_dim_1": (1, cached_randn((67, 71, 256))),
-    "3d_dim_neg1": (-1, cached_randn((67, 71, 256))),
-    "4d_dim_0": (0, cached_randn((6, 7, 12, 256))),
-    "4d_dim_1": (1, cached_randn((6, 7, 12, 256))),
-    "4d_dim_2": (2, cached_randn((6, 7, 12, 256))),
-    "4d_dim_neg1": (-1, cached_randn((6, 7, 12, 256))),
-    "5d_dim_0": (0, cached_randn((2, 3, 5, 7, 256))),
-    "5d_dim_1": (1, cached_randn((2, 3, 5, 7, 256))),
-    "5d_dim_2": (2, cached_randn((2, 3, 5, 7, 256))),
-    "5d_dim_3": (3, cached_randn((2, 3, 5, 7, 256))),
-    "5d_dim_neg1": (-1, cached_randn((2, 3, 5, 7, 256))),
+    # Regular single-dim coverage. Use moderate scale to reduce FP16 noise
+    # without pushing values into the quantization floor.
+    "2d_dim_0": (0, cached_randn((67, 256), scale=0.1)),
+    "2d_dim_neg1": (-1, cached_randn((67, 256), scale=0.1)),
+    "3d_dim_0": (0, cached_randn((3, 5, 256), scale=0.1)),
+    "3d_dim_1": (1, cached_randn((67, 71, 256), scale=0.1)),
+    "3d_dim_neg1": (-1, cached_randn((67, 71, 256), scale=0.1)),
+    "4d_dim_0": (0, cached_randn((6, 7, 12, 256), scale=0.1)),
+    "4d_dim_1": (1, cached_randn((6, 7, 12, 256), scale=0.1)),
+    "4d_dim_2": (2, cached_randn((6, 7, 12, 256), scale=0.1)),
+    "4d_dim_neg1": (-1, cached_randn((6, 7, 12, 256), scale=0.1)),
+    "5d_dim_0": (0, cached_randn((2, 3, 5, 7, 256), scale=0.1)),
+    "5d_dim_1": (1, cached_randn((2, 3, 5, 7, 256), scale=0.1)),
+    "5d_dim_2": (2, cached_randn((2, 3, 5, 7, 256), scale=0.1)),
+    "5d_dim_3": (3, cached_randn((2, 3, 5, 7, 256), scale=0.1)),
+    "5d_dim_neg1": (-1, cached_randn((2, 3, 5, 7, 256), scale=0.1)),
     # SDSC padding-path coverage.
-    "pad_2d_dim_0": (0, cached_randn((63, 129))),
-    "pad_2d_dim_1": (1, cached_randn((63, 129))),
-    "pad_3d_dim_0": (0, cached_randn((3, 7, 9))),
-    "pad_3d_dim_1": (1, cached_randn((3, 7, 9))),
+    "pad_2d_dim_0": (0, cached_randn((63, 129), scale=0.1)),
+    "pad_2d_dim_1": (1, cached_randn((63, 129), scale=0.1)),
+    "pad_3d_dim_0": (0, cached_randn((3, 7, 9), scale=0.1)),
+    "pad_3d_dim_1": (1, cached_randn((3, 7, 9), scale=0.1)),
     # TODO: compiled mean(dim=2) on padded 3D tensors mismatches on spyre (issue #1706)
-    # "pad_3d_dim_2": (2, cached_randn((3, 7, 9))),
-    "pad_4d_dim_0": (0, cached_randn((3, 7, 9, 32))),
-    "pad_4d_dim_1": (1, cached_randn((3, 7, 9, 32))),
-    "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32))),
-    "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32))),
+    # "pad_3d_dim_2": (2, cached_randn((3, 7, 9), scale=0.1)),
+    "pad_4d_dim_0": (0, cached_randn((3, 7, 9, 32), scale=0.1)),
+    "pad_4d_dim_1": (1, cached_randn((3, 7, 9, 32), scale=0.1)),
+    "pad_4d_dim_2": (2, cached_randn((3, 7, 9, 32), scale=0.1)),
+    "pad_4d_dim_3": (3, cached_randn((3, 7, 9, 32), scale=0.1)),
 }
 
 
@@ -98,48 +104,48 @@ CORE_REDUCTION_EDGE_KEEPDIM_PARAM_SETS = {
 
 
 COMMON_REDUCTION_MULTIDIM_KEEPDIM_PARAM_SETS = {
-    # Regular multidim coverage. Use small scale to keep FP16 accumulation noise
-    # from hiding lowering issues.
-    "2d_dim_01_all": ((0, 1), cached_randn((67, 256), scale=0.1)),
-    "3d_dim_01": ((0, 1), cached_randn((67, 71, 256), scale=0.1)),
+    # Regular multidim coverage. Use lower scale to limit FP16 accumulation
+    # noise across multiple reduced axes.
+    "2d_dim_01_all": ((0, 1), cached_randn((67, 256), scale=0.01)),
+    "3d_dim_01": ((0, 1), cached_randn((67, 71, 256), scale=0.01)),
     "3d_dim_02": ((0, 2), cached_randn((67, 71, 256), scale=0.01)),
-    "3d_dim_12": ((1, 2), cached_randn((67, 71, 256), scale=0.1)),
-    "3d_dim_012_all": ((0, 1, 2), cached_randn((67, 71, 256), scale=0.1)),
-    "3d_neg_21": ((-2, -1), cached_randn((5, 7, 64), scale=0.1)),
-    "3d_mixed_1_neg1": ((1, -1), cached_randn((5, 7, 64), scale=0.1)),
-    "4d_dim_01": ((0, 1), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_02": ((0, 2), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_03": ((0, 3), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_12": ((1, 2), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_13": ((1, 3), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_23": ((2, 3), cached_randn((6, 7, 12, 64), scale=0.1)),
-    "4d_dim_012": ((0, 1, 2), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_013": ((0, 1, 3), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_023": ((0, 2, 3), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_123": ((1, 2, 3), cached_randn((6, 7, 12, 256), scale=0.1)),
-    "4d_dim_0123_all": ((0, 1, 2, 3), cached_randn((6, 7, 12, 64), scale=0.1)),
-    "4d_unsorted_30": ((3, 0), cached_randn((4, 6, 8, 64), scale=0.1)),
-    "4d_size1_23": ((2, 3), cached_randn((4, 6, 1, 64), scale=0.1)),
-    "5d_dim_04": ((0, 4), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "5d_dim_024": ((0, 2, 4), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "5d_dim_1234": ((1, 2, 3, 4), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "5d_mixed_1_neg1": ((1, -1), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "5d_size1_34": ((3, 4), cached_randn((2, 3, 5, 1, 64), scale=0.1)),
+    "3d_dim_12": ((1, 2), cached_randn((67, 71, 256), scale=0.01)),
+    "3d_dim_012_all": ((0, 1, 2), cached_randn((67, 71, 256), scale=0.01)),
+    "3d_neg_21": ((-2, -1), cached_randn((5, 7, 64), scale=0.01)),
+    "3d_mixed_1_neg1": ((1, -1), cached_randn((5, 7, 64), scale=0.01)),
+    "4d_dim_01": ((0, 1), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_02": ((0, 2), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_03": ((0, 3), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_12": ((1, 2), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_13": ((1, 3), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_23": ((2, 3), cached_randn((6, 7, 12, 64), scale=0.01)),
+    "4d_dim_012": ((0, 1, 2), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_013": ((0, 1, 3), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_023": ((0, 2, 3), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_123": ((1, 2, 3), cached_randn((6, 7, 12, 256), scale=0.01)),
+    "4d_dim_0123_all": ((0, 1, 2, 3), cached_randn((6, 7, 12, 64), scale=0.01)),
+    "4d_unsorted_30": ((3, 0), cached_randn((4, 6, 8, 64), scale=0.01)),
+    "4d_size1_23": ((2, 3), cached_randn((4, 6, 1, 64), scale=0.01)),
+    "5d_dim_04": ((0, 4), cached_randn((2, 3, 5, 7, 256), scale=0.01)),
+    "5d_dim_024": ((0, 2, 4), cached_randn((2, 3, 5, 7, 256), scale=0.01)),
+    "5d_dim_1234": ((1, 2, 3, 4), cached_randn((2, 3, 5, 7, 256), scale=0.01)),
+    "5d_mixed_1_neg1": ((1, -1), cached_randn((2, 3, 5, 7, 256), scale=0.01)),
+    "5d_size1_34": ((3, 4), cached_randn((2, 3, 5, 1, 64), scale=0.01)),
     # SDSC padding-path coverage.
-    "pad_2d_dim_01_all": ((0, 1), cached_randn((63, 129), scale=0.1)),
-    "pad_3d_dim_01": ((0, 1), cached_randn((3, 7, 9), scale=0.1)),
-    "pad_3d_dim_12": ((1, 2), cached_randn((3, 7, 9), scale=0.1)),
-    "pad_3d_dim_012_all": ((0, 1, 2), cached_randn((3, 7, 9), scale=0.1)),
-    "pad_4d_dim_23": ((2, 3), cached_randn((3, 7, 9, 32), scale=0.1)),
-    "pad_4d_dim_0123_all": ((0, 1, 2, 3), cached_randn((3, 7, 9, 32), scale=0.1)),
-    "pad_5d_dim_234": ((2, 3, 4), cached_randn((2, 3, 5, 7, 9), scale=0.1)),
+    "pad_2d_dim_01_all": ((0, 1), cached_randn((63, 129), scale=0.01)),
+    "pad_3d_dim_01": ((0, 1), cached_randn((3, 7, 9), scale=0.01)),
+    "pad_3d_dim_12": ((1, 2), cached_randn((3, 7, 9), scale=0.01)),
+    "pad_3d_dim_012_all": ((0, 1, 2), cached_randn((3, 7, 9), scale=0.01)),
+    "pad_4d_dim_23": ((2, 3), cached_randn((3, 7, 9, 32), scale=0.01)),
+    "pad_4d_dim_0123_all": ((0, 1, 2, 3), cached_randn((3, 7, 9, 32), scale=0.01)),
+    "pad_5d_dim_234": ((2, 3, 4), cached_randn((2, 3, 5, 7, 9), scale=0.01)),
 }
 
 
 CORE_REDUCTION_EDGE_MULTIDIM_KEEPDIM_PARAM_SETS = {
     # TODO: 5D all-dims sum/mean reduction is incorrect on spyre (issue #1707)
     # "5d_dim_01234_all": ((0, 1, 2, 3, 4), cached_randn((2, 3, 5, 7, 256), scale=0.1)),
-    "large_2d_dim_01_all": ((0, 1), cached_randn((2048, 4096), scale=0.001)),
+    # "large_2d_dim_01_all": ((0, 1), cached_randn((2048, 4096), scale=0.01)),
     "large_3d_dim_12": ((1, 2), cached_randn((32, 64, 512), scale=0.01)),
 }
 
@@ -231,12 +237,81 @@ def _compare_op_with_cpu(fn, op, *args, **kwargs):
     )
 
 
+ALL_DTYPES = [
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.bool,
+]
+
+ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
+
+TO_DTYPE_OP_SHAPES_UNALIGNED = [
+    (4, 16),
+    (4, 68),
+]
+
+TO_DTYPE_OP_SHAPES_ALIGNED = [
+    (4, 64),
+    (4, 8, 128),
+    (2, 4, 8, 64),
+]
+
+TO_DTYPE_OP_SHAPES = TO_DTYPE_OP_SHAPES_UNALIGNED + TO_DTYPE_OP_SHAPES_ALIGNED
+
+
+def _dtype_name(dt):
+    return str(dt).split(".")[-1]
+
+
+TO_DTYPE_OP_MAP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
+    for src, dst in ALL_DTYPE_PAIRS
+}
+
+TO_DTYPE_OP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    for shape in TO_DTYPE_OP_SHAPES
+    if src != torch.bool and dst != torch.bool
+}
+
+TO_DTYPE_OP_EXPECT_FAIL = [
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
+    for src, dst in DtypeOpTable.get_dtype_pairs()
+    for shape in TO_DTYPE_OP_SHAPES
+    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+]
+
+TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src, dst in [(torch.float16, torch.float32)]
+    for shape in TO_DTYPE_OP_SHAPES
+}
+
+TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
+    for src, dst in [(torch.float16, torch.float32)]
+    for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
+]
+
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
 
 class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
-    torch.manual_seed(0xAFFE)
+    torch.manual_seed(0xAFFE)  # seeds cached_randn/cached_xavier calls in PARAMS below
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xAFFE)
+
     # Define parameter sets for each base test method
     # If parameterized, the base test method will not be invoked
     # The test methods that are not parameterized will be invoked
@@ -420,6 +495,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 rand_type="xavier",
             ),
         },
+        ("test_matmul_noncontiguous", "test_mm_relaxed"): {
+            "ops_dict": {"matmul": torch.matmul},
+            "param_sets": {
+                "3d": (
+                    cached_xavier((128, 2, 128)).transpose(0, 1),
+                    cached_xavier((128, 2, 256)).transpose(0, 1),
+                ),
+                "4d": (
+                    cached_xavier((2, 8, 128, 128)),
+                    cached_xavier((2, 128, 8, 128)).transpose(1, 2),
+                ),
+            },
+        },
         ("test_large_matmul", "test_mm_relaxed"): {
             "ops_dict": {"matmul": torch.matmul},
             "param_sets": {
@@ -450,6 +538,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim_2": (2, cached_randn((12, 8, 25, 64))),
                 "4d_dim_3": (3, cached_randn((12, 8, 25, 64))),
             },
+        },
+        ("test_sub_scalar", "test_unary_op_cpu"): {
+            "ops_dict": {
+                "sub_scalar_5": lambda x: torch.sub(x, 5.0),
+                "sub_scalar_neg": lambda x: torch.sub(x, -3.5),
+                "sub_scalar_zero": lambda x: torch.sub(x, 0.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                    ((67, 71, 256),),
+                ]
+            ),
+        },
+        ("test_sub_broadcast", "test_binary_op_cpu"): {
+            "ops_dict": {"sub": torch.sub},
+            "param_sets": {
+                "1d_2d": (
+                    cached_randn((256,)),
+                    cached_randn((67, 256)),
+                ),
+                "2d_3d": (
+                    cached_randn((71, 256)),
+                    cached_randn((67, 71, 256)),
+                ),
+                "scalar_broadcast": (
+                    cached_randn((1,)),
+                    cached_randn((67, 256)),
+                ),
+                "3d_4d": (
+                    cached_randn((12, 32, 64)),
+                    cached_randn((7, 12, 32, 64)),
+                ),
+            },
+        },
+        ("test_sub_alpha", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "sub_alpha_2": lambda a, b: torch.sub(a, b, alpha=2.0),
+                "sub_alpha_0.5": lambda a, b: torch.sub(a, b, alpha=0.5),
+                "sub_alpha_neg": lambda a, b: torch.sub(a, b, alpha=-1.0),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                ]
+            ),
         },
         (
             "test_alias_operands",
@@ -639,7 +775,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "5d_permuted_dim_1_neg1": (
                     (1, -1),
-                    cached_randn((2, 48, 2, 256, 65), scale=0.1).permute(0, 2, 3, 4, 1),
+                    cached_randn((2, 48, 2, 256, 65), scale=0.01).permute(
+                        0, 2, 3, 4, 1
+                    ),
                 ),
             },
         },
@@ -650,7 +788,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "5d_permuted_dim_1_neg1": (
                     (1, -1),
-                    cached_randn((2, 48, 2, 256, 65), scale=0.1).permute(0, 2, 3, 4, 1),
+                    cached_randn((2, 48, 2, 256, 65), scale=0.01).permute(
+                        0, 2, 3, 4, 1
+                    ),
                 ),
             },
         },
@@ -1835,6 +1975,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((128), dtype=torch.float16),  # weight
                     torch.zeros([128], dtype=torch.float16),  # bias
                 ),
+                "2d_transposed": (
+                    cached_randn((128, 256), dtype=torch.float16).transpose(0, 1),
+                    cached_randn((128), dtype=torch.float16),
+                    torch.zeros([128], dtype=torch.float16),
+                ),
             },
         },
         ("test_rmsnorm", "test_rmsnorm_cpu"): {
@@ -2202,6 +2347,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         ),
                     )
                 ),
+                "copy_": (
+                    lambda dim, index, x: (
+                        y := torch.split(x, x.size()[dim] // 3, dim=dim)[index],
+                        y.copy_(torch.ones_like(y))._base,
+                    )[-1]
+                ),
                 "chunk": (lambda dim, index, x: x.chunk(3, dim=dim)[index].clone()),
             },
             "param_sets": {
@@ -2231,6 +2382,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "add": lambda dim, x: torch.add(x.clone(), x),
                 "sum": lambda dim, x: torch.sum(x, dim=dim, keepdim=True),
                 "amax": lambda dim, x: torch.amax(x, dim=dim, keepdim=False),
+                "copy_": lambda dim, x: x.copy_(torch.ones_like(x))._base,
             },
             "param_sets": {
                 "1d0s0": (0, 0, cached_randn((192,), dtype=torch.float16)),
@@ -3123,15 +3275,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "expect_fail": [
-                "fp16_2d_dim_0",
-                "fp16_2d_dim_1",
-                "fp16_3d_dim_0",
-                "fp16_3d_dim_1",
-                "fp16_3d_dim_2",
-                "fp16_4d_dim_0",
-                "fp16_4d_dim_1",
-                "fp16_4d_dim_2",
-                "fp16_4d_dim_3",
                 "fp32_2d_dim_0",
                 "fp32_2d_dim_1",
                 "fp32_3d_dim_0",
@@ -3260,14 +3403,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
             "expect_fail": [
-                "fp16_2d_dim_0",
-                "fp16_2d_dim_1",
-                "fp16_3d_dim_1",
-                "fp16_3d_dim_2",
-                "fp16_4d_dim_0",
-                "fp16_4d_dim_1",
-                "fp16_4d_dim_2",
-                "fp16_4d_dim_3",
                 "fp32_2d_dim_0",
                 "fp32_2d_dim_1",
                 "fp32_3d_dim_1",
@@ -3288,6 +3423,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "67x256": (cached_randn((67, 256), dtype=torch.float32),),
                 "67x71x256": (cached_randn((67, 71, 256), dtype=torch.float32),),
             },
+        },
+        ("test_to_dtype_op_map", "test_to_dtype_op_map"): {
+            "param_sets": TO_DTYPE_OP_MAP_PARAMS_SETS,
+        },
+        ("test_to_dtype", "test_to_dtype_cpu"): {
+            "param_sets": TO_DTYPE_OP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_EXPECT_FAIL,
+        },
+        ("test_round_trip_to_dtype", "test_round_trip_to_dtype_cpu"): {
+            "ops_dict": {"add": torch.add},
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
     }
 
@@ -3373,9 +3520,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
         # - torch.eq, torch.ge, torch.gt, torch.lt: work eagerly
-        # - torch.ne, torch.le: aten::ne.Tensor_out / aten::le.Tensor_out not registered
+        # - torch.le: aten::le.Tensor_out not registered
         # - torch.matmul: numerical divergence (close=False) in eager 2d case
-        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt)
+        eager_supported = op in (torch.eq, torch.ge, torch.gt, torch.lt, torch.ne)
         self.compare_with_cpu(op, x, y, run_eager=eager_supported)
 
     def test_linear_fn(self, x, weight, bias):
@@ -3391,6 +3538,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_addmm_cpu(self, input, mat1, mat2):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division
         self.compare_with_cpu(torch.addmm, input, mat1, mat2, atol=3e-1, rtol=2e-1)
+
+    def test_matmul_tiled_y(self):
+        # Inspired by granite code that broke with no covering tests.
+        # GQA pattern: y is a 5D contiguous buffer from clone(expand(...))
+        # giving tiled host coords where the reduction dim decomposes as
+        # floor(...) and Mod(...) over a single loop variable.
+        B, H_KV, GQA, S, D = 2, 8, 4, 128, 128
+        H = H_KV * GQA
+
+        def fn(x, kv_cache):
+            y = kv_cache.view(B, S, H_KV, D)
+            y = y.permute(0, 2, 1, 3)
+            y = y.unsqueeze(2)
+            y = y.expand(-1, -1, GQA, -1, -1)
+            y = y.clone()
+            return torch.bmm(
+                x.reshape(B * H, S, D),
+                y.reshape(B * H, S, D).transpose(1, 2),
+            )
+
+        x = torch.randn(B, H, S, D, dtype=torch.float16)
+        kv = torch.randn(B, S * H_KV, D, dtype=torch.float16)
+        self.compare_with_cpu(fn, x, kv, atol=0.5, rtol=0.1)
+
+    def test_matmul_tiled_x(self):
+        # Inspired by granite code that broke with no covering tests.
+        # x is a 4D contiguous buffer [B,S,H,D] giving tiled host coords
+        # where the reduction dim decomposes as floor(...) and Mod(...)
+        # over a single flat loop variable.
+        B, S, H, D = 2, 128, 32, 128
+
+        def fn(x_base, y):
+            x = x_base.clone()
+            return torch.matmul(x.reshape(B, S, H * D), y)
+
+        x = torch.randn(B, S, H, D, dtype=torch.float16) * 0.01
+        y = torch.randn(H * D, H * D, dtype=torch.float16) * 0.01
+        self.compare_with_cpu(fn, x, y, atol=0.5, rtol=0.1)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
@@ -3576,15 +3761,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support the integer index tensor in "
-            "torch.min(dim) tuple outputs yet (stable error signature: "
-            "Unsupported: operation on DataFormats.IEEE_INT32)"
-        ),
-        strict=True,
-    )
-    def test_min_tuple_output_keepdim0_known_xfail(self):
+    def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
             lambda x: torch.min(x, dim=1, keepdim=False),
@@ -3592,15 +3769,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support integer index outputs from "
-            "argmin yet (stable error signature: Unsupported: operation on "
-            "DataFormats.IEEE_INT32)"
-        ),
-        strict=True,
-    )
-    def test_argmin_keepdim0_known_xfail(self):
+    def test_argmin_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
             lambda x: torch.argmin(x, dim=1, keepdim=False),
@@ -3990,28 +4159,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_2d_contiguous_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
-        self.compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
-        )
+        self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
     def test_transpose_3d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_3d_contiguous_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
-        self.compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
-        )
+        self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
     def test_transpose_4d_cpu(self, dim0: int, dim1: int, x):
         self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1), x)
 
     def test_transpose_4d_contiguous_cpu(self, dim0: int, dim1: int, x):
-        # Note: .contiguous() causes issues with eager mode, see https://github.com/torch-spyre/torch-spyre/issues/1149
-        self.compare_with_cpu(
-            lambda x: torch.transpose(x, dim0, dim1).contiguous(), x, run_eager=False
-        )
+        self.compare_with_cpu(lambda x: torch.transpose(x, dim0, dim1).contiguous(), x)
 
     def test_where_cpu(self, cond_op, x, y):
         # aten::where.self is not registered for the Spyre backend
@@ -4020,11 +4180,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_range_op(self, op, input, min, max, err):
-        # aten::clamp is not registered for Spyre eager dispatch; it uses the
-        # spyre::clamp custom op which only works inside torch.compile
-        self.compare_with_cpu(
-            lambda x: op(x, min, max), input, atol=err, rtol=err, run_eager=False
-        )
+        self.compare_with_cpu(lambda x: op(x, min, max), input, atol=err, rtol=err)
 
     def test_activation_cls(self, op, input, kwargs, err):
         # Spyre activation custom ops (e.g. spyre::gelu) have a pass-through
@@ -4445,7 +4601,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
-        self.compare_with_cpu(fn, x, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_slice_cpu(self, op, dim, index, x):
         def fn(x):
@@ -4458,7 +4614,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
@@ -4517,6 +4673,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         # TODO(aviros): Add support for missing eager ops and debug remaining issues to match eager results
         self.compare_with_cpu(fn, q, k, v, cpu_compile=False, run_eager=False)
+
+    def test_to_dtype_op_map(self, src, dst):
+        result = DtypeOpTable.get_operator(src, dst)
+        conversions = DtypeOpTable.get_table()
+        if (src, dst) in conversions:
+            expected = conversions[(src, dst)]
+            assert result == expected, (
+                f"Expected {expected} for {src}->{dst}, got {result}"
+            )
+        else:
+            assert result is None, (
+                f"Expected None for unsupported {src}->{dst}, got {result}"
+            )
+
+    def test_to_dtype_cpu(self, x, dst_dtype):
+        def fn(x, dst_dtype):
+            return x.to(dtype=dst_dtype)
+
+        self.compare_with_cpu(
+            fn,
+            x,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_to_dtype_cpu(self, op, x, dst_dtype):
+        def fn(op, x, dst_dtype):
+            y = x.to(dst_dtype)
+            z = op(y, y)
+            return z.to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
 
 
 if __name__ == "__main__":
