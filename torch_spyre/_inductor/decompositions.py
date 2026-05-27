@@ -505,30 +505,7 @@ def spyre_softmax(
     if compute_dtype != output_dtype:
         return result.to(output_dtype)
     else:
-        return result
-
-"""
-@register_spyre_decomposition([torch.ops.aten._softmax.default])
-def spyre_softmax(
-    input: torch.Tensor,
-    dim: int,
-    half_to_float: bool,
-) -> torch.Tensor:
-    if input.dtype == torch.float32 or half_to_float:
-        input_fp16 = input.to(torch.float16) if input.dtype != torch.float16 else input
-        max_val = torch.amax(input_fp16, dim=dim, keepdim=True)
-        shifted = input_fp16 - max_val
-        exp_shifted = torch.exp(shifted)
-        sum_exp = torch.sum(exp_shifted, dim=dim, keepdim=True)
-        result_fp16 = exp_shifted / sum_exp
-        return result_fp16.to(torch.float32) if (input.dtype == torch.float32 or half_to_float) else result_fp16
-    else:
-        max_val = torch.amax(input, dim=dim, keepdim=True)
-        shifted = input - max_val
-        exp_shifted = torch.exp(shifted)
-        sum_exp = torch.sum(exp_shifted, dim=dim, keepdim=True)
-        return exp_shifted / sum_exp
-"""
+        return result 
 
 @register_spyre_decomposition([torch.ops.aten.linear.default])
 def spyre_linear(
