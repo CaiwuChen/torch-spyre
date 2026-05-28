@@ -16,6 +16,10 @@ BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 
+# Type casting operators from deeptools
+DL16TOFP32_OP = "dl16tofp32"
+FP32TODL16_OP = "fp32todl16"
+
 DEVICE_NAME = "spyre"
 
 
@@ -48,10 +52,10 @@ SPYRE_FP32_OPS = [
     "exx2",
     "layernormnorm",
     "identity",
-    "overwrite",
     "topkvalue",
     "topkindex",
     "floor",
+    "to_dtype",
     "maximum",
     "minimum",
 ]
@@ -65,4 +69,4 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
-MATMUL_DIM_LABELS = ["x", "mb", "y", "ki", "kj", "out", "in"]
+MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]

@@ -15,7 +15,7 @@
 import dataclasses
 import math
 from typing import Any
-
+from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
@@ -33,6 +33,7 @@ from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import generate_sdsc
 
@@ -42,6 +43,7 @@ logger = get_inductor_logger("codegen.superdsc")
 @dataclasses.dataclass
 class SDSCArgs:
     layout: str
+    dim_order: list[Symbol]
     data_format: DataFormats
     scales: dict[Symbol, Any]
     strides: dict[Symbol, Any]
@@ -60,6 +62,7 @@ class SDSCArgs:
         return (
             f"SDSCArgs(\n"
             f"  layout={self.layout},\n"
+            f"  dim_order={self.dim_order}, \n"
             f"  data_format={self.data_format.name},\n"
             f"  scales=[{scales}],\n"
             f"  strides=[{strides}],\n"
@@ -239,7 +242,7 @@ def _get_layout_label(
     for label, layout in layouts.items():
         if (
             layout["stick_dim_order"] == stick_dim_order
-            and layout["dim_order"] == dim_order
+            and Counter(layout["dim_order"]) == Counter(dim_order)
             and layout["stick_size"] == stick_size
         ):
             return label
@@ -257,6 +260,7 @@ def _get_padded_iteration_space(
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
+    dim_order,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -265,11 +269,11 @@ def _get_padded_iteration_space(
     Returns a mapping of dim -> padding amount
     """
     padding: dict = {}
-    for sdsc_arg, op_spec_arg in zip(sdsc_args, op_spec_args):
+    for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim = layout["stick_dim_order"]
         dev_size = op_spec_arg.device_size[-2::-1]
-        for idx, dim in enumerate(layout["dim_order"]):
+        for idx, dim in enumerate(dim_order):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
             unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
@@ -287,53 +291,29 @@ def _is_topk(op: str) -> bool:
     return op in TOPK_OPS
 
 
-def _get_op_dim_labels(ndim: int) -> list[str]:
-    return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
+    if is_matmul:
+        return MATMUL_DIM_LABELS[len(MATMUL_DIM_LABELS) - ndim :]
+    else:
+        return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
-def _get_matmul_symbol_mapping(op_spec: OpSpec) -> dict[Symbol, Symbol]:
+def _get_data_format(op, device_dtype):
     """
-    Assign dim labels in specific order to work around backend bug.
-    https://github.com/torch-spyre/torch-spyre/issues/2070
+    NOTE: This is NOT a data conversion.
+    This is only a temporary re-labeling of the same 32 bit data.
+    The underlying data remains unchanged.
+
+    In the long term, SDSC should accept int32 as the data format.
+    Such re-labeling will become unnecessary.
     """
-
-    def syms(arg):
-        return {s for c in arg.device_coordinates for s in c.free_symbols}
-
-    inp0, inp1, out = (
-        syms(op_spec.args[0]),
-        syms(op_spec.args[1]),
-        syms(op_spec.args[2]),
-    )
-
-    mapping = {}
-    row_batch_syms = set()
-
-    for sym in op_spec.iteration_space:
-        if sym in inp0 and sym in inp1 and sym in out:
-            row_batch_syms.add(sym)
-        elif sym in inp0 and sym in inp1 and sym not in out:
-            # Reduction dim
-            mapping[sym] = Symbol("in")
-        elif sym not in inp0 and sym in inp1:
-            # Output stick dim
-            mapping[sym] = Symbol("out")
-        else:
-            row_batch_syms.add(sym)
-
-    ordered = list(
-        dict.fromkeys(
-            s
-            for coord in reversed(op_spec.args[2].device_coordinates)
-            for s in coord.free_symbols
-            if s in row_batch_syms
-        )
-    )
-    remaining_labels = MATMUL_DIM_LABELS[: len(MATMUL_DIM_LABELS) - 2]
-    for sym, label in zip(ordered[::-1], remaining_labels[: len(ordered)]):
-        mapping[sym] = Symbol(label)
-
-    return mapping
+    data_format = {
+        (
+            IDENTITY_OP,
+            DataFormats.IEEE_INT32,
+        ): DataFormats.IEEE_FP32,  # Identity op: int32 -> fp32
+    }
+    return data_format.get((op, device_dtype), device_dtype)
 
 
 def _create_sdsc_tensors(
@@ -348,7 +328,6 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     missing_dim = None
-    adjusted_output_size = op_spec.args[-1].device_size.copy()
     sdsc_args: list[SDSCArgs] = []
     for arg in op_spec.args:
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
@@ -358,7 +337,6 @@ def _create_sdsc_tensors(
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-        use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
@@ -380,10 +358,7 @@ def _create_sdsc_tensors(
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(
-                stride_idx,
-                arg.device_size if not use_adjusted_size else adjusted_output_size,
-            )
+            strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
@@ -411,10 +386,15 @@ def _create_sdsc_tensors(
             arg.device_dtype.elems_per_stick(),
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
+        # Change dataFormat_ value if needed.
+        # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
+        arg_data_format = _get_data_format(op_spec.op, arg.device_dtype)
+
         sdsc_args.append(
             SDSCArgs(
                 layout=label,
-                data_format=arg.device_dtype,
+                dim_order=dim_order,
+                data_format=arg_data_format,
                 scales=scales,
                 strides=strides,
                 offsets=offsets,
@@ -433,8 +413,6 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype" or op == "overwrite":
-        return IDENTITY_OP
     if (
         is_reduction
         and not _is_matmul(op)
@@ -481,10 +459,10 @@ def _extend_matmul_k_to_padded(
 ) -> None:
     """Extend sdsc_iteration_space[K] to K_padded for matmul ops.
 
-    The IR-level padding pass pads y's device_size to K_padded rows but keeps
+    The IR-level padding pass pads y's K dimension to K_padded rows but keeps
     the host iteration space (and op_spec.iteration_space) at K.  This function
-    reads K_padded from y's device_size and updates sdsc_iteration_space[K_sym]
-    before _create_sdsc_tensors runs.
+    computes K_padded = round_up(K, stick_size) and updates
+    sdsc_iteration_space[K_sym] before _create_sdsc_tensors runs.
 
     With sdsc_iteration_space[K_sym] = K_padded:
     - y's dev_dim_size for K == it_dim_size → backGap branch never fires for y.
@@ -529,41 +507,33 @@ def _extend_matmul_k_to_padded(
         )
         return
 
-    # Find K_padded from y's device_size using the same stride_idx formula as
-    # _create_sdsc_tensors: dev_dim_size = device_size[-stride_idx - 2]
-    # where stride_idx is the position of k_sym in y_dim_order.
-    # y has no reduced dims, so stride_dim_order == y_dim_order, and k_sym is
-    # guaranteed to be present (it was just found in y_non_stick_syms ⊆ y_dim_order).
-    stride_idx = y_dim_order.index(k_sym)
-    dev_dim_idx = -stride_idx - 2
-    k_padded = int(y_arg.device_size[dev_dim_idx])
-
+    # Compute K_padded by rounding K up to the next stick boundary.
+    # Reading K_padded from y_arg.device_size would be wrong when y is a view
+    # (e.g. a slice) of a larger buffer: device_size reflects the underlying
+    # allocation's K extent, not the slice's logical K, so it can be larger
+    # than the matmul's actual K and would over-extend the iteration space.
+    stick_size = y_arg.device_dtype.elems_per_stick()
     k_current = sdsc_iteration_space[k_sym]
+    k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
+
     if k_padded > k_current:
         logger.debug(
-            "_extend_matmul_k_to_padded: extending K %d -> %d "
-            "(sym=%s, y device_size[%d]=%d, stride_idx=%d)",
+            "_extend_matmul_k_to_padded: extending K %d -> %d (sym=%s)",
             k_current,
             k_padded,
             k_sym,
-            dev_dim_idx,
-            k_padded,
-            stride_idx,
         )
         sdsc_iteration_space[k_sym] = k_padded
 
 
-def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
+def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
 
-    if is_matmul:
-        symbol_mapping = _get_matmul_symbol_mapping(op_spec)
-    else:
-        dim_labels = _get_op_dim_labels(ndim)
-        symbol_mapping = {
-            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-        }
+    dim_labels = _get_op_dim_labels(ndim, is_matmul)
+    symbol_mapping = {
+        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+    }
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
@@ -608,14 +578,29 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
 
-    if is_matmul:
-        pad_args, pad_sdsc_args = list(op_spec.args), args
-    elif op_spec.is_reduction or op_spec.op == "overwrite":
-        pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
+    # In case of same type conversion (identity op) user gets compile time error & avoid
+    # changing the padding logic here to fix errors with torch.split() for 3d shapes.
+    is_dtype_op = DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
+    if is_matmul or is_dtype_op:
+        pad_args, pad_sdsc_args, dim_order = (
+            list(op_spec.args),
+            args,
+            [arg.dim_order for arg in args],
+        )
+    elif op_spec.is_reduction:
+        pad_args, pad_sdsc_args, dim_order = (
+            [op_spec.args[0]],
+            [args[0]],
+            [args[0].dim_order],
+        )
     else:
-        pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
+        pad_args, pad_sdsc_args, dim_order = (
+            [op_spec.args[-1]],
+            [args[-1]],
+            [args[-1].dim_order],
+        )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
+        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
@@ -636,26 +621,47 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
             sdsc_iteration_space, dim_splits, num_cores
         )
 
-    return SDSCSpec(
-        opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
-        execution_unit="pt" if is_matmul else "sfp",
-        data_format=op_spec.args[
-            0
-        ].device_dtype,  # TODO: op_spec needs operation data format
-        num_inputs=num_inputs,
-        iteration_space=sdsc_iteration_space,
-        num_cores=num_cores,
-        work_slices=work_slices,
-        core_id_to_work_slice=core_id_to_work_slice,
-        padding=padding,
-        layouts=layouts,
-        args=args,
-        constants=constants,
-        coordinate_masking=coordinate_masking,
+    return (
+        SDSCSpec(
+            opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
+            execution_unit="pt" if is_matmul else "sfp",
+            data_format=args[
+                0
+            ].data_format,  # TODO: op_spec needs operation data format
+            num_inputs=num_inputs,
+            iteration_space=sdsc_iteration_space,
+            num_cores=num_cores,
+            work_slices=work_slices,
+            core_id_to_work_slice=core_id_to_work_slice,
+            padding=padding,
+            layouts=layouts,
+            args=args,
+            constants=constants,
+            coordinate_masking=coordinate_masking,
+        ),
+        symbol_mapping,
     )
 
 
-def compile_op_spec(idx: int, op_spec: OpSpec) -> Any:
-    sdsc_spec = parse_op_spec(op_spec)
+def compile_op_spec(
+    idx: int,
+    op_spec: OpSpec,
+    symbols: list[int],
+    symbol_id_offset: int = 0,
+    use_symbols: bool = False,
+) -> tuple[Any, list[int], list[dict]]:
+    sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    return generate_sdsc(idx, sdsc_spec)
+    # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
+    # SDSC symbols via the same mapping used to build sdsc_spec.
+    tiled_symbols = [
+        symbol_mapping[s] for s in op_spec.tiled_symbols if s in symbol_mapping
+    ]
+    return generate_sdsc(
+        idx,
+        sdsc_spec,
+        symbols,
+        symbol_id_offset,
+        tiled_symbols=tiled_symbols,
+        use_symbols=use_symbols,
+    )

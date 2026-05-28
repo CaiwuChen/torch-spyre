@@ -19,17 +19,10 @@ after insert_restickify, when every ComputedBuffer has a FixedTiledLayout.
 Only y is padded; x is left untouched.
 
 For y, the following IR sequence is emitted:
-  spyre.empty(padded_size)                         — uninitialised allocation
-  spyre.constant(0.0)                              — scalar zero, generated on-device (cached)
-  aten.expand(constant, pad_size)                  — broadcast to pad-region shape; free
-  aten.clone(expand)                               — on-device broadcast copy → fill buffer
-  overwrite(fill_buf, empty, [dim], [fill_offset]) — write zeros into pad region
-  overwrite(orig,     empty, [dim], [0])           — copy original data at offset 0
-
-fill_offset is original_size[dim] rounded down to the nearest stick boundary.
-This ensures the fill overwrite is stick-aligned; any elements between
-fill_offset and original_size[dim] that are over-zeroed are restored by the
-data overwrite, which always runs after the fill overwrite.
+  1. ComputedBuffer - output buffer allocation (FixedLayout)
+  2. SpyreConstantFallback - fill constant (FixedLayout)
+  3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
+  4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
 
 y's padded buffer is built at the full K_padded host size by lower_pad_sequence.
 reduction_ranges stays at K; the K→K_padded extension happens at SDSC codegen
@@ -41,9 +34,8 @@ x is left physically untouched.  The hardware masks within-stick elements of x
 beyond the true K to zero, so extending the SDSC iteration to K_padded does not
 introduce numerical error from x.
 
-spyre.constant is cached across all matmuls with the same (fill_value, device,
-dtype) key so it is lowered at most once per unique fill value and dtype,
-regardless of tensor shape or which dimension is padded.
+Deduplication of identical constants across multiple pad calls happens later
+at the IR level via dedup_and_promote_constants.
 
 x and y are identified via device_coordinates: x is the input sticked on the
 reduction coord, y is the other.  This avoids positional assumptions and handles
@@ -221,6 +213,23 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         if len(reads) != 2:  # noqa: PLR2004
             continue
 
+        # Skip aligned-K matmuls early before any x/y identification.
+        # Aligned-K matmuls need no padding regardless of input layout, and
+        # skipping here avoids a spurious warning for e.g. decode-phase SDPA
+        # attention where out_coords has a constant-folded M dimension that
+        # makes reduction_coord detection fail for both inputs.
+        k_val = concretize_expr(reduction.reduction_ranges[0])
+        first_buf = next(
+            (V.graph.get_buffer(d.name) for d in reads if V.graph.get_buffer(d.name)),
+            None,
+        )
+        assert first_buf is not None, (
+            f"insert_bmm_padding: no input buffer found for matmul {op.get_name()}"
+        )
+        dtype = first_buf.get_dtype()
+        if compute_padding(k_val, dtype) == 0:
+            continue
+
         # Identify x and y via device_coordinates.
         # x is the input sticked on the reduction coord (hardware masks within-stick
         # padding for x).  y is the other input; its K host dim is derived from the
@@ -280,14 +289,9 @@ def insert_bmm_padding(operations: list[Operation]) -> None:
         # the inner_fn accesses x through a view with more dims than x_buf
         # (e.g. when mm_to_bmm_pass wraps a 2D mm into a 3D bmm).
         output_ranges = [concretize_expr(s) for s in reduction.ranges]
-        k_val = concretize_expr(reduction.reduction_ranges[0])
         x_size = output_ranges[:-1] + [k_val]  # [batch..., M, K]
-        dtype = x_buf.get_dtype()
         device = x_buf.get_device()
-
         pad = compute_padding(k_val, dtype)
-        if pad == 0:
-            continue
 
         # Find the FX node/TensorBox that presents x at x_size dimensionality.
         # mm_to_bmm_pass may wrap a 2D x buffer with a 3D view; we need the
