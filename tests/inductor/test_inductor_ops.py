@@ -464,6 +464,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     # Padding
                     ((2, 55, 2), (2, 2, 99)),
                     ((2, 99, 65), (2, 65, 55)),
+                    # Previous fail cases
+                    # issue 502
+                    ((32, 1, 2880), (32, 2880, 2880)),
+                    # issue 1349
+                    ((44, 1, 2880), (44, 2880, 2880)),
+                    ((256, 1, 128), (256, 128, 512)),
                 ],
                 rand_type="xavier",
             ),
@@ -1372,6 +1378,79 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_overwrite",
+            "test_overwrite_cpu",
+        ): {
+            "param_sets": {
+                "1d_dim0_single": (
+                    cached_randn((64,), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                    [0],
+                    [128],
+                ),
+                "1d_dim0_multi": (
+                    cached_randn((128,), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                    [0],
+                    [64],
+                ),
+                "2d_dim0_single": (
+                    cached_randn((1, 256), dtype=torch.float16),
+                    cached_randn((16, 256), dtype=torch.float16),
+                    [0],
+                    [8],
+                ),
+                "2d_dim0_multi": (
+                    cached_randn((4, 256), dtype=torch.float16),
+                    cached_randn((16, 256), dtype=torch.float16),
+                    [0],
+                    [3],
+                ),
+                "2d_dim1_single": (
+                    cached_randn((8, 64), dtype=torch.float16),
+                    cached_randn((8, 256), dtype=torch.float16),
+                    [1],
+                    [128],
+                ),
+                "2d_dim1_multi": (
+                    cached_randn((8, 128), dtype=torch.float16),
+                    cached_randn((8, 256), dtype=torch.float16),
+                    [1],
+                    [64],
+                ),
+                "3d_dim0_single": (
+                    cached_randn((1, 4, 256), dtype=torch.float16),
+                    cached_randn((8, 4, 256), dtype=torch.float16),
+                    [0],
+                    [3],
+                ),
+                "3d_dim0_multi": (
+                    cached_randn((5, 4, 256), dtype=torch.float16),
+                    cached_randn((8, 4, 256), dtype=torch.float16),
+                    [0],
+                    [2],
+                ),
+                "4d_dim0_single": (
+                    cached_randn((1, 8, 4, 256), dtype=torch.float16),
+                    cached_randn((4, 8, 4, 256), dtype=torch.float16),
+                    [0],
+                    [2],
+                ),
+                "4d_dim1_single": (
+                    cached_randn((4, 1, 4, 256), dtype=torch.float16),
+                    cached_randn((4, 8, 4, 256), dtype=torch.float16),
+                    [1],
+                    [3],
+                ),
+                "4d_dims01_multi": (
+                    cached_randn((4, 3, 4, 128), dtype=torch.float16),
+                    cached_randn((4, 8, 4, 256), dtype=torch.float16),
+                    [1, 3],
+                    [2, 128],
+                ),
+            },
+        },
+        (
             "test_cat",
             "test_cat_cpu",
         ): {
@@ -1512,6 +1591,58 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_dim0_left": (
                     cached_randn((2, 3, 4, 64), dtype=torch.float16),
                     (0, 0, 0, 0, 0, 0, 1, 0),
+                ),
+                "2d_last_dim_negative_right": (
+                    cached_randn((3, 256), dtype=torch.float16),
+                    (0, -64),
+                ),
+                "2d_last_dim_negative_left": (
+                    cached_randn((5, 256), dtype=torch.float16),
+                    (-64, 0),
+                ),
+                "2d_last_dim_negative_both": (
+                    cached_randn((5, 256), dtype=torch.float16),
+                    (-64, -64),
+                ),
+                "2d_last_dim_mixed": (
+                    cached_randn((5, 256), dtype=torch.float16),
+                    (-64, 64),
+                ),
+                "2d_dim0_negative": (
+                    cached_randn((5, 256), dtype=torch.float16),
+                    (0, 0, -2, 0),
+                ),
+                "2d_dim0_mixed": (
+                    cached_randn((5, 64), dtype=torch.float16),
+                    (0, 0, -1, 2),
+                ),
+                "3d_last_dim_negative_right": (
+                    cached_randn((2, 5, 128), dtype=torch.float16),
+                    (0, -64),
+                ),
+                "3d_last_dim_mixed": (
+                    cached_randn((2, 5, 128), dtype=torch.float16),
+                    (64, -32),
+                ),
+                "3d_dim1_negative": (
+                    cached_randn((2, 5, 128), dtype=torch.float16),
+                    (0, 0, -2, 0),
+                ),
+                "3d_dim1_negative_both": (
+                    cached_randn((2, 5, 128), dtype=torch.float16),
+                    (0, 0, -2, -2),
+                ),
+                "3d_dim1_mixed": (
+                    cached_randn((2, 5, 128), dtype=torch.float16),
+                    (0, 0, -1, 2),
+                ),
+                "4d_dim1_mixed": (
+                    cached_randn((2, 5, 8, 64), dtype=torch.float16),
+                    (0, 0, 0, 0, -1, 2),
+                ),
+                "4d_dim2_negative_both": (
+                    cached_randn((2, 5, 8, 64), dtype=torch.float16),
+                    (0, 0, -2, -2),
                 ),
             },
         },
@@ -2090,6 +2221,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_stick": (torch.rand(2, 2, 2, 3, dtype=torch.float16),),
                 "5d_stick": (torch.rand(1, 2, 3, 4, 5, dtype=torch.float16),),
                 "6d_stick": (torch.rand(1, 3, 5, 2, 4, 62, dtype=torch.float16),),
+            },
+        },
+        ("test_mean_default", "test_mean_default_cpu"): {
+            "param_sets": {
+                "1d": (cached_randn((512,)),),
+                "2d": (cached_randn((32, 64)),),
+                "3d": (cached_randn((1, 11, 4096)),),
             },
         },
         ("test_mean", "test_mean_cpu"): {
@@ -4317,6 +4455,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cached_randn(input_dims, dtype=torch.float16),
         )
 
+    @pytest.mark.filterwarnings(
+        "ignore:torch\\.ops\\.spyre\\.overwrite is deprecated.*:FutureWarning"
+    )
+    def test_overwrite_cpu(self, input, output, dims, offsets):
+        def fn(input, output):
+            torch.ops.spyre.overwrite(input, output, dims, offsets)
+            return output
+
+        self.compare_with_cpu(fn, input, output, clone_inputs=True)
+
     def test_flatten_cpu(self, start_dim, end_dim, x):
         """Test flatten operation with various dimension ranges."""
         self.compare_with_cpu(lambda x: x.flatten(start_dim, end_dim), x)
@@ -4418,7 +4566,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, *tensors)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pad_cpu(self, x, pad):
         """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
 
@@ -4426,21 +4573,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.pad(x, pad)
 
         self.compare_with_cpu(fn, x)
-
-    def test_pad_unsupported(self):
-        """Padding cases that raise Unsupported due to logical decomposition constraints."""
-        from torch_spyre._inductor.errors import Unsupported
-
-        unsupported_cases = [
-            # Negative padding (cropping).
-            (cached_randn((3, 64), dtype=torch.float16), (0, -32)),
-            (cached_randn((4, 64), dtype=torch.float16), (0, 0, 0, -2)),
-        ]
-        from torch_spyre._inductor.decompositions import pad_decomp
-
-        for x, pad in unsupported_cases:
-            with pytest.raises(Unsupported):
-                pad_decomp(x, list(pad))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
@@ -4503,6 +4635,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_copy_roundtrip(self, x):
         self.compare_with_cpu(lambda x: x, x)
+
+    def test_mean_default_cpu(self, x):
+        self.compare_with_cpu(lambda x: torch.mean(x), x)
 
     def test_mean_cpu(self, dim, keepdim, x):
         self.compare_with_cpu(lambda x: torch.mean(x, dim=dim, keepdim=keepdim), x)
