@@ -1485,6 +1485,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_exp_overflow",
+            "test_unary_op",
+        ): {
+            "ops_dict": {
+                "exp": torch.exp,
+            },
+            "param_sets": {
+                "fp16_near_max": (torch.tensor([10.0, 10.5, 11.0], dtype=torch.float16),),
+                "fp16_overflow": (torch.tensor([15.0, 20.0, 50.0], dtype=torch.float16),),
+                "fp32_near_max": (torch.tensor([87.0, 88.0, 88.5], dtype=torch.float32),),
+                "fp32_overflow": (torch.tensor([100.0, 200.0, 500.0], dtype=torch.float32),),
+                "fp16_underflow": (torch.tensor([-50.0, -100.0, -200.0], dtype=torch.float16),),
+                "fp32_underflow": (torch.tensor([-100.0, -200.0, -500.0], dtype=torch.float32),),
+                "fp16_mixed": (torch.tensor([-20.0, 0.0, 12.0], dtype=torch.float16),),
+                "fp32_mixed": (torch.tensor([-100.0, 0.0, 90.0], dtype=torch.float32),),
+            },
+        },
+        (
             "test_bitwise_not",
             "test_fallback_unary_op_cpu",
         ): {
