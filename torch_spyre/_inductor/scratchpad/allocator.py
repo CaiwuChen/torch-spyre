@@ -31,6 +31,10 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
 )
+from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+    BestFitLayoutSolver,
+    FirstFitLayoutSolver,
+)
 from torch_spyre._inductor.scratchpad.passes import (
     CloneInputNodesPass,
     ScratchpadOptimizationPass,
@@ -199,7 +203,16 @@ class DefaultAllocator(ScratchpadAllocator):
         """
         size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
         if layout_planning is None:
-            layout_planning = GreedyLayoutSolver(size)
+            if config.layout_solver == "greedy":
+                layout_planning = GreedyLayoutSolver(size)
+            elif config.layout_solver == "bestfit":
+                layout_planning = BestFitLayoutSolver(size)
+            elif config.layout_solver == "firstfit":
+                layout_planning = FirstFitLayoutSolver(size)
+            else:
+                raise ValueError(
+                    f"Invalid layout_solver config option '{config.layout_solver}'."
+                )
         if pre_optimization_passes is None:
             pre_optimization_passes = [CloneInputNodesPass(size)]
         if post_optimization_passes is None:
@@ -312,6 +325,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             if chosen != getattr(op, "op_it_space_splits", ({}, {})):
                 op.op_it_space_splits = chosen
 
+        # try insert clone again, as what was incompatible could be compatible now
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
         # Standard downstream flow on the now-fixed winning splits. Mirrors
         # DefaultAllocator.plan_allocation past the pre-passes.
         buffers = self._generate_buffers(graph)
