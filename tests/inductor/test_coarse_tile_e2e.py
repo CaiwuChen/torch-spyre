@@ -1265,7 +1265,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @unittest.skip("TODO: coarse tiling correctness not yet resolved")
     @config.patch({"coarse_tiling": True})
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
@@ -1329,10 +1328,46 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             result,
             ref,
             equal_nan=True,
-            atol=1.0,
+            atol=0.01,
             rtol=0.1,
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
+
+    @config.patch({"coarse_tiling": True})
+    def test_hint_h_tiling_elementwise(self):
+        """spyre_hint(slices={"H": 2}) tiles elementwise multiply over the H dimension.
+
+        Regression test for a bug in _byte_stride_for_arg (unroll.py) where
+        align_tensors rewrites device_coordinates but leaves stride_map stale,
+        causing per-tile HBM base addresses to advance by the wrong amount when
+        the tiled dimension is not the outermost host dimension (e.g. H in BHLD).
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        torch.manual_seed(42)
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64  # Lk == Lq intentionally; same seq-len
+
+        Q = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        V = torch.randn(B, H, Lk, D, dtype=torch.float16)
+
+        def fn(q, v):
+            with spyre_hint(slices={"H": 2}):
+                return q * v
+
+        ref = fn(Q, V)
+
+        Q_dev = Q.to("spyre")
+        V_dev = V.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(Q_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(V_dev, ["B", "H", "Lk", "D"])
+
+        result = torch.compile(fn)(Q_dev, V_dev).cpu()
+        torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
 
 
 if __name__ == "__main__":
