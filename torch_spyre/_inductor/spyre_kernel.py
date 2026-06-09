@@ -37,6 +37,7 @@ from .constants import (
     IDENTITY_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
@@ -70,6 +71,74 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+
+
+def _preserve_shared_weight_unit_bmm_dim(
+    op: str,
+    it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+    args: Sequence[TensorArg],
+    op_info: dict[str, Any],
+) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
+    # TensorArg layout is normalized in-place below to match the surrounding
+    # OpSpec construction helpers.
+    if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
+        return it_space
+    if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        return it_space
+    if len(it_space) != 3 or len(args) < 3:
+        return it_space
+    info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
+    if not isinstance(info, dict) or info.get("batch_dim") != 0:
+        return it_space
+
+    unit_sym = sympy.Symbol("_spyre_bmm_unit")
+    suffix = 0
+    while unit_sym in it_space:
+        suffix += 1
+        unit_sym = sympy.Symbol(f"_spyre_bmm_unit_{suffix}")
+
+    def _unit_indices(arg: TensorArg) -> list[int]:
+        return [
+            idx
+            for idx, (size, coord) in enumerate(
+                zip(arg.device_size[:-1], arg.device_coordinates[:-1])
+            )
+            if concretize_expr(size) == 1 and coord == 0
+        ]
+
+    target_args = (args[0], args[-1])
+    unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
+
+    if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
+        for arg in target_args:
+            if len(arg.device_size) < 2:
+                return it_space
+            insert_at = len(arg.device_size) - 1
+            arg.device_size.insert(insert_at, 1)
+            arg.device_coordinates.insert(insert_at, sympy.S.Zero)
+            if arg.stride_map is not None:
+                arg.stride_map.insert(insert_at, -1)
+        unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
+
+    if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
+        return it_space
+
+    rewrite_targets = [
+        (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
+    ]
+
+    for arg, unit_idx in rewrite_targets:
+        arg.device_coordinates[unit_idx] = unit_sym
+        nonstick = list(range(len(arg.device_size) - 1))
+        order = [unit_idx] + [i for i in reversed(nonstick) if i != unit_idx]
+        order.append(len(arg.device_size) - 1)
+        arg.device_size[:] = [arg.device_size[i] for i in order]
+        arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
+        if arg.stride_map is not None and len(arg.stride_map) == len(order):
+            arg.stride_map[:] = [arg.stride_map[i] for i in order]
+
+    logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
+    return {unit_sym: (sympy.S.One, 1), **it_space}
 
 
 @dataclass
@@ -449,6 +518,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = {
             k: (v, work_division.get(k, 1)) for k, v in it_space.items()
         }
+        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
+            op, it_space_extended, args, op_info
+        )
 
         # If this op is inside a coarse-tiling loop, identify which iteration-space
         # symbols are tiled by the enclosing loop(s).  loop_tiled_dims is a
@@ -817,4 +889,8 @@ def simplify_op_spec(op_spec):
                 j = old_sym_to_idx.get(next(iter(syms)))
                 if j is not None and j < len(old_stride_map):
                     new_stride_map[d] = old_stride_map[j]
+            # TODO: consider whether this stick-dim stride preservation should
+            # apply to other op types once another validated case needs it.
+            if SHARED_WEIGHT_UNIT_BMM_INFO_KEY in op_spec.op_info and old_stride_map:
+                new_stride_map[-1] = old_stride_map[-1]
             arg.stride_map = new_stride_map

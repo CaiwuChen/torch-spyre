@@ -257,11 +257,14 @@ ALL_DTYPES = [
 ALL_DTYPE_PAIRS = [(src, dst) for src in ALL_DTYPES for dst in ALL_DTYPES if src != dst]
 
 TO_DTYPE_OP_SHAPES_UNALIGNED = [
+    (68,),  # 1D unaligned: 68 > 1 fp16 stick (64 elems), not a multiple of 64
     (4, 16),
     (4, 68),
 ]
 
 TO_DTYPE_OP_SHAPES_ALIGNED = [
+    (64,),  # 1D aligned: exactly 1 fp16 stick — regression for 1D dtype-conv crash
+    (5120,),  # 1D aligned: 80 fp16 sticks — exact repro shape from the bug report
     (4, 64),
     (4, 8, 128),
     (2, 4, 8, 64),
@@ -289,11 +292,17 @@ TO_DTYPE_OP_PARAMS_SETS = {
     if src != torch.bool and dst != torch.bool
 }
 
+
+_DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
+
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if (shape == (4, 68) or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP)
+    if (
+        shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
+        or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+    )
 ]
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
@@ -1250,6 +1259,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16
                     ),
                 ),
+                "signed_zero": (
+                    torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
+                    torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
+                ),
             },
         },
         ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
@@ -1959,7 +1972,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([0.0, -0.0, 1.0, -1.0], dtype=torch.float16),
                 ),
             },
-            "expect_fail": ["fp16_signed_0"],
         },
         (
             "test_inplace_op",
@@ -2021,7 +2033,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256, 128)).t(),
                 ),
             },
-            "expect_fail": ["float2bool"],
         },
         (
             "test_inplace_copy_noncontiguous",
@@ -2639,6 +2650,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s0": (2, 0, cached_randn((3, 3, 192), dtype=torch.float16)),
                 "3d2s1": (2, 1, cached_randn((3, 3, 192), dtype=torch.float16)),
                 "3d2s2": (2, 2, cached_randn((3, 3, 192), dtype=torch.float16)),
+            },
+        },
+        ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
+            "param_sets": {
+                "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
             },
         },
         ("test_rope_fms", "test_rope_cpu"): {
@@ -3868,6 +3884,35 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_4x6": (cached_randn((2, 64), dtype=torch.float16), 4, 6),
                 "2d_1x1": (cached_randn((2, 64), dtype=torch.float16), 1, 1),
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
+            },
+        },
+        ("test_unfold", "test_unfold_cpu"): {
+            "param_sets": {
+                # 1D: Basic cases
+                "1d_step1": (0, 3, 1, torch.arange(10, dtype=torch.float16)),
+                "1d_step2": (0, 3, 2, torch.arange(20, dtype=torch.float16)),
+                "1d_no_overlap": (0, 4, 4, torch.arange(16, dtype=torch.float16)),
+                "1d_large": (0, 10, 5, cached_randn((100,))),
+                # 2D: Different dimensions
+                "2d_dim0": (0, 3, 1, cached_randn((10, 8))),
+                "2d_dim1": (1, 4, 2, cached_randn((8, 16))),
+                "2d_dim_neg": (-1, 3, 1, cached_randn((8, 12))),
+                "2d_square": (0, 4, 2, cached_randn((8, 8))),
+                # 3D: Each dimension
+                "3d_dim0": (0, 3, 1, cached_randn((10, 8, 6))),
+                "3d_dim1": (1, 4, 2, cached_randn((8, 16, 6))),
+                "3d_dim2": (2, 3, 1, cached_randn((8, 6, 10))),
+                # 4D: Deep learning typical
+                "4d_batch": (0, 3, 1, cached_randn((8, 4, 6, 6))),
+                "4d_spatial": (2, 3, 1, cached_randn((4, 8, 12, 6))),
+                "4d_cnn": (2, 3, 1, cached_randn((2, 64, 28, 28))),
+                # Edge cases
+                "edge_window_1": (0, 1, 1, cached_randn((10,))),
+                "edge_single_window": (0, 5, 1, torch.arange(5, dtype=torch.float16)),
+                "edge_large_step": (0, 3, 7, cached_randn((30,))),
+                "edge_pow2_64": (0, 16, 8, cached_randn((64,))),
+                "edge_nopad_37": (0, 7, 3, cached_randn((37,))),
+                "edge_nopad_2d": (1, 5, 2, cached_randn((16, 33))),
             },
         },
         ("test_unbind", "test_unbind_cpu"): {
@@ -5113,6 +5158,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
+    def test_slice_synthetic_dims_cpu(self, x):
+        def fn(x):
+            return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
+
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
             B, S, E = q.shape
@@ -5231,6 +5282,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_bool_conversion_from_spyre(self):
+        torch.manual_seed(42)
+
+        def test_fn(input):
+            tmp = torch.mul(input, input)
+            tmp = tmp.to(dtype=torch.bool)
+            return tmp
+
+        input_cpu = (torch.randn(64) > 0.0).to(dtype=torch.float16)
+        expected_output = test_fn(input_cpu)
+
+        input_spyre = input_cpu.to("spyre")
+        compiled_fn = torch.compile(test_fn, backend="inductor")
+        output_spyre = compiled_fn(input_spyre)
+        output_cpu = output_spyre.cpu()
+
+        assert torch.equal(output_cpu, expected_output), (
+            f"Bool conversion failed: got {output_cpu.sum().item()}/{64} True, expected {expected_output.sum().item()}/{64}"
+        )
+
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
@@ -5345,6 +5416,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a.repeat(*repeat_args)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_unfold_cpu(self, dimension, size, step, x):
+        """Test unfold operation (view only, no contiguous).
+
+        NOTE: .contiguous() is not tested as it currently fails.
+        This test verifies the unfold VIEW operation works correctly.
+        """
+        self.compare_with_cpu(lambda x: x.unfold(dimension, size, step), x)
 
     def test_unbind_cpu(self, dim: int, x):
         self.compare_with_cpu(lambda a: torch.unbind(a, dim=dim), x)
