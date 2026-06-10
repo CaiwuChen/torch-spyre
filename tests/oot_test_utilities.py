@@ -6,11 +6,22 @@ oot_test_utilities.py -- Utility functions for the OOT PyTorch test framework.
 
 from __future__ import annotations
 
+import ast
+import platform as _platform
 import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+import regex as re
+import torch
+
+from oot_test_constants import (
+    DTYPE_STR_MAP,
+    REL_PATH_TOKENS,
+)
+from oot_test_matching import parse_dtype
+
 
 # ---------------------------------------------------------------------------
 # Optional YAML import
@@ -22,8 +33,42 @@ except ImportError as _yaml_err:  # pragma: no cover
         "PyYAML is required for oot_test_utilities. Install it with: pip install pyyaml"
     ) from _yaml_err
 
-import regex as re
-import torch
+
+# Normalise platform.machine() into a safe marker string once at import time.
+_OOT_PLATFORM_ARCH: str = (
+    re.sub(r"[^a-zA-Z0-9_]", "_", _platform.machine() or "unknown").strip("_")
+    or "unknown"
+)
+
+
+def _extract_base_module_name(name: str) -> str:
+    """Extract base module name by stripping YAML-generated suffixes.
+
+    Strips suffixes like:
+    - _93b52f93 (8-char hex hash)
+    - _4096 (numeric identifier)
+    - _layer0 (layer identifier)
+
+    Examples:
+        GraniteRotaryEmbedding_93b52f93 -> GraniteRotaryEmbedding
+        GraniteRMSNorm_4096 -> GraniteRMSNorm
+        GraniteDecoderLayer_layer0 -> GraniteDecoderLayer
+
+    Args:
+        name: YAML module name with potential suffix
+
+    Returns:
+        Base module name without suffix
+    """
+    parts = name.rsplit("_", 1)
+    if len(parts) == 2:
+        base_name, suffix = parts
+        # Check if suffix looks like a hash (hex) or number or "layerN"
+        if suffix.replace("layer", "").isdigit() or all(
+            c in "0123456789abcdef" for c in suffix
+        ):
+            return base_name
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +105,117 @@ def _log_warning(msg: str) -> None:
 def _log_error(msg: str) -> None:
     """Write error message to stderr for visibility during test runs."""
     os.write(2, f"[OOTDeviceTestBase ERROR] {msg}\n".encode())
+
+
+# ---------------------------------------------------------------------------
+# Python literal evaluator
+# ---------------------------------------------------------------------------
+
+_PY_ALLOWED_NODES = {
+    ast.Expression,
+    ast.Constant,
+    ast.Tuple,
+    ast.List,
+    ast.Name,
+    ast.Call,
+    ast.Load,
+    ast.UnaryOp,
+    ast.USub,
+    ast.UAdd,
+}
+_PY_ALLOWED_NAMES: Dict[str, Any] = {
+    "None": None,
+    "Ellipsis": Ellipsis,
+    "slice": slice,
+    "inf": float("inf"),
+    "nan": float("nan"),
+}
+
+_TOKEN_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _eval_py_literal(expr: str) -> Any:
+    """Safely evaluate a restricted Python literal (slice, tuple, Ellipsis, etc.)."""
+    node = ast.parse(expr, mode="eval")
+    for n in ast.walk(node):
+        if type(n) not in _PY_ALLOWED_NODES:
+            raise ValueError(
+                f"Node type {type(n).__name__!r} not allowed in py: {expr!r}"
+            )
+        if isinstance(n, ast.Call):
+            if not (isinstance(n.func, ast.Name) and n.func.id == "slice"):
+                raise ValueError(f"Only slice(...) calls are allowed in py: {expr!r}")
+        if isinstance(n, ast.Name) and n.id not in _PY_ALLOWED_NAMES:
+            raise ValueError(f"Name {n.id!r} not allowed in py: {expr!r}")
+    return eval(compile(node, "<py>", "eval"), {"__builtins__": {}}, _PY_ALLOWED_NAMES)
+
+
+# ---------------------------------------------------------------------------
+# Dtype resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_dtype_str(spec: str) -> torch.dtype:
+    """Resolve a dtype string using DTYPE_STR_MAP. Accepts 'float16' or 'torch.float16'."""
+    bare = spec.removeprefix("torch.")
+    if bare in DTYPE_STR_MAP:
+        return DTYPE_STR_MAP[bare]
+    try:
+        return parse_dtype(bare)
+    except ValueError:
+        pass
+    raise ValueError(
+        f"Unsupported dtype: {spec!r}. "
+        f"Supported aliases: {sorted(DTYPE_STR_MAP)} and torch.<dtype>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tensor path resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_tensor_path(raw_path: str) -> str:
+    """Expand ``${TOKEN}`` placeholders in a tensor init_args.path and return
+    an absolute path.
+
+    Resolution order:
+    1. Replace every ``${TOKEN}`` using the env-var declared in REL_PATH_TOKENS.
+    2. If the result is already absolute, return it.
+    3. Otherwise resolve relative to the process working directory.
+
+    Raises:
+        ValueError:       Unknown token or its env-var is unset.
+        FileNotFoundError: Resolved path does not exist on disk.
+    """
+    token_map: dict[str, str] = {
+        tok.strip("${}") if tok.startswith("${") else tok: env_var
+        for tok, env_var in REL_PATH_TOKENS
+    }
+
+    def _replace(m: re.Match) -> str:
+        name = m.group(1)
+        if name not in token_map:
+            raise ValueError(
+                f"Unknown path token '${{{name}}}' in init_args.path={raw_path!r}. "
+                f"Known tokens: {sorted(token_map)}"
+            )
+        value = os.environ.get(token_map[name])
+        if value is None:
+            raise ValueError(
+                f"Environment variable '{token_map[name]}' (for token '${{{name}}}') "
+                f"is not set. Export it before running tests."
+            )
+        return value
+
+    expanded = _TOKEN_RE.sub(_replace, raw_path)
+    resolved = str(Path(expanded).resolve())
+
+    if not Path(resolved).exists():
+        raise FileNotFoundError(
+            f"Tensor file not found: {resolved!r}  (from init_args.path={raw_path!r})"
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
