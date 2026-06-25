@@ -841,3 +841,102 @@ def test_sparse_dense_pointwise_unsupported():
         InductorError, match="No mechanism to gather elements from multiple sticks"
     ):
         _compare(lambda a, b: a.sum(1) + b, a, b)
+
+
+# ------- Restickify padding: sliced input raises Unsupported ---------
+
+
+@pytest.mark.xfail(
+    reason="Slice detection in insert_restickify_padding not yet implemented",
+    strict=True,
+)
+def test_pad_restickify_sliced_input_raises():
+    """Sliced input to transpose+clone must raise, not silently corrupt output."""
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    with pytest.raises(
+        RuntimeError,
+        match="sliced input",
+    ):
+        _compile_and_run(
+            lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
+        )
+
+
+# ------- Restickify padding (unaligned stick dim) ---------
+
+# new_stick_dim = dim-0 (unaligned): shape (67, 128) or (1025, 1024), small tensor and large tensor.
+RESTICKIFY_PAD_2D_SIZES = [(67, 128), (1025, 1024)]
+
+
+@pytest.fixture(params=RESTICKIFY_PAD_2D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}")
+def pad_tensors_2d(request):
+    s0, s1 = request.param
+    return torch.randn((s0, s1), dtype=torch.float16)
+
+
+def test_pad_2d_transpose_clone(pad_tensors_2d):
+    """2D transpose(0,1)+clone: new stick dim is dim-0 (unaligned) — padding required."""
+    x = pad_tensors_2d
+    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
+
+
+# new_stick_dim = dim-1 (unaligned): shape (128, 67)
+RESTICKIFY_PAD_2D_LAST_SIZES = [(128, 67)]
+
+
+@pytest.fixture(params=RESTICKIFY_PAD_2D_LAST_SIZES, ids=lambda p: f"{p[0]}x{p[1]}")
+def pad_tensors_2d_last(request):
+    s0, s1 = request.param
+    return torch.randn((s0, s1), dtype=torch.float16)
+
+
+def test_pad_2d_transpose_clone_last_dim_unaligned(pad_tensors_2d_last):
+    """2D transpose(0,1)+clone: new stick dim is dim-1 (unaligned) — padding required."""
+    x = pad_tensors_2d_last
+    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
+
+
+# 3D: transpose(-2,-1).clone() — the new stick dim is the second-to-last dim
+RESTICKIFY_PAD_3D_SIZES = [(2, 67, 128), (2, 1025, 1024)]
+
+
+@pytest.fixture(params=RESTICKIFY_PAD_3D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}")
+def pad_tensors_3d(request):
+    s0, s1, s2 = request.param
+    return torch.randn((s0, s1, s2), dtype=torch.float16)
+
+
+def test_pad_3d_transpose_last2_clone(pad_tensors_3d):
+    """3D transpose(-2,-1)+clone: new stick dim is unaligned — padding required."""
+    x = pad_tensors_3d
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+# 4D: two transpose variants matching the user's shapes
+RESTICKIFY_PAD_4D_SIZES = [(2, 2, 67, 128), (2, 2, 1025, 1024)]
+
+
+@pytest.fixture(
+    params=RESTICKIFY_PAD_4D_SIZES, ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}x{p[3]}"
+)
+def pad_tensors_4d(request):
+    s0, s1, s2, s3 = request.param
+    return torch.randn((s0, s1, s2, s3), dtype=torch.float16)
+
+
+def test_pad_4d_transpose_last2_clone(pad_tensors_4d):
+    """4D transpose(-2,-1)+clone: new stick dim is unaligned — padding required."""
+    x = pad_tensors_4d
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+@pytest.fixture(ids=lambda p: f"{p[0]}x{p[1]}x{p[2]}x{p[3]}", params=[(2, 2, 67, 128)])
+def pad_tensors_4d_t1_last(request):
+    s0, s1, s2, s3 = request.param
+    return torch.randn((s0, s1, s2, s3), dtype=torch.float16)
+
+
+def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
+    """4D transpose(1,-1)+clone: swaps dim-1 and dim-3, new stick dim unaligned."""
+    x = pad_tensors_4d_t1_last
+    _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)

@@ -1055,10 +1055,9 @@ def lower_pad_sequence(
     is filled with stick-aligned offsets. This is required because the dim is
     ensured to be a stick dimension here.
 
-    ``orig_stl`` is the ``SpyreTensorLayout`` of the unpadded buffer and is used
-    to derive the padded buffer's device layout, preserving the within-stick host
-    dimension.  Raises ``RuntimeError`` if the within-stick dimension cannot be
-    determined from ``orig_stl``.
+    The padded buffer's ``SpyreTensorLayout`` is derived from ``orig_stl`` by
+    mirroring the producer's existing device layout and bumping only the
+    entry for the padded host dim.
 
     Deduplication of identical constants across multiple pad calls happens later
     at the IR level via dedup_and_promote_constants.
@@ -1141,67 +1140,7 @@ def lower_pad_sequence(
         and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
-    # --- Build the device layout (SpyreTensorLayout) for the padded buffer. ---
-    #
-    # We need to know two things to construct the padded STL:
-    #   1. The "core" host shape — the dimensions that orig_stl was actually
-    #      built from.  mm_to_bmm_pass sometimes adds a leading batch=1 dim to
-    #      padded_size (the view the matmul inner_fn uses) while leaving the
-    #      underlying buffer 2D.  Passing that phantom dim to SpyreTensorLayout
-    #      would produce a degenerate 4D device layout with a -1 sentinel stride
-    #      for the size-1 device dim, which causes compute_coordinates to emit a
-    #      constant nonzero stick offset and normalize_coordinates to assert.
-    #      We strip phantom dims by comparing padded_size rank against the host
-    #      rank implied by orig_stl: stride_map has one entry per device dim, and
-    #      device dims = host dims + 1 (the extra entry is the within-stick dim),
-    #      so orig_host_ndim = len(stride_map) - 1.
-    #   2. Which host dimension is the within-stick dimension.  SpyreTensorLayout
-    #      takes an explicit dim_order whose last element names the within-stick
-    #      host dim; we must carry this over from the original buffer so that the
-    #      padded buffer's device coordinates use the same stick dimension.  We
-    #      identify it by matching orig_stl.stride_map[-1] (the within-stick
-    #      element stride, always 1 for contiguous layouts) against the original
-    #      buffer's host strides.
-
-    # Step 1 — strip phantom batch dims to get the core host shape.
-    orig_host_ndim = len(list(orig_stl.stride_map)) - 1
-    n_phantom = len(padded_size) - orig_host_ndim
-    padded_core = padded_size[n_phantom:]
-
-    # Step 2 — identify the within-stick host dim in the view (which may include
-    # phantom leading dims) by matching the within-stick element stride.
-    sm_last = int(list(orig_stl.stride_map)[-1])
-    orig_host_stride = list(arg_fx_node.meta["val"].stride())
-    within_stick_dim_view = next(
-        (i for i, s in enumerate(orig_host_stride) if int(s) == sm_last), None
-    )
-    if within_stick_dim_view is None:
-        raise RuntimeError(
-            f"lower_pad_sequence: cannot determine within-stick host dimension for "
-            f"buffer {arg_fx_node.name!r}: orig_stl.stride_map[-1]={sm_last} not found "
-            f"in view strides {orig_host_stride}.  orig_stl={list(orig_stl.device_size)} "
-            f"stride_map={list(orig_stl.stride_map)}, padded_size={padded_size}"
-        )
-
-    # Step 3 — translate the within-stick dim index from view space to core space
-    # (subtract the number of phantom dims that were stripped in step 1).
-    within_stick_dim_core = within_stick_dim_view - n_phantom
-
-    # Step 4 — build dim_order for SpyreTensorLayout: all non-stick dims in their
-    # natural order, followed by the within-stick dim last.  This tells the STL
-    # constructor which host dim maps to the innermost device (within-stick) axis.
-    dim_order_core = [
-        i for i in range(len(padded_core)) if i != within_stick_dim_core
-    ] + [within_stick_dim_core]
-
-    # Step 5 — compute row-major strides for the padded core shape.  These are
-    # host strides, not device strides; SpyreTensorLayout derives the device
-    # layout (sticks, rows, …) from the host shape + dim_order.
-    core_stride = [1] * len(padded_core)
-    for i in range(len(padded_core) - 2, -1, -1):
-        core_stride[i] = core_stride[i + 1] * padded_core[i + 1]
-
-    padded_stl = SpyreTensorLayout(padded_core, core_stride, dtype, dim_order_core)
+    padded_stl = _build_padded_stl(arg_fx_node, padded_size, dim, orig_stl)
     host_layout = padded_buf.layout
     padded_buf.layout = FixedTiledLayout(
         host_layout.device,
@@ -1240,6 +1179,67 @@ def lower_pad_sequence(
     )
 
     return padded_buf, list(new_ops)
+
+
+def _build_padded_stl(
+    arg_fx_node: torch.fx.Node,
+    padded_size: list[int],
+    dim: int,
+    orig_stl: SpyreTensorLayout,
+) -> SpyreTensorLayout:
+    """Build a padded STL that mirrors ``orig_stl``'s dim arrangement.
+
+    Bumps the device_size entry for the padded host dim and rescales
+    stride_map entries for dims that wrap around it; everything else
+    (synthetic floor splits, custom dim orderings) is carried over verbatim.
+    """
+    original_shape = list(arg_fx_node.meta["val"].shape)
+    orig_host_stride = [int(s) for s in arg_fx_node.meta["val"].stride()]
+    padded_host_stride = [1] * len(padded_size)
+    for i in range(len(padded_size) - 2, -1, -1):
+        padded_host_stride[i] = padded_host_stride[i + 1] * padded_size[i + 1]
+
+    orig_device_size = orig_stl.device_size
+    orig_stride_map = [int(s) for s in orig_stl.stride_map]
+
+    # mm_to_bmm_pass occasionally wraps a 2D buffer in a batch=1 view, so
+    # the view's rank can exceed the host rank implied by orig_stl's
+    # stride_map (device rank = host rank + 1 for the within-stick entry).
+    n_phantom = len(padded_size) - (len(orig_device_size) - 1)
+    assert n_phantom >= 0
+
+    core_padded_host_stride = padded_host_stride[n_phantom:]
+    # Later index wins for repeated strides (size-1 dim collapse).
+    stride_to_host_dim = {s: h for h, s in enumerate(orig_host_stride[n_phantom:])}
+
+    new_stride_map: list[int] = []
+    for sm in orig_stride_map[:-1]:
+        host_dim = stride_to_host_dim.get(sm)
+        if host_dim is None:
+            # Not derived from any current host dim — synthetic constant.
+            new_stride_map.append(sm)
+        else:
+            new_stride_map.append(core_padded_host_stride[host_dim])
+    new_stride_map.append(orig_stride_map[-1])
+
+    # Bump the device_size entry that represents the padded host dim.
+    padded_dim_orig_stride = orig_host_stride[dim]
+    orig_padded_extent = original_shape[dim]
+    bumped_dim = None
+    for k, (sm, ds) in enumerate(zip(orig_stride_map[:-1], orig_device_size[:-1])):
+        if sm == padded_dim_orig_stride and ds == orig_padded_extent:
+            bumped_dim = k
+            break
+    assert bumped_dim is not None, (
+        f"_build_padded_stl: could not find device dim for padded host dim "
+        f"{dim} (orig_stride={padded_dim_orig_stride}, "
+        f"orig_extent={orig_padded_extent}, device_size={orig_device_size}, "
+        f"stride_map={orig_stride_map})"
+    )
+    new_device_size = orig_device_size[:]
+    new_device_size[bumped_dim] = padded_size[dim]
+
+    return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
 
 
 @dataclass(frozen=True)

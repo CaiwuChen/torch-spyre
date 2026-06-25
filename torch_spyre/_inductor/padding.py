@@ -49,22 +49,27 @@ from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
     Operation,
+    Pointwise,
     Reduction,
     TensorBox,
 )
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     concretize_expr,
+    concretize_index,
     find_reduction_var,
-    identify_matmul_inputs,
     host_coordinates,
+    identify_matmul_inputs,
+    is_stick_expr_offset_free,
     lower_pad_sequence,
     replace_computed_buffer_body,
 )
+from .views import compute_coordinates, matching_dim
 from torch_spyre._C import get_elem_in_stick
 
 logger = get_inductor_logger("padding")
@@ -297,3 +302,169 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         # x is left entirely untouched: the original inner_fn's x loader is
         # preserved as-is.  Only y's loader is replaced with the padded buffer.
         _rebuild_matmul(op, y_padded_buf, operations)
+
+
+# --------------------------------------------------------------------------- #
+# insert_restickify_padding                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _project_stick_host_dim(
+    host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
+) -> int | None:
+    """Return the host_layout host dim carrying stick_layout's within-stick
+    coord under dep, or None if no unique canonical match exists.
+
+    When host_layout is stick_layout this is the buffer's own within-stick
+    host dim; when they differ, stick_layout's STL is projected through dep.
+    Returns None unless the stick coord is valid.
+    """
+    host_coords = host_coordinates(host_layout, dep, None)
+    stl = stick_layout.device_layout
+    device_index = concretize_index(dep.index, set(dep.ranges.keys()))
+    device_coords = compute_coordinates(
+        stl.device_size, stl.stride_map, dep.ranges, device_index
+    )
+    if not host_coords or not device_coords:
+        return None
+    if not is_stick_expr_offset_free(device_coords[-1], stl.elems_per_stick()):
+        return None
+    return matching_dim(host_coords, device_coords[-1])
+
+
+def _restickify_input_dep(op: Operation, graph: GraphLowering):
+    """Return (in_dep, in_buf, in_layout, host_size, new_stick_dim) when op
+    is a single-input pointwise copy whose output STL puts a different host
+    dim within the stick than the input's does, else None.
+
+    Both stick dims are recovered in the input's host frame so they are
+    directly comparable; the cross-buffer projection makes transpose work
+    while reduce drops out as non-Pointwise and flatten drops out via the
+    canonical-form filter in _project_stick_host_dim.  Sliced inputs are
+    not filtered here — they raise Unsupported in the perm loop.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return None
+    out_layout = op.get_layout()
+    if not isinstance(out_layout, FixedTiledLayout):
+        return None
+    if not isinstance(op.data, Pointwise):
+        return None
+
+    rw = op.get_read_writes()
+    reads = [r for r in rw.reads if hasattr(r, "name")]
+    if len(reads) != 1:
+        return None
+    in_dep = reads[0]
+
+    in_buf = graph.get_buffer(in_dep.name)
+    if in_buf is None:
+        return None
+    in_layout = in_buf.get_layout()
+    if not isinstance(in_layout, FixedTiledLayout):
+        return None
+
+    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
+    new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
+    if in_stick_dim is None or new_stick_dim is None:
+        return None
+    if new_stick_dim == in_stick_dim:
+        return None
+
+    host_size = [concretize_expr(s) for s in in_layout.size]
+    return in_dep, in_buf, in_layout, host_size, new_stick_dim
+
+
+def insert_restickify_padding(graph: GraphLowering) -> None:
+    """Zero-pad a Restickify's input along the dim that becomes the new
+    stick dim, when its extent is not a multiple of the stick size.
+
+    Without padding, codegen widens the iteration space to a stick boundary
+    and reads past the true extent — those tail elements come from
+    uninitialized HBM and end up in the output, producing a value mismatch.
+
+    Strategy: insert a stick-aligned, zero-filled copy of the input ahead of
+    the Restickify (lower_pad_sequence) and rewrite the Restickify body to
+    load from the padded buffer through a permuted index that maps each
+    output iter dim to the corresponding input host dim.  The Restickify's
+    ranges, layout, and device_layout are left untouched; codegen's existing
+    stick-boundary widening reads from the zero-filled tail of the padded
+    buffer instead of uninitialized HBM.
+    """
+    operations = graph.operations
+    for op in list(operations):
+        match = _restickify_input_dep(op, graph)
+        if match is None:
+            continue
+        in_dep, in_buf, in_layout, host_size, new_stick_dim = match
+
+        dtype = in_layout.dtype
+        n = host_size[new_stick_dim]
+        pad = compute_padding(n, dtype)
+        if pad == 0:
+            continue
+
+        device = in_buf.get_device()
+        if device is None:
+            continue
+
+        padded_size = list(host_size)
+        padded_size[new_stick_dim] = n + pad
+
+        in_fx = _find_arg_fx_node(in_dep.name)
+        restickify_fx = next(iter(op.origins))
+        padded_buf, new_ops = lower_pad_sequence(
+            in_fx,
+            padded_size=padded_size,
+            device=device,
+            dtype=dtype,
+            dim=new_stick_dim,
+            insert_before=restickify_fx,
+            orig_stl=in_layout.device_layout,
+            fill_value=0.0,
+        )
+
+        # Move pad ops to just before the restickify (lower_pad_sequence appends).
+        for o in new_ops:
+            operations.remove(o)
+        idx = operations.index(op)
+        for i, o in enumerate(new_ops):
+            operations.insert(idx + i, o)
+
+        # Replace the restickify body with a Pointwise that reads padded_buf
+        # through a permuted index: input host dim i is addressed by output iter
+        # index perm[i], where perm[i] is the lone iter sym in in_host_coords[i].
+        # op.data.ranges stays at the logical output extent; the stick-boundary
+        # widening happens later in superdsc's _extend_restickify_to_padded
+        # (Inductor's _simplify_loops would undo it if done here).
+        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        old_iter_syms = list(in_dep.ranges.keys())
+        perm: list[int] = []
+        for i, coord in enumerate(in_host_coords):
+            picks = [j for j, s in enumerate(old_iter_syms) if s in coord.free_symbols]
+            assert len(picks) == 1, "_restickify_input_dep should have ensured this"
+            sym = old_iter_syms[picks[0]]
+            iter_extent = concretize_expr(in_dep.ranges[sym])
+            dim_size = concretize_expr(in_layout.size[i])
+            # Slice-detection lives here (not in the predicate): if the predicate
+            # returned None for slices, codegen would silently produce wrong
+            # output.  Raising here makes compilation fail loudly instead.
+            # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
+            if iter_extent != dim_size:
+                raise Unsupported(
+                    f"insert_restickify_padding: sliced input on host dim "
+                    f"{i} of {op.get_name()} (iter range {iter_extent} != "
+                    f"dim size {dim_size}) is not supported"
+                )
+            perm.append(picks[0])
+        old_pw = op.data
+        padded_loader = padded_buf.make_loader()
+        new_pw = Pointwise(
+            device=old_pw.device,
+            dtype=old_pw.dtype,
+            inner_fn=lambda index, _loader=padded_loader, _perm=tuple(perm): _loader(
+                [index[p] for p in _perm]
+            ),
+            ranges=old_pw.ranges,
+        )
+        replace_computed_buffer_body(op, new_pw, operations)

@@ -674,8 +674,41 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
+def _extend_restickify_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Round sdsc_iteration_space[stick_sym] up to a stick boundary for each
+    restickify arg.  Both input (old stick) and output (new stick) may carry
+    the unaligned iter, so we extend per-arg.
+
+    Running before ``_create_sdsc_tensors`` keeps backGap correct: the
+    unaligned-stick arg gets dev_dim_size==it_dim_size on the within-stick
+    axis (no backGap), and the other arg's outer-split strides are computed
+    against the padded extent (no stale-stride mismatch with the later
+    widening done by ``_get_padded_iteration_space``).
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        stick_size = arg.device_dtype.elems_per_stick()
+        cur = sdsc_iteration_space[stick_sym]
+        padded = ((cur + stick_size - 1) // stick_size) * stick_size
+        if padded > cur:
+            logger.debug(
+                "_extend_restickify_to_padded: extending %s %d -> %d",
+                stick_sym,
+                cur,
+                padded,
+            )
+            sdsc_iteration_space[stick_sym] = padded
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
+    is_restickify = op_spec.op == RESTICKIFY_OP
     ndim = len(op_spec.iteration_space)
 
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
@@ -729,6 +762,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_restickify:
+        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
@@ -758,7 +793,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif op_spec.op == RESTICKIFY_OP:
+    elif is_restickify:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
         pad_args, pad_sdsc_args, dim_order = (
@@ -778,7 +813,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # For restickify, update backGaps based on the padded iteration space,
     # since non-stick dimensions may now have it_dim_size > dev_dim_size.
-    if op_spec.op == RESTICKIFY_OP:
+    if is_restickify:
         for sdsc_arg, op_spec_arg in zip(args, op_spec.args):
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]

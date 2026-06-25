@@ -37,7 +37,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mark_direct_unit_bmm_pass,
@@ -324,6 +324,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            insert_restickify_padding,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
