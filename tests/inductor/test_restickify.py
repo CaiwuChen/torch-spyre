@@ -843,25 +843,6 @@ def test_sparse_dense_pointwise_unsupported():
         _compare(lambda a, b: a.sum(1) + b, a, b)
 
 
-# ------- Restickify padding: sliced input raises Unsupported ---------
-
-
-@pytest.mark.xfail(
-    reason="Slice detection in insert_restickify_padding not yet implemented",
-    strict=True,
-)
-def test_pad_restickify_sliced_input_raises():
-    """Sliced input to transpose+clone must raise, not silently corrupt output."""
-    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
-    with pytest.raises(
-        RuntimeError,
-        match="sliced input",
-    ):
-        _compile_and_run(
-            lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
-        )
-
-
 # ------- Restickify padding (unaligned stick dim) ---------
 
 # new_stick_dim = dim-0 (unaligned): shape (67, 128) or (1025, 1024), small tensor and large tensor.
@@ -940,3 +921,35 @@ def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
     """4D transpose(1,-1)+clone: swaps dim-1 and dim-3, new stick dim unaligned."""
     x = pad_tensors_4d_t1_last
     _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify padding: sliced tensor inputs ---------
+#
+# When the restickify input is a slice of a larger tensor the new-stick dim
+# extent is the slice size (not the full backing-buffer size).
+# insert_restickify_padding must pad from the slice extent and use the
+# already-lowered slice FX node so that lower_pad_sequence sees the correct
+# original shape and storage offset.
+
+
+def test_pad_sliced_4d_complex_offset():
+    """4D: x[:, :, 1:66, :].transpose(-2,-1) — sliced dim-2 (65 elems) becomes
+    new stick dim; padding must use the slice size, not the backing-buffer size."""
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    _compare(lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), x, check_strides=False)
+
+
+def test_pad_sliced_4d_multiple_slices():
+    """4D: x[:, 1:7, 1:66, :].transpose(-2,-1) — slices on dim-1 and dim-2."""
+    x = torch.randn((4, 8, 67, 128), dtype=torch.float16)
+    _compare(lambda x: x[:, 1:7, 1:66, :].transpose(-2, -1).clone(), x, check_strides=False)
+
+
+def test_pad_sliced_4d_both_transpose_dims_sliced():
+    """4D: both transposed dims are sliced and unaligned.
+    new stick dim and the other transpose dim both come from slices;
+    storage_offset matching in _find_slice_fx_node must resolve the
+    correct ReinterpretView."""
+    x = torch.randn((4, 8, 67, 131), dtype=torch.float16)
+    _compare(lambda x: x[:, :, 1:66, 3:130].transpose(-2, -1).clone(), x, check_strides=False)
+

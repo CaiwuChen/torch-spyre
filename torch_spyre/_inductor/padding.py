@@ -56,7 +56,6 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_OP
-from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -70,7 +69,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates, matching_dim
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import get_elem_in_stick, SpyreTensorLayout
 
 logger = get_inductor_logger("padding")
 
@@ -310,14 +309,18 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 
 def _project_stick_host_dim(
-    host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
+    host_layout: FixedTiledLayout,
+    stick_layout: FixedTiledLayout,
+    dep,
+    allow_offset: bool = False,
 ) -> int | None:
     """Return the host_layout host dim carrying stick_layout's within-stick
     coord under dep, or None if no unique canonical match exists.
 
     When host_layout is stick_layout this is the buffer's own within-stick
     host dim; when they differ, stick_layout's STL is projected through dep.
-    Returns None unless the stick coord is valid.
+    Returns None unless the stick coord is valid (offset-free, unless
+    allow_offset=True in which case a constant additive offset is permitted).
     """
     host_coords = host_coordinates(host_layout, dep, None)
     stl = stick_layout.device_layout
@@ -327,9 +330,25 @@ def _project_stick_host_dim(
     )
     if not host_coords or not device_coords:
         return None
-    if not is_stick_expr_offset_free(device_coords[-1], stl.elems_per_stick()):
+    stick_expr = device_coords[-1]
+    elems = stl.elems_per_stick()
+    if is_stick_expr_offset_free(stick_expr, elems):
+        return matching_dim(host_coords, stick_expr)
+    if not allow_offset:
         return None
-    return matching_dim(host_coords, device_coords[-1])
+    # Strip the constant offset; the variable part must be a valid stick expression.
+    free = stick_expr.free_symbols
+    if not free:
+        return None
+    var_part = stick_expr - stick_expr.subs({s: 0 for s in free})
+    if not is_stick_expr_offset_free(var_part, elems):
+        return None
+    # Strip offsets from host coords so matching_dim sees bare variables.
+    stripped_host = [
+        (c - c.subs({s: 0 for s in c.free_symbols}) if c.free_symbols else c)
+        for c in host_coords
+    ]
+    return matching_dim(stripped_host, var_part)
 
 
 def _restickify_input_dep(op: Operation, graph: GraphLowering):
@@ -341,7 +360,7 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     directly comparable; the cross-buffer projection makes transpose work
     while reduce drops out as non-Pointwise and flatten drops out via the
     canonical-form filter in _project_stick_host_dim.  Sliced inputs are
-    not filtered here — they raise Unsupported in the perm loop.
+    handled by insert_restickify_padding via allow_offset=True.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -364,8 +383,12 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
-    new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
+    in_stick_dim = _project_stick_host_dim(
+        in_layout, in_layout, in_dep, allow_offset=True
+    )
+    new_stick_dim = _project_stick_host_dim(
+        in_layout, out_layout, in_dep, allow_offset=True
+    )
     if in_stick_dim is None or new_stick_dim is None:
         return None
     if new_stick_dim == in_stick_dim:
@@ -373,6 +396,50 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
 
     host_size = [concretize_expr(s) for s in in_layout.size]
     return in_dep, in_buf, in_layout, host_size, new_stick_dim
+
+
+def _find_slice_fx_node(
+    in_dep, iter_extents: list[int], offsets: list[int]
+) -> torch.fx.Node:
+    """Return the FX node for a sliced view of the buffer named in_dep.name.
+
+    For sliced inputs Inductor lowers the slice to a ReinterpretView sharing
+    the same buffer name as the base but with a smaller shape and a non-zero
+    storage offset.  We locate it by matching shape and, when multiple
+    candidates exist, by matching the expected storage offset derived from the
+    host strides and per-dim slice offsets.
+    """
+    graph_lowering = V.graph
+    _patch_env(graph_lowering)
+    target_shape = list(iter_extents)
+    candidates = [
+        fx_node
+        for fx_node, tb in graph_lowering.env.items()
+        if isinstance(fx_node, torch.fx.Node)
+        and isinstance(tb, TensorBox)
+        and tb.get_name() == in_dep.name
+        and list(fx_node.meta["val"].shape) == target_shape
+    ]
+    if not candidates:
+        raise RuntimeError(
+            f"_find_slice_fx_node: no FX node with name={in_dep.name!r} "
+            f"and shape={target_shape}"
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+    # Break ties by matching storage_offset against the expected linear offset.
+    in_buf = graph_lowering.get_buffer(in_dep.name)
+    if in_buf is not None:
+        host_stride = [int(s) for s in in_buf.get_layout().stride]
+        expected_offset = sum(o * s for o, s in zip(offsets, host_stride))
+        for fx_node in candidates:
+            val = fx_node.meta["val"]
+            actual_so = (
+                int(val.storage_offset()) if hasattr(val, "storage_offset") else None
+            )
+            if actual_so is not None and actual_so == expected_offset:
+                return fx_node
+    return candidates[0]
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -390,6 +457,10 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
     ranges, layout, and device_layout are left untouched; codegen's existing
     stick-boundary widening reads from the zero-filled tail of the padded
     buffer instead of uninitialized HBM.
+
+    Sliced inputs are handled by using the slice's iter extents for the
+    padded buffer shape, and by finding the already-lowered slice FX node
+    so that lower_pad_sequence sees the correct shape and storage offset.
     """
     operations = graph.operations
     for op in list(operations):
@@ -399,20 +470,68 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         in_dep, in_buf, in_layout, host_size, new_stick_dim = match
 
         dtype = in_layout.dtype
-        n = host_size[new_stick_dim]
-        pad = compute_padding(n, dtype)
-        if pad == 0:
-            continue
-
         device = in_buf.get_device()
         if device is None:
             continue
 
-        padded_size = list(host_size)
+        in_host_coords = host_coordinates(in_layout, in_dep, None)
+        old_iter_syms = list(in_dep.ranges.keys())
+        perm: list[int] = []
+        iter_extents: list[int] = []
+        offsets: list[int] = []
+        for i, coord in enumerate(in_host_coords):
+            picks = [j for j, s in enumerate(old_iter_syms) if s in coord.free_symbols]
+            if len(picks) == 0:
+                # size-1 dim: constant coordinate, no loop variable.
+                # Use a placeholder perm entry pointing to the first sym; the
+                # loader will receive index[0] which equals 0 for a size-1 dim.
+                iter_extents.append(1)
+                offsets.append(0)
+                perm.append(0)
+                continue
+            assert len(picks) == 1, "_restickify_input_dep should have ensured this"
+            sym = old_iter_syms[picks[0]]
+            iter_extents.append(concretize_expr(in_dep.ranges[sym]))
+            offsets.append(int(coord.subs(sym, 0)) if hasattr(coord, "subs") else 0)
+            perm.append(picks[0])
+
+        n = iter_extents[new_stick_dim]
+        pad = compute_padding(n, dtype)
+        if pad == 0:
+            continue
+
+        padded_size = list(iter_extents)
         padded_size[new_stick_dim] = n + pad
 
-        in_fx = _find_arg_fx_node(in_dep.name)
+        # For contiguous inputs use the base FX node directly.  For sliced
+        # inputs find the already-lowered ReinterpretView whose shape matches
+        # iter_extents and whose storage offset matches the slice offsets.
+        base_fx = _find_arg_fx_node(in_dep.name)
+        if list(base_fx.meta["val"].shape) != iter_extents:
+            in_fx = _find_slice_fx_node(in_dep, iter_extents, offsets)
+        else:
+            in_fx = base_fx
+
         restickify_fx = next(iter(op.origins))
+
+        # For sliced inputs orig_stl's device_size reflects the full backing
+        # buffer while in_fx reflects the slice extent.  Patch orig_stl's
+        # device_size for each sliced dim so _build_padded_stl can match
+        # device dims against the slice extent rather than the full size.
+        orig_stl = in_layout.device_layout
+        if iter_extents != host_size:
+            old_ds = list(orig_stl.device_size)
+            old_sm = list(orig_stl.stride_map)
+            new_ds = list(old_ds)
+            for host_dim, (ie, hs) in enumerate(zip(iter_extents, host_size)):
+                if ie != hs:
+                    host_stride_val = int(in_layout.stride[host_dim])
+                    for k, (sm, ds) in enumerate(zip(old_sm[:-1], old_ds[:-1])):
+                        if sm == host_stride_val and ds == hs:
+                            new_ds[k] = ie
+                            break
+            orig_stl = SpyreTensorLayout(new_ds, old_sm, orig_stl.device_dtype)
+
         padded_buf, new_ops = lower_pad_sequence(
             in_fx,
             padded_size=padded_size,
@@ -420,7 +539,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
             dtype=dtype,
             dim=new_stick_dim,
             insert_before=restickify_fx,
-            orig_stl=in_layout.device_layout,
+            orig_stl=orig_stl,
             fill_value=0.0,
         )
 
@@ -437,26 +556,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # op.data.ranges stays at the logical output extent; the stick-boundary
         # widening happens later in superdsc's _extend_restickify_to_padded
         # (Inductor's _simplify_loops would undo it if done here).
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
-        old_iter_syms = list(in_dep.ranges.keys())
-        perm: list[int] = []
-        for i, coord in enumerate(in_host_coords):
-            picks = [j for j, s in enumerate(old_iter_syms) if s in coord.free_symbols]
-            assert len(picks) == 1, "_restickify_input_dep should have ensured this"
-            sym = old_iter_syms[picks[0]]
-            iter_extent = concretize_expr(in_dep.ranges[sym])
-            dim_size = concretize_expr(in_layout.size[i])
-            # Slice-detection lives here (not in the predicate): if the predicate
-            # returned None for slices, codegen would silently produce wrong
-            # output.  Raising here makes compilation fail loudly instead.
-            # TODO: support sliced inputs (e.g. ``x[:, :, 1:66, :].transpose(-2, -1)``).
-            if iter_extent != dim_size:
-                raise Unsupported(
-                    f"insert_restickify_padding: sliced input on host dim "
-                    f"{i} of {op.get_name()} (iter range {iter_extent} != "
-                    f"dim size {dim_size}) is not supported"
-                )
-            perm.append(picks[0])
         old_pw = op.data
         padded_loader = padded_buf.make_loader()
         new_pw = Pointwise(
