@@ -940,3 +940,80 @@ def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
     """4D transpose(1,-1)+clone: swaps dim-1 and dim-3, new stick dim unaligned."""
     x = pad_tensors_4d_t1_last
     _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify padding: size-1 dimension inputs ---------
+# Regression tests for Blocker 2: inputs with a size-1 host dim previously
+# triggered a bare AssertionError in the perm loop because compute_coordinates
+# skips loop variables with range <= 1, leaving those dims with no free
+# symbols. _restickify_input_dep now returns None for size-1 inputs, bypassing
+# the padding path safely (a single-element dim cannot produce HBM over-reads).
+
+
+def test_pad_size1_leading_dim_transpose_clone():
+    """(1, 67, 128) transpose(-2,-1)+clone: leading dim is size=1.
+    Must not raise AssertionError; output must match CPU."""
+    x = torch.randn((1, 67, 128), dtype=torch.float16)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+def test_pad_size1_middle_dim_transpose_clone():
+    """(2, 1, 67, 128) transpose(-2,-1)+clone: dim-1 is size=1.
+    Must not raise AssertionError; output must match CPU."""
+    x = torch.randn((2, 1, 67, 128), dtype=torch.float16)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify padding: fp32 dtype ---------
+# fp32 has elems_per_stick=32 (half of fp16's 64), which exercises different
+# boundaries in compute_padding and _build_padded_stl.
+# 33 elements is unaligned for fp32 (33 % 32 == 1) but aligned for fp16.
+# ReStickifyOpHBM does not yet support IEEE_FP32 on hardware, so these tests
+# are xfail until fp32 restickify is enabled.
+
+
+@pytest.mark.xfail(
+    reason="ReStickifyOpHBM does not support IEEE_FP32 on Spyre hardware",
+    strict=True,
+)
+def test_pad_fp32_2d_transpose_clone():
+    """(33, 64) fp32 transpose(0,1)+clone: unaligned for fp32 stick (32 elems)."""
+    x = torch.randn((33, 64), dtype=torch.float32)
+    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
+
+
+@pytest.mark.xfail(
+    reason="ReStickifyOpHBM does not support IEEE_FP32 on Spyre hardware",
+    strict=True,
+)
+def test_pad_fp32_3d_transpose_clone():
+    """(2, 33, 64) fp32 transpose(-2,-1)+clone: unaligned for fp32 stick."""
+    x = torch.randn((2, 33, 64), dtype=torch.float32)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+# ------- Restickify padding: both dims unaligned ---------
+# Regression tests for Blocker 1: when both new_stick_dim AND in_stick_dim are
+# unaligned, _extend_restickify_to_padded widens both iter syms to a stick
+# boundary. Without padding the old stick dim the tail reads stale HBM values.
+# These tests are xfail until dual-dim padding is implemented.
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Blocker 1: both-unaligned case requires dual-dim padding"
+        " (not yet implemented)"
+    ),
+    strict=True,
+)
+def test_pad_2d_transpose_clone_both_unaligned():
+    """(67, 67) transpose(0,1)+clone: both dims unaligned — both must be padded."""
+    x = torch.randn((67, 67), dtype=torch.float16)
+    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
+
+
+def test_pad_3d_transpose_last2_clone_both_unaligned():
+    """(2, 67, 67) transpose(-2,-1)+clone: both transposed dims unaligned."""
+    x = torch.randn((2, 67, 67), dtype=torch.float16)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+

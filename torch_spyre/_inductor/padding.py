@@ -93,6 +93,22 @@ def _patch_env(graph_lowering) -> None:
     graph_lowering.env.update(env)
 
 
+def _move_ops_before(
+    operations: list[Operation], new_ops: list[Operation], anchor: Operation
+) -> None:
+    """Relocate *new_ops* to sit immediately before *anchor* in *operations*.
+
+    ``lower_pad_sequence`` appends new ops at the end of ``operations``; this
+    helper moves them to just before the op that consumes them so topological
+    order is preserved.
+    """
+    for o in new_ops:
+        operations.remove(o)
+    idx = operations.index(anchor)
+    for i, o in enumerate(new_ops):
+        operations.insert(idx + i, o)
+
+
 def _find_arg_fx_node(arg_name: str) -> torch.fx.Node:
     """Return the FX node whose lowered TensorBox has the given buffer name.
 
@@ -292,11 +308,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
         # --- Relocate new ops before the matmul ---
         # run_node appended them at the end of operations; move before op.
-        for new_op in y_new_ops:
-            operations.remove(new_op)
-        op_idx = operations.index(op)
-        for i, new_op in enumerate(y_new_ops):
-            operations.insert(op_idx + i, new_op)
+        _move_ops_before(operations, y_new_ops, op)
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is
@@ -310,7 +322,10 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
 
 
 def _project_stick_host_dim(
-    host_layout: FixedTiledLayout, stick_layout: FixedTiledLayout, dep
+    host_layout: FixedTiledLayout,
+    stick_layout: FixedTiledLayout,
+    dep,
+    host_coords=None,
 ) -> int | None:
     """Return the host_layout host dim carrying stick_layout's within-stick
     coord under dep, or None if no unique canonical match exists.
@@ -318,8 +333,11 @@ def _project_stick_host_dim(
     When host_layout is stick_layout this is the buffer's own within-stick
     host dim; when they differ, stick_layout's STL is projected through dep.
     Returns None unless the stick coord is valid.
+
+    Pass ``host_coords`` if already computed to avoid recomputation.
     """
-    host_coords = host_coordinates(host_layout, dep, None)
+    if host_coords is None:
+        host_coords = host_coordinates(host_layout, dep, None)
     stl = stick_layout.device_layout
     device_index = concretize_index(dep.index, set(dep.ranges.keys()))
     device_coords = compute_coordinates(
@@ -342,6 +360,13 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     while reduce drops out as non-Pointwise and flatten drops out via the
     canonical-form filter in _project_stick_host_dim.  Sliced inputs are
     not filtered here — they raise Unsupported in the perm loop.
+
+    Inputs with a size-1 host dimension are skipped: compute_coordinates
+    drops loop variables with range <= 1, so those dims produce no free
+    symbols in their coordinate expressions.  The perm loop cannot recover
+    a unique iterator for them, so we return None rather than assert.
+    Size-1 dims cannot produce HBM over-reads (only one element exists),
+    so skipping them is safe.
     """
     if not isinstance(op, ComputedBuffer):
         return None
@@ -364,15 +389,21 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if not isinstance(in_layout, FixedTiledLayout):
         return None
 
-    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep)
-    new_stick_dim = _project_stick_host_dim(in_layout, out_layout, in_dep)
+    in_host_coords = host_coordinates(in_layout, in_dep, None)
+    in_stick_dim = _project_stick_host_dim(in_layout, in_layout, in_dep, in_host_coords)
+    new_stick_dim = _project_stick_host_dim(
+        in_layout, out_layout, in_dep, in_host_coords
+    )
     if in_stick_dim is None or new_stick_dim is None:
         return None
     if new_stick_dim == in_stick_dim:
         return None
 
     host_size = [concretize_expr(s) for s in in_layout.size]
-    return in_dep, in_buf, in_layout, host_size, new_stick_dim
+    if any(s == 1 for s in host_size):
+        return None
+
+    return in_dep, in_buf, in_layout, host_size, in_host_coords, new_stick_dim
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -396,7 +427,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         match = _restickify_input_dep(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout, host_size, new_stick_dim = match
+        in_dep, in_buf, in_layout, host_size, in_host_coords, new_stick_dim = match
 
         dtype = in_layout.dtype
         n = host_size[new_stick_dim]
@@ -425,11 +456,7 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         )
 
         # Move pad ops to just before the restickify (lower_pad_sequence appends).
-        for o in new_ops:
-            operations.remove(o)
-        idx = operations.index(op)
-        for i, o in enumerate(new_ops):
-            operations.insert(idx + i, o)
+        _move_ops_before(operations, new_ops, op)
 
         # Replace the restickify body with a Pointwise that reads padded_buf
         # through a permuted index: input host dim i is addressed by output iter
@@ -437,7 +464,6 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         # op.data.ranges stays at the logical output extent; the stick-boundary
         # widening happens later in superdsc's _extend_restickify_to_padded
         # (Inductor's _simplify_loops would undo it if done here).
-        in_host_coords = host_coordinates(in_layout, in_dep, None)
         old_iter_syms = list(in_dep.ranges.keys())
         perm: list[int] = []
         for i, coord in enumerate(in_host_coords):
