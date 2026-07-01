@@ -1017,13 +1017,6 @@ def test_pad_fp32_3d_transpose_clone():
 # These tests are xfail until dual-dim padding is implemented.
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Blocker 1: both-unaligned case requires dual-dim padding"
-        " (not yet implemented)"
-    ),
-    strict=True,
-)
 def test_pad_2d_transpose_clone_both_unaligned():
     """(67, 67) transpose(0,1)+clone: both dims unaligned — both must be padded."""
     x = torch.randn((67, 67), dtype=torch.float16)
@@ -1034,4 +1027,3 @@ def test_pad_3d_transpose_last2_clone_both_unaligned():
     """(2, 67, 67) transpose(-2,-1)+clone: both transposed dims unaligned."""
     x = torch.randn((2, 67, 67), dtype=torch.float16)
     _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
-

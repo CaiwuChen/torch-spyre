@@ -1095,26 +1095,17 @@ def lower_pad_sequence(
     padded_dims = [
         i for i in range(len(padded_size)) if padded_size[i] != original_shape[i]
     ]
-    assert padded_dims == [dim], (
-        f"lower_pad_sequence: expected exactly dim={dim} to be padded, "
-        f"but padded_size={padded_size} differs from original={original_shape} at dims={padded_dims}"
+    assert dim in padded_dims and all(
+        padded_size[i] > original_shape[i] for i in padded_dims
+    ), (
+        f"lower_pad_sequence: dim={dim} must be in padded dims and all extents must grow, "
+        f"but padded_size={padded_size} vs original={original_shape}"
     )
-    original_size_dim: int = original_shape[dim]
-    pad_extent = padded_size[dim] - original_size_dim
-    assert pad_extent > 0, (
-        f"lower_pad_sequence: pad_extent={pad_extent} for dim={dim}; "
-        f"padded_size={padded_size}, original_size_dim={original_size_dim}"
-    )
-
     # Build pad tuple for constant_pad_nd: (left, right) pairs in reverse dimension order
-    # We're padding only one dimension, so most pairs are (0, 0)
     pad_tuple = []
     for i in range(len(original_shape) - 1, -1, -1):
-        if i == dim:
-            # Pad at the end of this dimension
-            pad_tuple.extend([0, pad_extent])
-        else:
-            pad_tuple.extend([0, 0])
+        pad_extent_i = padded_size[i] - original_shape[i]
+        pad_tuple.extend([0, pad_extent_i])
 
     with fx_graph.inserting_before(insert_before):
         # Single constant_pad_nd call (lowers to 4 IR operations)
@@ -1138,24 +1129,27 @@ def lower_pad_sequence(
 
     assert new_ops[0] == padded_buf
 
-    # Verify structure: constant_pad_nd lowers to 4 operations
+    # Verify structure: constant_pad_nd lowers to 3+N operations where N=len(padded_dims)
     #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
     #   op1: SpyreConstantFallback - fill constant (FixedLayout)
-    #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
-    #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    #   op2..op1+N: ComputedBuffer - fill padding region per dim (MutationLayoutSHOULDREMOVE)
+    #   op2+N: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    n_fill = len(padded_dims)
+    expected_ops = 3 + n_fill
     assert (
-        len(new_ops) == 4
+        len(new_ops) == expected_ops
         and isinstance(new_ops[0], ComputedBuffer)
         and isinstance(new_ops[0].get_layout(), FixedLayout)
         and isinstance(new_ops[1], SpyreConstantFallback)
         and isinstance(new_ops[1].get_layout(), FixedLayout)
-        and isinstance(new_ops[2], ComputedBuffer)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3], ComputedBuffer)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+        and all(
+            isinstance(new_ops[i], ComputedBuffer)
+            and isinstance(new_ops[i].get_layout(), MutationLayoutSHOULDREMOVE)
+            for i in range(2, expected_ops)
+        )
     )
 
-    padded_stl = _build_padded_stl(arg_fx_node, padded_size, dim, orig_stl)
+    padded_stl = _build_padded_stl(arg_fx_node, padded_size, padded_dims, orig_stl)
     host_layout = padded_buf.layout
     padded_buf.layout = FixedTiledLayout(
         host_layout.device,
@@ -1186,11 +1180,13 @@ def lower_pad_sequence(
     # Mutation ops are intentionally left untouched
 
     assert (
-        len(new_ops) == 4
+        len(new_ops) == expected_ops
         and isinstance(new_ops[0].get_layout(), FixedTiledLayout)
         and isinstance(new_ops[1].get_layout(), FixedTiledLayout)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+        and all(
+            isinstance(new_ops[i].get_layout(), MutationLayoutSHOULDREMOVE)
+            for i in range(2, expected_ops)
+        )
     )
 
     return padded_buf, list(new_ops)
@@ -1199,15 +1195,22 @@ def lower_pad_sequence(
 def _build_padded_stl(
     arg_fx_node: torch.fx.Node,
     padded_size: list[int],
-    dim: int,
+    dims: "int | list[int]",
     orig_stl: SpyreTensorLayout,
 ) -> SpyreTensorLayout:
     """Build a padded STL that mirrors ``orig_stl``'s dim arrangement.
 
-    Bumps the device_size entry for the padded host dim and rescales
+    Bumps the device_size entry for each padded host dim and rescales
     stride_map entries for dims that wrap around it; everything else
     (synthetic floor splits, custom dim orderings) is carried over verbatim.
+
+    ``dims`` may be a single int or a list of ints.  Stick-dim padding
+    (within-stick axis) leaves device_size unchanged since the number of
+    sticks doesn't change when padding within a stick boundary.
     """
+    if isinstance(dims, int):
+        dims = [dims]
+
     original_shape = list(arg_fx_node.meta["val"].shape)
     orig_host_stride = [int(s) for s in arg_fx_node.meta["val"].stride()]
     padded_host_stride = [1] * len(padded_size)
@@ -1237,22 +1240,21 @@ def _build_padded_stl(
             new_stride_map.append(core_padded_host_stride[host_dim])
     new_stride_map.append(orig_stride_map[-1])
 
-    # Bump the device_size entry that represents the padded host dim.
-    padded_dim_orig_stride = orig_host_stride[dim]
-    orig_padded_extent = original_shape[dim]
-    bumped_dim = None
-    for k, (sm, ds) in enumerate(zip(orig_stride_map[:-1], orig_device_size[:-1])):
-        if sm == padded_dim_orig_stride and ds == orig_padded_extent:
-            bumped_dim = k
-            break
-    assert bumped_dim is not None, (
-        f"_build_padded_stl: could not find device dim for padded host dim "
-        f"{dim} (orig_stride={padded_dim_orig_stride}, "
-        f"orig_extent={orig_padded_extent}, device_size={orig_device_size}, "
-        f"stride_map={orig_stride_map})"
-    )
     new_device_size = orig_device_size[:]
-    new_device_size[bumped_dim] = padded_size[dim]
+    for dim in dims:
+        # Bump the device_size entry that represents the padded host dim.
+        padded_dim_orig_stride = orig_host_stride[dim]
+        orig_padded_extent = original_shape[dim]
+        bumped_dim = None
+        for k, (sm, ds) in enumerate(zip(orig_stride_map[:-1], orig_device_size[:-1])):
+            if sm == padded_dim_orig_stride and ds == orig_padded_extent:
+                bumped_dim = k
+                break
+        if bumped_dim is not None:
+            new_device_size[bumped_dim] = padded_size[dim]
+        # else: padded dim is the stick dim (within-stick axis); device_size outer
+        # entries are in sticks and don't change when padding within a stick boundary
+        # (ceil(67/64)==ceil(128/64)==2).  No bump needed.
 
     return SpyreTensorLayout(new_device_size, new_stride_map, orig_stl.device_dtype)
 

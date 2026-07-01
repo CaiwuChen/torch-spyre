@@ -70,7 +70,7 @@ from .pass_utils import (
     replace_computed_buffer_body,
 )
 from .views import compute_coordinates, matching_dim
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 
 logger = get_inductor_logger("padding")
 
@@ -403,7 +403,15 @@ def _restickify_input_dep(op: Operation, graph: GraphLowering):
     if any(s == 1 for s in host_size):
         return None
 
-    return in_dep, in_buf, in_layout, host_size, in_host_coords, new_stick_dim
+    return (
+        in_dep,
+        in_buf,
+        in_layout,
+        host_size,
+        in_host_coords,
+        new_stick_dim,
+        in_stick_dim,
+    )
 
 
 def insert_restickify_padding(graph: GraphLowering) -> None:
@@ -427,7 +435,15 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
         match = _restickify_input_dep(op, graph)
         if match is None:
             continue
-        in_dep, in_buf, in_layout, host_size, in_host_coords, new_stick_dim = match
+        (
+            in_dep,
+            in_buf,
+            in_layout,
+            host_size,
+            in_host_coords,
+            new_stick_dim,
+            in_stick_dim,
+        ) = match
 
         dtype = in_layout.dtype
         n = host_size[new_stick_dim]
@@ -441,6 +457,13 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         padded_size = list(host_size)
         padded_size[new_stick_dim] = n + pad
+
+        # When in_stick_dim is also unaligned, pad it too.
+        # _extend_restickify_to_padded widens its iter to the same stick boundary,
+        # so its tail must be zero-filled to avoid reading uninitialized HBM.
+        old_stick_pad = compute_padding(host_size[in_stick_dim], dtype)
+        if old_stick_pad > 0:
+            padded_size[in_stick_dim] = host_size[in_stick_dim] + old_stick_pad
 
         in_fx = _find_arg_fx_node(in_dep.name)
         restickify_fx = next(iter(op.origins))
@@ -457,6 +480,33 @@ def insert_restickify_padding(graph: GraphLowering) -> None:
 
         # Move pad ops to just before the restickify (lower_pad_sequence appends).
         _move_ops_before(operations, new_ops, op)
+
+        # When in_stick_dim was also padded, the OUTPUT (Restickify op) layout must
+        # reflect the new extent: its device_size entry for in_stick_dim was set to
+        # host_size[in_stick_dim] by compute_restickify_target_layout, and must now
+        # be updated to padded_size[in_stick_dim] so _create_sdsc_tensors sees
+        # dev_dim_size == it_dim_size and emits no backGap on that axis.
+        if old_stick_pad > 0:
+            out_stl = op.layout.device_layout
+            old_ds = list(out_stl.device_size)
+            old_sm = list(out_stl.stride_map)
+            old_in_host_stride = concretize_expr(in_layout.stride[in_stick_dim])
+            padded_in_stick_size = padded_size[in_stick_dim]
+            orig_in_stick_size = host_size[in_stick_dim]
+            new_ds = old_ds[:]
+            for k, (sm, ds) in enumerate(zip(old_sm[:-1], old_ds[:-1])):
+                if sm == old_in_host_stride and ds == orig_in_stick_size:
+                    new_ds[k] = padded_in_stick_size
+                    break
+            new_out_stl = SpyreTensorLayout(new_ds, old_sm, out_stl.device_dtype)
+            out_host = op.layout
+            op.layout = FixedTiledLayout(
+                out_host.device,
+                out_host.dtype,
+                out_host.size,
+                out_host.stride,
+                new_out_stl,
+            )
 
         # Replace the restickify body with a Pointwise that reads padded_buf
         # through a permuted index: input host dim i is addressed by output iter
