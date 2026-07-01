@@ -374,7 +374,7 @@ def _make_tiled_op_spec() -> OpSpec:
         iteration_space={c0: (Integer(128), 1)},
         args=[tensor_in, tensor_out],
         op_info={},
-        tiled_symbols=[c0],
+        tiled_symbols=[[c0]],
     )
 
 
@@ -1376,12 +1376,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
+        # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
+        # With one tiling level, affine_strides[0] = [{s: stride}].
         self.assertEqual(len(affine_strides), 1)
-        self.assertIn(s, affine_strides[0])
-        self.assertEqual(affine_strides[0][s], 64 * 128 * 2)
+        self.assertIn(s, affine_strides[0][0])
+        self.assertEqual(affine_strides[0][0][s], 64 * 128 * 2)
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
@@ -1393,7 +1395,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
@@ -1408,7 +1410,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1428,7 +1430,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbol_id_offset=0,
             tiled_symbols=[],
         )
-        self.assertEqual(affine_strides, [{}])
+        self.assertEqual(affine_strides, [[]])
 
     def test_lx_tensor_not_in_symbols(self):
         s = Symbol("s")
@@ -1442,11 +1444,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
-        self.assertEqual(affine_strides, [{}])
+        # lx tensor: one level of tiled_symbols, but lx allocation is always non-tiled.
+        self.assertEqual(affine_strides, [[{}]])
 
     def test_symbol_id_offset_applied(self):
         s = Symbol("s")
@@ -1457,7 +1460,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=5,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1502,13 +1505,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
         self.assertEqual(symbols[1], 0x1000 + 128)
-        self.assertIn(s, affine_strides[0])
+        # affine_strides[0] = [{s: stride}] (one level, one tensor)
+        self.assertIn(s, affine_strides[0][0])
 
 
 class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
@@ -1543,25 +1547,34 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             },
             args=[tensor_in, tensor_out],
             op_info={},
-            tiled_symbols=[c0, c1],
+            tiled_symbols=[[c0, c1]],
         )
 
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        hbm_strides = [d for d in affine_strides if len(d) > 0]
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        # Both tensors have one tiling level with two symbols.
+        # Find tensors with non-empty strides at any level.
+        hbm_strides = [
+            per_level
+            for per_level in affine_strides
+            if any(len(d) > 0 for d in per_level)
+        ]
         self.assertGreater(len(hbm_strides), 0)
-        for tensor_strides in hbm_strides:
-            self.assertEqual(len(tensor_strides), 2)
+        for per_level in hbm_strides:
+            total_strides = sum(len(d) for d in per_level)
+            self.assertEqual(total_strides, 2)
 
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        for tensor_strides in affine_strides:
-            for sym, stride in tensor_strides.items():
-                self.assertGreater(stride, 0)
+        for per_level in affine_strides:
+            for level_strides in per_level:
+                for sym, stride in level_strides.items():
+                    self.assertGreater(stride, 0)
 
 
 class TestCompileOpSpecSymbolMapping(unittest.TestCase):
@@ -1569,7 +1582,11 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        has_strides = any(len(d) > 0 for d in affine_strides)
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        has_strides = any(
+            any(len(level_d) > 0 for level_d in per_level)
+            for per_level in affine_strides
+        )
         self.assertTrue(
             has_strides,
             f"Expected non-empty affine_strides; got {affine_strides}.",
@@ -1923,10 +1940,11 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}], []
+            # affine_strides: list[list[dict]] — one tensor, one level, one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1943,7 +1961,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[op])
@@ -1961,10 +1979,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
-            return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}], []
+            return _make_tiled_json(idx, sym_id), [0x3000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("c")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1978,10 +1996,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
-            return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}], []
+            return _make_tiled_json(idx, sym_id), [0x4000], [[{s: 512}]], []
 
         op = _make_minimal_op_spec("d")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1997,10 +2015,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -2050,10 +2068,12 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
+            # per_level_strides: outermost-first. Level 0 (outer) has s0 stride,
+            # level 1 (inner) has s1 stride.  One tensor, two levels.
             return (
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
-                [{s0: outer_stride, s1: inner_stride}],
+                [[{s0: outer_stride}, {s1: inner_stride}]],
                 [],
             )
 
@@ -2163,7 +2183,8 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            # One tensor, one level (the enclosing loop), one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2177,7 +2198,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2193,7 +2214,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2238,10 +2259,18 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # bmm: tiled on inner K var only
-                return _make_tiled_json(idx, sym_id), [0x1000], [{c_k: k_stride}], []
-            else:  # combine: accum_buf not tiled on K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            if i == 0:
+                # bmm: tiled on inner K var only (level 1 in outer>inner nesting).
+                # per_level_strides: outermost first — outer has no K stride, inner has it.
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x1000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            else:
+                # combine: accum_buf not tiled on K at any level.
+                return _make_tiled_json(idx, sym_id), [0x2000], [[{}, {}]], []
 
         return fake
 
@@ -2330,14 +2359,23 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # fill: per_tile_fixed output, not tiled
-                return _make_tiled_json(idx, sym_id), [0x1000], [{}], []
-            elif i == 1:  # bmm: K-input tiled on inner K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{c_k: k_stride}], []
-            elif i == 2:  # combine: per_tile_fixed accum_tile, not tiled
-                return _make_tiled_json(idx, sym_id), [0x3000], [{}], []
-            else:  # copy: accum_full advances per outer B-tile
-                return _make_tiled_json(idx, sym_id), [0x4000], [{c_b: b_stride}], []
+            if i == 0:
+                # fill: inside outer loop only, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x1000], [[{}]], []
+            elif i == 1:
+                # bmm: inside outer>inner; K-input tiled at inner level (level 1).
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x2000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            elif i == 2:
+                # combine: inside outer>inner, per_tile_fixed accum_tile, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x3000], [[{}, {}]], []
+            else:
+                # copy: inside outer loop only; accum_full tiled at outer level (level 0).
+                return _make_tiled_json(idx, sym_id), [0x4000], [[{c_b: b_stride}]], []
 
         return fake
 
@@ -2459,11 +2497,12 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             sid1 = -(symbol_id_offset + 2)
             symbols.append(0x1000)
             symbols.append(0x2000)
-            # tensor 0 tiled, tensor 1 not tiled
+            # tensor 0: tiled at the enclosing loop level (level 0).
+            # tensor 1: not tiled.
             return (
                 _make_two_tensor_json(idx, sid0, sid1),
                 [0x1000, 0x2000],
-                [{s: 256}, {}],
+                [[{s: 256}], [{}]],
                 [],
             )
 
@@ -2945,48 +2984,6 @@ class TestValidateReductionTiling(unittest.TestCase):
         _validate_reduction_tiling(op)
 
 
-class TestTiledSymsForSchedNode(unittest.TestCase):
-    """Regression test for _tiled_syms_for_sched_node_at_depth.
-
-    loop_tiled_dims stores host-range indices (e.g. 1 for H in [B=1,H,Lq,D])
-    but the iteration space skips unit-size dims (B=1 dropped), so H is at
-    iteration-space index 0.  The function must map between the two.
-    """
-
-    def test_unit_batch_dim_skipped(self):
-        """[B=1,H=8,Lq=256,D=64] with loop_tiled_dims=[[1]] must return H (c0).
-
-        Without the fix, index 1 is used directly and returns c1 (Lq) instead.
-        """
-        from torch_spyre._inductor.scheduler import _tiled_syms_for_sched_node_at_depth
-        from torch._inductor.scheduler import SchedulerNode
-
-        host_ranges = [1, 8, 256, 64]
-        non_unit = [r for r in host_ranges if r != 1]
-        it_syms = [Symbol(f"c{i}") for i in range(len(non_unit))]
-        it_space = {s: Integer(r) for s, r in zip(it_syms, non_unit)}
-
-        ir_op = MagicMock()
-        ir_op.data.ranges = [Integer(r) for r in host_ranges]
-        ir_op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[1]],
-        )
-
-        snode = MagicMock(spec=SchedulerNode)
-        snode.node = ir_op
-
-        with patch(
-            "torch_spyre._inductor.scheduler.iteration_space",
-            return_value=it_space,
-        ):
-            result = _tiled_syms_for_sched_node_at_depth(snode, 0)
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(str(result[0]), "c0")  # H, not c1 (Lq)
-
-
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -3381,7 +3378,7 @@ class TestSymbolKind(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)
@@ -3850,6 +3847,22 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         self.assertEqual(self._run([a, u1, b, u2, c]), ["u2", "a", "b", "c", "u1"])
 
+    def test_two_interlopers_both_move_after(self):
+        # [H(a), U1(reads a), U2(reads a), H(b), H(c)]
+        # U1 and U2 both read 'a' so neither can move before the run.
+        # Both have no dependents in the remaining hinted ops so both can
+        # move after.  After U1 moves after c, U2 is encountered next; it
+        # also reads a (blocked from moving before) and can move after c.
+        # Verifies the chained move-after path for consecutive interlopers.
+        a = _make_rui_op("a", hint_ids=(0,))
+        u1 = _make_rui_op("u1", reads=("a",))
+        u2 = _make_rui_op("u2", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        # u1 is processed first and moves after c; u2 is processed next and
+        # also moves after c (now at index 3), landing between c and u1.
+        self.assertEqual(self._run([a, u1, u2, b, c]), ["a", "b", "c", "u2", "u1"])
+
     def test_mutating_interloper_blocked(self):
         # x mutates buffer 'a' produced by a hinted op; x cannot legally move
         # before the run (would run before 'a' is produced) and b reads x so
@@ -3860,6 +3873,222 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         with self.assertRaises(RuntimeError):
             self._run([a, x, b, c])
+
+
+# ===========================================================================
+# TestHintsLevels
+# ===========================================================================
+
+
+class TestHintsLevels(unittest.TestCase):
+    """_hints_levels must drop size-1 split_count hints as no-ops."""
+
+    def _make_op(self, hints):
+        """Return a fake ComputedBuffer with the given DimHint list.
+
+        hints: list of (hint_id, split_count, loop_var) tuples.
+        """
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.get_name.return_value = "buf0"
+        op.dim_hints = [
+            DimHint(
+                dim_names=[f"dim{i}"],
+                split_count=sc,
+                loop_var=lv,
+                is_reduction=False,
+                hint_id=hid,
+            )
+            for i, (hid, sc, lv) in enumerate(hints)
+        ]
+        return op
+
+    def test_size1_hint_dropped(self):
+        """A single hint with split_count=1 produces an empty levels list."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(0, 1, sympy.Symbol("c0"))])
+        self.assertEqual(_hints_levels([op]), [])
+
+    def test_size1_hint_dropped_with_debug_log(self):
+        """A size-1 hint emits a debug log message when dropped."""
+        import logging
+        import logging.handlers
+        import sympy
+        import torch_spyre._inductor.coarse_tile as ct_mod
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(7, 1, sympy.Symbol("c0"))])
+
+        original_level = ct_mod.hints_logger.level
+        ct_mod.hints_logger.setLevel(logging.DEBUG)
+        handler = logging.handlers.MemoryHandler(
+            capacity=100, flushLevel=logging.CRITICAL
+        )
+        ct_mod.hints_logger.addHandler(handler)
+        try:
+            result = _hints_levels([op])
+            handler.flush()
+            messages = [r.getMessage() for r in handler.buffer]
+        finally:
+            ct_mod.hints_logger.removeHandler(handler)
+            ct_mod.hints_logger.setLevel(original_level)
+
+        self.assertEqual(result, [])
+        self.assertTrue(
+            any("split_count=1" in m and "no-op" in m for m in messages),
+            f"Expected a 'split_count=1 … no-op' debug message; got: {messages}",
+        )
+
+    def test_nonunit_hint_kept(self):
+        """A hint with split_count > 1 is retained normally."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op = self._make_op([(3, 4, c0)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, is_reduction = levels[0]
+        self.assertEqual(hint_id, 3)
+        self.assertEqual(count, sympy.Integer(4))
+        self.assertFalse(is_reduction)
+
+    def test_mixed_hints_drops_only_size1(self):
+        """When one hint is size-1 and another is size>1, only the size>1 survives."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
+        op = self._make_op([(0, 1, c0), (1, 8, c1)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, _ = levels[0]
+        self.assertEqual(hint_id, 1)
+        self.assertEqual(count, sympy.Integer(8))
+
+    def test_all_size1_hints_dropped_falls_through_to_next_op(self):
+        """If every hint on op0 is size-1, _hints_levels tries op1 next."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op0 = self._make_op([(0, 1, c0)])
+        op1 = self._make_op([(0, 4, c0)])
+        levels = _hints_levels([op0, op1])
+        self.assertEqual(len(levels), 1)
+        _, count, _ = levels[0]
+        self.assertEqual(count, sympy.Integer(4))
+
+
+# ===========================================================================
+# TestHintsToCoarseTileGroupsLogging
+# ===========================================================================
+
+
+def _make_htctg_op(name, hints):
+    """Return a fake ComputedBuffer for hints_to_coarse_tile_groups logging tests.
+
+    hints: list of (hint_id, dim_names, split_count, loop_var) tuples.
+    loop_var may be None to simulate an op that is broadcast on that dim.
+    """
+    from torch._inductor.ir import ComputedBuffer
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.get_name.return_value = name
+    op.get_operation_name.return_value = name
+    op.origins = []
+    op.dim_hints = [
+        DimHint(
+            dim_names=dim_names,
+            split_count=split_count,
+            loop_var=loop_var,
+            is_reduction=False,
+            hint_id=hint_id,
+        )
+        for hint_id, dim_names, split_count, loop_var in hints
+    ]
+    return op
+
+
+def _run_htctg_and_capture_log(ops):
+    """Run hints_to_coarse_tile_groups with INFO logging and return the log text."""
+    import logging
+    import logging.handlers
+    from types import SimpleNamespace
+    from torch_spyre._inductor.coarse_tile import hints_to_coarse_tile_groups
+    import torch_spyre._inductor.coarse_tile as coarse_tile_mod
+
+    graph = SimpleNamespace(operations=list(ops))
+
+    # Temporarily force the module-level hints_logger to INFO so the logging
+    # block inside hints_to_coarse_tile_groups actually runs.
+    original_level = coarse_tile_mod.hints_logger.level
+    coarse_tile_mod.hints_logger.setLevel(logging.INFO)
+
+    handler = logging.handlers.MemoryHandler(capacity=1000, flushLevel=logging.CRITICAL)
+    coarse_tile_mod.hints_logger.addHandler(handler)
+    try:
+        hints_to_coarse_tile_groups(graph)
+        handler.flush()
+        return "\n".join(r.getMessage() for r in handler.buffer)
+    finally:
+        coarse_tile_mod.hints_logger.removeHandler(handler)
+        coarse_tile_mod.hints_logger.setLevel(original_level)
+
+
+class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
+    """The scopes= log line must list all hint dims, not just those with
+    loop_var set on the first op in the group.
+
+    Regression test for a bug where group_ops[0] had loop_var=None for a hint
+    (e.g. a restickify op that doesn't iterate over Lq), causing that hint to
+    be absent from group_levels and therefore omitted from the scopes= line.
+    """
+
+    def test_scopes_includes_all_hints_when_first_op_is_broadcast_on_second_hint(self):
+        """When group_ops[0] has loop_var=None for hint 2 (Lq), the scopes= line
+        must still include Lq — not just H."""
+        import sympy
+
+        h_sym = sympy.Symbol("c0")
+        lq_sym = sympy.Symbol("c1")
+
+        # op0: iterates over H only — loop_var=None for Lq (broadcast, like restickify)
+        op0 = _make_htctg_op(
+            "op0",
+            [
+                (1, ["H"], 8, h_sym),  # hint_id=1, H, has loop_var
+                (2, ["Lq"], 4, None),  # hint_id=2, Lq, loop_var=None → broadcast
+            ],
+        )
+        # op1: iterates over both H and Lq
+        op1 = _make_htctg_op(
+            "op1",
+            [
+                (1, ["H"], 8, h_sym),
+                (2, ["Lq"], 4, lq_sym),
+            ],
+        )
+
+        log_output = _run_htctg_and_capture_log([op0, op1])
+
+        # Find the scopes= line specifically
+        scopes_line = next(
+            (ln for ln in log_output.splitlines() if "scopes=" in ln), ""
+        )
+        self.assertIn("H", scopes_line, f"scopes= must mention H; got: {scopes_line!r}")
+        self.assertIn(
+            "Lq",
+            scopes_line,
+            f"scopes= must mention Lq even though op0 is broadcast on Lq "
+            f"(loop_var=None for hint_id=2 on group_ops[0]); "
+            f"got: {scopes_line!r}",
+        )
 
 
 if __name__ == "__main__":

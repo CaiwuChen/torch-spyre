@@ -34,6 +34,7 @@ from torch._inductor.dependencies import ReadWrites
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_expr,
+    device_coordinates,
     iteration_space_from_op,
     splits_by_index_coeff,
 )
@@ -51,7 +52,6 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
-    OP_GOOD_FOR_LX_INPLACE,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -67,6 +67,44 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
+
+
+def _would_produce_lx_back_gap(
+    graph: GraphLowering,
+    buf_name: str,
+    uses: list[int],
+) -> bool:
+    """Check if pinning a buffer to LX would produce a backGapCore_.
+
+    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
+    The backend supports backGap for HBM but not for LX, so buffers triggering
+    this condition must stay in HBM.
+    """
+    buf = graph.get_buffer(buf_name)
+    stl = buf.layout.device_layout
+    device_size = stl.device_size
+
+    for use_idx in uses:
+        op = graph.operations[use_idx]
+        rw = op.get_read_writes()
+        for dep in rw.reads | rw.writes:
+            if dep.name != buf_name:
+                continue
+            try:
+                coords = device_coordinates(stl, dep, None)
+            except Exception:
+                continue
+            for d, coord_expr in enumerate(coords[:-1]):
+                syms = coord_expr.free_symbols
+                if not syms:
+                    if device_size[d] > 1:
+                        return True
+                    continue
+                sym = next(iter(syms))
+                it_dim_size = int(dep.ranges[sym])
+                if device_size[d] > it_dim_size:
+                    return True
+    return False
 
 
 class ScratchpadAllocator(ABC):
@@ -120,9 +158,6 @@ class ScratchpadAllocator(ABC):
         if target is None:
             return []
         reads = [dep.name for dep in op.get_read_writes().reads]
-        if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
-            # If the op is in the whitelist, allow all inputs
-            return reads
         if torch.Tag.pointwise in target.tags:
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
@@ -184,6 +219,9 @@ class ScratchpadAllocator(ABC):
             if output_name in graph_output_names and not cloning_allowed:
                 self.reject_reasons[output_name] = "graph output (no clone)"
                 continue  # we can only allocate graph outputs if we're allowed to clone
+            if _would_produce_lx_back_gap(graph, output_name, uses):
+                self.reject_reasons[output_name] = "lx back gap"
+                continue
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
@@ -209,6 +247,9 @@ class ScratchpadAllocator(ABC):
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
                     continue  # core division mismatch across consumers
+                if _would_produce_lx_back_gap(graph, input_name, uses):
+                    self.reject_reasons[input_name] = "lx back gap"
+                    continue
                 buf = graph.get_buffer(input_name)
                 dev_layout = buf.layout.device_layout
                 dev_size = math.prod(dev_layout.device_size[:-1]) * 128
