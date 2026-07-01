@@ -619,6 +619,20 @@ def _ref_arg(op_spec):
     return op_spec.args[-1]
 
 
+def _round_up_to_stick(
+    sdsc_iteration_space: dict,
+    sym,
+    stick_size: int,
+    caller: str,
+) -> None:
+    """Round ``sdsc_iteration_space[sym]`` up to the next stick boundary."""
+    cur = sdsc_iteration_space[sym]
+    padded = ((cur + stick_size - 1) // stick_size) * stick_size
+    if padded > cur:
+        logger.debug("%s: extending %s %d -> %d", caller, sym, cur, padded)
+        sdsc_iteration_space[sym] = padded
+
+
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -680,17 +694,9 @@ def _extend_matmul_k_to_padded(
     # allocation's K extent, not the slice's logical K, so it can be larger
     # than the matmul's actual K and would over-extend the iteration space.
     stick_size = y_arg.device_dtype.elems_per_stick()
-    k_current = sdsc_iteration_space[k_sym]
-    k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
-
-    if k_padded > k_current:
-        logger.debug(
-            "_extend_matmul_k_to_padded: extending K %d -> %d (sym=%s)",
-            k_current,
-            k_padded,
-            k_sym,
-        )
-        sdsc_iteration_space[k_sym] = k_padded
+    _round_up_to_stick(
+        sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
+    )
 
 
 def _extend_restickify_to_padded(
@@ -713,16 +719,9 @@ def _extend_restickify_to_padded(
         if stick_sym is None or stick_sym not in sdsc_iteration_space:
             continue
         stick_size = arg.device_dtype.elems_per_stick()
-        cur = sdsc_iteration_space[stick_sym]
-        padded = ((cur + stick_size - 1) // stick_size) * stick_size
-        if padded > cur:
-            logger.debug(
-                "_extend_restickify_to_padded: extending %s %d -> %d",
-                stick_sym,
-                cur,
-                padded,
-            )
-            sdsc_iteration_space[stick_sym] = padded
+        _round_up_to_stick(
+            sdsc_iteration_space, stick_sym, stick_size, "_extend_restickify_to_padded"
+        )
 
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
