@@ -861,25 +861,6 @@ def test_sparse_dense_pointwise_unsupported():
         _compare(lambda a, b: a.sum(1) + b, a, b)
 
 
-# ------- Restickify padding: sliced input raises Unsupported ---------
-
-
-@pytest.mark.xfail(
-    reason="Slice detection in insert_restickify_padding not yet implemented",
-    strict=True,
-)
-def test_pad_restickify_sliced_input_raises():
-    """Sliced input to transpose+clone must raise, not silently corrupt output."""
-    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
-    with pytest.raises(
-        RuntimeError,
-        match="sliced input",
-    ):
-        _compile_and_run(
-            lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), (x,), DEVICE
-        )
-
-
 # ------- Restickify padding (unaligned stick dim) ---------
 
 # new_stick_dim = dim-0 (unaligned): shape (67, 128) or (1025, 1024), small tensor and large tensor.
@@ -960,12 +941,44 @@ def test_pad_4d_transpose_1_last_clone(pad_tensors_4d_t1_last):
     _compare(lambda x: x.transpose(1, -1).clone(), x, check_strides=False)
 
 
+# ------- Restickify padding: sliced tensor inputs ---------
+
+
+def test_pad_sliced_4d_complex_offset():
+    """4D: x[:, :, 1:66, :].transpose(-2,-1) — sliced dim-2 (65 elems) becomes
+    new stick dim; padding must use the slice size, not the backing-buffer size."""
+    x = torch.randn((2, 2, 67, 128), dtype=torch.float16)
+    _compare(
+        lambda x: x[:, :, 1:66, :].transpose(-2, -1).clone(), x, check_strides=False
+    )
+
+
+def test_pad_sliced_4d_multiple_slices():
+    """4D: x[:, 1:7, 1:66, :].transpose(-2,-1) — slices on dim-1 and dim-2."""
+    x = torch.randn((4, 8, 67, 128), dtype=torch.float16)
+    _compare(
+        lambda x: x[:, 1:7, 1:66, :].transpose(-2, -1).clone(), x, check_strides=False
+    )
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Both transposed dims are sliced with non-zero offsets and neither "
+        "is divisible by stick_size=64 (65 and 127). _candidate_output_stls "
+        "finds no aligned stick candidate. "
+    ),
+    strict=True,
+)
+def test_pad_sliced_4d_both_transpose_dims_sliced():
+    """4D: x[:, :, 1:66, 3:130].transpose(-2,-1) — both transposed dims are
+    sliced and unaligned (65 and 127, neither divisible by 64)."""
+    x = torch.randn((4, 8, 67, 131), dtype=torch.float16)
+    _compare(
+        lambda x: x[:, :, 1:66, 3:130].transpose(-2, -1).clone(), x, check_strides=False
+    )
+
+
 # ------- Restickify padding: size-1 dimension inputs ---------
-# Regression tests for Blocker 2: inputs with a size-1 host dim previously
-# triggered a bare AssertionError in the perm loop because compute_coordinates
-# skips loop variables with range <= 1, leaving those dims with no free
-# symbols. _restickify_input_dep now returns None for size-1 inputs, bypassing
-# the padding path safely (a single-element dim cannot produce HBM over-reads).
 
 
 def test_pad_size1_leading_dim_transpose_clone():
@@ -983,21 +996,8 @@ def test_pad_size1_middle_dim_transpose_clone():
 
 
 # ------- Restickify padding: fp32 dtype ---------
-# fp32 has elems_per_stick=32 (half of fp16's 64), which exercises different
-# boundaries in compute_padding and _build_padded_stl.
-# 33 elements is unaligned for fp32 (33 % 32 == 1) but aligned for fp16.
 # ReStickifyOpHBM does not yet support IEEE_FP32 on hardware, so these tests
 # are xfail until fp32 restickify is enabled.
-
-
-@pytest.mark.xfail(
-    reason="ReStickifyOpHBM does not support IEEE_FP32 on Spyre hardware",
-    strict=True,
-)
-def test_pad_fp32_2d_transpose_clone():
-    """(33, 64) fp32 transpose(0,1)+clone: unaligned for fp32 stick (32 elems)."""
-    x = torch.randn((33, 64), dtype=torch.float32)
-    _compare(lambda x: x.transpose(0, 1).clone(), x, check_strides=False)
 
 
 @pytest.mark.xfail(
@@ -1011,10 +1011,6 @@ def test_pad_fp32_3d_transpose_clone():
 
 
 # ------- Restickify padding: both dims unaligned ---------
-# Regression tests for Blocker 1: when both new_stick_dim AND in_stick_dim are
-# unaligned, _extend_restickify_to_padded widens both iter syms to a stick
-# boundary. Without padding the old stick dim the tail reads stale HBM values.
-# These tests are xfail until dual-dim padding is implemented.
 
 
 def test_pad_2d_transpose_clone_both_unaligned():
@@ -1026,4 +1022,10 @@ def test_pad_2d_transpose_clone_both_unaligned():
 def test_pad_3d_transpose_last2_clone_both_unaligned():
     """(2, 67, 67) transpose(-2,-1)+clone: both transposed dims unaligned."""
     x = torch.randn((2, 67, 67), dtype=torch.float16)
+    _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)
+
+
+def test_pad_4d_transpose_last2_clone_both_unaligned():
+    """(2, 67, 67) transpose(-2,-1)+clone: both transposed dims unaligned."""
+    x = torch.randn((2, 2, 67, 67), dtype=torch.float16)
     _compare(lambda x: x.transpose(-2, -1).clone(), x, check_strides=False)

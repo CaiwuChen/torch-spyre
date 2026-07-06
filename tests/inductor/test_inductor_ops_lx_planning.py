@@ -148,7 +148,6 @@ INHERITED_TEST_ATTRIBUTES = [
 ]
 
 POINTWISE_TEST_FAILURES = [
-    "test_complex_offset_pattern_default",
     "test_conv2d_1x3x32_ksize3_no_pad",
     "test_conv2d_1x64_ksize3_depthwise",
     "test_conv2d_2x32_ksize1_stride2",
@@ -176,7 +175,6 @@ POINTWISE_TEST_FAILURES = [
     "test_mm_autocast_f16_disabled",
     "test_mm_autocast_f16_enabled",
     "test_mm_mm_55x2_2x99",
-    "test_multiple_slices_transpose_default",
     "test_slice_stick_reduce_dim2_amax_3d64_0",
     "test_slice_stick_reduce_dim2_sum_3d64_0",
     "test_restickify_add_transpose_10x20_add_transpose",
@@ -295,7 +293,6 @@ REDUCTION_TEST_FAILURES = [
     "test_alias_operands_double_67x71x256",
     "test_alias_operands_triple_67x256",
     "test_alias_operands_triple_67x71x256",
-    "test_complex_offset_pattern_default",
     "test_conv2d_1x3x32_ksize3_no_pad",
     "test_conv2d_1x64_ksize3_depthwise",
     "test_conv2d_2x32_ksize1_stride2",
@@ -323,7 +320,6 @@ REDUCTION_TEST_FAILURES = [
     "test_matmul_tiled_y",
     "test_mm_autocast_f16_disabled",
     "test_mm_autocast_f16_enabled",
-    "test_multiple_slices_transpose_default",
     "test_pointwise_binary_op_div_67x256_67x256",
     "test_pointwise_binary_op_div_67x71x256_67x71x256",
     "test_pointwise_range_op_clamp_fp16",
