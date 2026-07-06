@@ -30,8 +30,8 @@ to innermost.  For a single-level group this is a 1-element list ``[K]``.
 
 Entry point::
 
-    groups = hints_to_coarse_tile_groups(operations)
-    coarse_tile(operations, groups)
+    groups = hints_to_coarse_tile_groups(graph)
+    coarse_tile(graph, groups)
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
 ``(hint_id, count, is_reduction_level)`` triples, outermost first.  Each op
@@ -73,7 +73,7 @@ from .constants import BATCH_MATMUL_OP
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
-from .propagate_hints import DimHint, get_op_hints
+from .propagate_hints import DimHint
 from .pass_utils import op_out_coords
 from .span_overflow_hint_analysis import plan_span_overflow_tile
 from .ir import FixedTiledLayout
@@ -113,13 +113,23 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     Returns a list of (hint_id, count, is_reduction_level) triples, outermost
     first.  Previously this skipped is_reduction hints; it now includes them so
     that _stamp_group can divide reduction_ranges for reduction-dim tiling.
+    Hints with split_count == 1 are dropped: tiling by 1 is a no-op.
     """
     for op in ops:
-        levels = [
-            (h.hint_id, sympy.Integer(h.split_count), h.is_reduction)
-            for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None
-        ]
+        levels = []
+        for h in getattr(op, "dim_hints", []):
+            if h.loop_var is None:
+                continue
+            if h.split_count == 1:
+                hints_logger.debug(
+                    "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
+                    " — tiling by 1 is a no-op, dropping",
+                    ", ".join(o.get_name() for o in ops),
+                    h.hint_id,
+                    h.dim_names,
+                )
+                continue
+            levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
         if levels:
             return levels
     return []
@@ -337,13 +347,21 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
         # Pre-compute hint descriptions per group — get_op_hints is called once per
         # group rather than once per op in the group.
         group_hint_descs: dict[int, str] = {}
-        for g_idx, (group_ops, group_levels) in enumerate(groups):
-            spec_op = group_ops[0]
-            op_hints = get_op_hints(spec_op)
+        for g_idx, (group_ops, _group_levels) in enumerate(groups):
+            # Collect all DimHints across the group, keyed by hint_id.
+            # Prefer a hint whose loop_var is not None (op actually iterates
+            # that dim) over a broadcast hint (loop_var=None), so that the
+            # representative name/count reflects a real iteration.
+            best: dict[int, "DimHint"] = {}
+            for gop in group_ops:
+                for h in getattr(gop, "dim_hints", []):
+                    if h.hint_id not in best or best[h.hint_id].loop_var is None:
+                        best[h.hint_id] = h
             descs = [
-                f"hint_{hint_id}={op_hints[hint_id]}"
-                for hint_id, *_ in group_levels
-                if hint_id in op_hints
+                f"hint_{h.hint_id}={{'tiles': {{"
+                + ", ".join(f"'{n}': {h.split_count}" for n in h.dim_names)
+                + "}}"
+                for h in sorted(best.values(), key=lambda x: x.hint_id)
             ]
             group_hint_descs[g_idx] = ", ".join(descs)
 
@@ -597,58 +615,17 @@ def insert_tiling_propagation(
             _propagate_tiled_op(op, operations)
 
 
-def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> bool:
-    """Return True if red_dim_idx in reduction_ranges corresponds to the stick dim.
-
-    Uses device_coordinates to find the within-stick coordinate for the primary
-    input, then checks whether the reduction symbol for red_dim_idx appears in
-    that coordinate's free symbols — the same technique used in propagate_layouts.
-    """
-    from .ir import FixedTiledLayout
-    from .pass_utils import device_coordinates
-
-    data = op.data
-    assert isinstance(data, Reduction)
-    try:
-        rw = op.get_read_writes()
-        out_dep = next(iter(rw.writes))
-    except (StopIteration, AttributeError, TypeError):
-        # StopIteration: mocked ops in unit tests have empty rw.writes.
-        # AttributeError/TypeError: guard against partially constructed mocks.
-        return False
-    out_syms = set(out_dep.index.free_symbols)
-    in_dep = next((d for d in rw.reads if hasattr(d, "index")), None)
-    if in_dep is None:
-        return False
-    # reduction_syms: symbols in in_dep.ranges that are absent from the output index,
-    # in dep.ranges order (which matches reduction_ranges order).
-    reduction_syms = [s for s in in_dep.ranges if s not in out_syms]
-    if red_dim_idx >= len(reduction_syms):
-        return False
-    red_sym = reduction_syms[red_dim_idx]
-
-    in_buf = V.graph.get_buffer(in_dep.name)
-    if in_buf is None or not isinstance(in_buf.layout, FixedTiledLayout):
-        return False
-    # device_coordinates[-1] is the within-stick coordinate expression.
-    # If red_sym appears in its free symbols, the reduction is on the stick dim.
-    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep, None)[-1]
-    return red_sym in stick_coord.free_symbols
-
-
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
-    """Raise RuntimeError for Reduction tiling configurations not yet implemented.
+    """Raise RuntimeError for unsupported Reduction tiling configurations.
 
     Supported:
       - A single level that tiles only a non-stick reduction dim.
-      - A single level that tiles the K (reduction) dim of a BATCH_MATMUL_OP.
-        K is the stick dim for operand x, but each tile's output is a full
-        [M, N] matrix so no partial-stick sparsity occurs.
+      - A single level that tiles the stick (innermost) reduction dim, including
+        the K dim of BATCH_MATMUL_OP and scalar reductions over dim=-1.
       - Multiple nesting levels where outer level(s) tile output dims and the
         innermost level tiles a reduction dim (e.g. outer M + inner K for mm).
 
     Deferred (raises RuntimeError):
-      - Reduction tiling on the stick dimension (except BATCH_MATMUL_OP above).
       - Mixed output+reduction tiling at the same nesting level.
       - Multiple reduction range indices tiled at one level.
     """
@@ -682,17 +659,6 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented — Stage 2)."
             )
-        for red_dim_idx in red_dims:
-            if (
-                data.reduction_type != BATCH_MATMUL_OP
-                and _reduction_tiling_is_on_stick_dim(op, red_dim_idx)
-            ):
-                raise RuntimeError(
-                    f"coarse_tile: op {op.get_name()!r} level {i} tiles "
-                    f"reduction dim {red_dim_idx} which is the stick dimension "
-                    "of the primary input (stick-dim reduction tiling is not "
-                    "yet implemented — Stage 2)."
-                )
 
 
 def _propagate_tiled_op(
@@ -1462,9 +1428,9 @@ def _stamp_group(
                     # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                     # before _validate_reduction_tiling runs in the later
                     # insert_tiling_propagation pass.  If validation raises (e.g.
-                    # stick-dim tiling, Stage 2), the mutated ranges are never
-                    # observed: the RuntimeError propagates uncaught through the
-                    # pass runner and aborts compilation.
+                    # mixed output+reduction at one level), the mutated ranges are
+                    # never observed: the RuntimeError propagates uncaught through
+                    # the pass runner and aborts compilation.
                     _divide_reduction_ranges(
                         op, count, [rpos] if rpos is not None else []
                     )
