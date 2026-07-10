@@ -1375,6 +1375,48 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('2')", src, "Expected loop count 2")
 
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_named_dims_hint_self_contained_no_driver_calls(self):
+        """spyre_hint(named_dims=[...]) alone enables coarse tiling.
+
+        Unlike the tests above, this omits the driver-side declare_tensor_dim /
+        name_tensor_dims calls entirely.  It locks in the in-graph path: the
+        named_dims hint must (1) self-enable propagate_named_dims and (2)
+        self-register the dim sizes, so the tiling hint resolves without any
+        driver bootstrapping.  This is how a decomposition names its own
+        intermediate dims (e.g. the flash SDPA decomposition).
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+            return x + bias
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        # Deliberately NO _declare_tensor_dim / _name_tensor_dims here.
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
 
 class TestCoarseTileReductionE2E(InductorTestCase):
     """E2E tests for coarse-tiling a reduction dimension.
@@ -1556,8 +1598,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
     def test_hint_tiled_reduction_min_correct(self):
         """x.amin(dim=-1) tiled over D (4 tiles) produces correct results."""
-        if not config.unroll_loops:
-            pytest.xfail("UNROLL_LOOPS=0: amin scf.for loop not yet correct in backend")
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1587,10 +1627,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1608,10 +1644,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1629,10 +1661,6 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_min_correct(self):
         """x.amin(dim=0) tiled over B produces correct results."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1778,10 +1806,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
@@ -1805,10 +1829,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 128, 512, 32
