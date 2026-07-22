@@ -1282,23 +1282,21 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
-@register_spyre_lowering(torch.ops.aten.add.Tensor, type_promotion_kind=None)
-@register_spyre_lowering(torch.ops.aten.add.Scalar, type_promotion_kind=None)
+@register_spyre_lowering(
+    torch.ops.aten.add.Tensor,
+    type_promotion_kind=None,
+)
 def lower_add(x, y, *, alpha=1):
     if alpha != 1:
-        if isinstance(y, (int, float)):
-            y = float(y) * alpha
-            alpha = 1
-        else:
-            alpha_tensor = lower_full(
-                y.get_size(),
-                float(alpha),
-                dtype=y.get_dtype(),
-                device=y.get_device(),
-            )
-            alpha_tensor.realize()
-            y = with_int64_fallback(lowering.mul, y, alpha_tensor)
-            y.realize()
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
     return with_int64_fallback(lowering.add, x, y)
 
 

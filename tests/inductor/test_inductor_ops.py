@@ -5545,13 +5545,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_dropout_functional(self, input, kwargs):
         self.compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_inplace_add_int64_scalar_cpu(self, dst, scalar):
+        # Direct inplace without clone: AOT autograd emits
+        # aten.full([], scalar, dtype=int64, device='cpu') which lower_full
+        # must redirect to the Spyre device.
         def fn(x, n):
-            x = x.clone()
             x.add_(n)
             return x
 
-        self.compare_with_cpu(fn, dst, scalar, run_eager=False)
+        self.compare_with_cpu(fn, dst, scalar, run_eager=False, clone_inputs=True)
 
     def test_inplace_op_cpu(self, op, dst, src):
         def fn(dst, src):
