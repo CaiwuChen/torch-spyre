@@ -2321,6 +2321,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_inplace_add_int64_scalar",
+            "test_inplace_add_int64_scalar_cpu",
+        ): {
+            "param_sets": {
+                "1_elem": (
+                    torch.randint(0, 1000, (1,), dtype=torch.int64),
+                    29,
+                ),
+                "1d": (
+                    torch.randint(-100, 100, (64,), dtype=torch.int64),
+                    7,
+                ),
+            },
+        },
+        (
             "test_inplace_copy",
             "test_inplace_op_cpu",
         ): {
@@ -5529,6 +5544,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_dropout_functional(self, input, kwargs):
         self.compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
+
+    def test_inplace_add_int64_scalar_cpu(self, dst, scalar):
+        def fn(x, n):
+            x = x.clone()
+            x.add_(n)
+            return x
+
+        self.compare_with_cpu(fn, dst, scalar, run_eager=False)
 
     def test_inplace_op_cpu(self, op, dst, src):
         def fn(dst, src):

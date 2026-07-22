@@ -988,7 +988,7 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
     if dtype is None:
         dtype = torch.get_default_dtype()
-    if dtype not in (torch.float16, torch.float32):
+    if dtype not in (torch.float16, torch.float32, torch.int64):
         return ir.TensorBox.create(
             ir.FallbackKernel.create(
                 torch.ops.aten.full.default,
@@ -1000,6 +1000,17 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
                 pin_memory=pin_memory,
             )
         )
+    # AOT autograd emits aten.full([], value, dtype=int64, device='cpu') for
+    # scalar operands like x.add_(29). Redirect CPU int64 constants to the
+    # Spyre graph device so they stay in-graph and never materialise as CPU
+    # tensors that Spyre kernels cannot accept.
+    if dtype == torch.int64 and (
+        device is None or (hasattr(device, "type") and device.type == "cpu")
+    ):
+        for d in V.graph.device_types:
+            if d != "cpu":
+                device = torch.device(d)
+                break
     scalar = ir.TensorBox.create(
         SpyreConstantFallback(
             torch.ops.spyre.constant.default, float(fill_value), dtype, device
@@ -1271,21 +1282,23 @@ def with_int64_fallback(fn, *args, convert_output=True):
     return output
 
 
-@register_spyre_lowering(
-    torch.ops.aten.add.Tensor,
-    type_promotion_kind=None,
-)
+@register_spyre_lowering(torch.ops.aten.add.Tensor, type_promotion_kind=None)
+@register_spyre_lowering(torch.ops.aten.add.Scalar, type_promotion_kind=None)
 def lower_add(x, y, *, alpha=1):
     if alpha != 1:
-        alpha_tensor = lower_full(
-            y.get_size(),
-            float(alpha),
-            dtype=y.get_dtype(),
-            device=y.get_device(),
-        )
-        alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
-        y.realize()
+        if isinstance(y, (int, float)):
+            y = float(y) * alpha
+            alpha = 1
+        else:
+            alpha_tensor = lower_full(
+                y.get_size(),
+                float(alpha),
+                dtype=y.get_dtype(),
+                device=y.get_device(),
+            )
+            alpha_tensor.realize()
+            y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+            y.realize()
     return with_int64_fallback(lowering.add, x, y)
 
 
