@@ -1584,6 +1584,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_lt_int64", "test_lt_int64_base"): {
+            "param_sets": {
+                "1d_4": (
+                    torch.randint(0, 1000, (4,), dtype=torch.int64),
+                    32,
+                ),
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    32,
+                ),
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int64),
+                    32,
+                ),
+                "1d_128": (
+                    torch.randint(0, 1000, (128,), dtype=torch.int64),
+                    32,
+                ),
+                "1d_1": (
+                    torch.randint(0, 1000, (1,), dtype=torch.int64),
+                    500,
+                ),
+                "1d_65": (
+                    torch.randint(0, 1000, (65,), dtype=torch.int64),
+                    500,
+                ),
+                "all_true": (
+                    torch.randint(0, 10, (64,), dtype=torch.int64),
+                    100,
+                ),
+                "all_false": (
+                    torch.randint(100, 1000, (64,), dtype=torch.int64),
+                    50,
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
@@ -4877,6 +4913,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_scalar_int64_cpu(self, op, x, scalar):
         # Test comparison ops with int64 tensors and scalar values.
         self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_lt_int64_base(self, x, scalar):
+        # int64 tensor < scalar: exercises the full spyre_lt_int64 decomposition
+        # chain: int64→fp32 [CPU] → lt(fp32) → fp32todl16 → stagger_to_standard_ea
+        self.compare_with_cpu(torch.lt, x, scalar, run_eager=False)
 
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without

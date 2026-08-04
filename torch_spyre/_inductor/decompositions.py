@@ -850,3 +850,67 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+@register_spyre_decompositions([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Scalar])
+def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
+    """Decompose aten.lt for int64 inputs via the full Spyre conversion chain:
+
+        int64 (IEEE_INT32)
+          → .to(fp32)             [int32tofp32 — CPU fallback via to_dtype_cpu]
+          → lt(fp32)              [Spyre lesserthan fp32 → bool, standard EA]
+          → .to(fp16)             [fp32todl16 — introduces staggered EA]
+          → stagger_to_standard_ea [restore standard EA via mm(P.t())]
+          → bool(fp16, standard EA)
+
+    For non-int64 inputs returns NotImplemented so the in-tree lowering runs.
+    """
+    if x.dtype != torch.int64:
+        return NotImplemented
+
+    # Only 1D is supported. Multi-dimensional int64 lt is left for a follow-up
+    # PR that will handle the stagger→standard EA pattern for higher-rank inputs.
+    if x.dim() != 1:
+        return NotImplemented
+
+    device = x.device
+
+    # Step 1: int64 → fp32
+    # fp32todl16 requires the last dim to be a multiple of 64 (fp16 stick size)
+    # and has no auto-pad, so we pad explicitly here before lt.
+    x_fp32 = x.to(torch.float32)
+    orig_last_dim = x_fp32.shape[-1]
+    needs_pad = orig_last_dim % 64 != 0  # x is guaranteed 1D here
+    if needs_pad:
+        padded_last_dim = math.ceil(orig_last_dim / 64) * 64
+        pad_extent = padded_last_dim - orig_last_dim
+        x_fp32 = torch.ops.aten.constant_pad_nd.default(x_fp32, [0, pad_extent], 0.0)
+
+    if isinstance(y, torch.Tensor):
+        y_fp32 = y.to(torch.float32)
+        if needs_pad:
+            y_fp32 = torch.ops.aten.constant_pad_nd.default(
+                y_fp32, [0, pad_extent], 0.0
+            )
+    else:
+        y_fp32 = torch.ops.aten.full.default(
+            list(x_fp32.shape),
+            float(y),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    # Step 2: lt(fp32) → bool (fp32 physical format, standard EA)
+    bool_fp32 = torch.lt(x_fp32, y_fp32)
+
+    # Step 3: fp32 → fp16 (fp32todl16) — this conversion introduces staggered EA
+    bool_fp16 = bool_fp32.to(torch.float16)
+
+    # Step 4: restore standard EA
+    result = torch.ops.spyre.stagger_to_standard_ea(bool_fp16)
+
+    if needs_pad:
+        result = result[:orig_last_dim]
+
+    # Reinterpret fp16 result as bool (identity cast on Spyre)
+    return result.to(torch.bool)
