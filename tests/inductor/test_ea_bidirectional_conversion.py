@@ -183,27 +183,9 @@ def test_bidirectional_roundtrip_fp32_start(device):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
-# ---------------------------------------------------------------------------
-# stagger_to_standard_ea
-# ---------------------------------------------------------------------------
-
-
 def _stagger_fn(x):
-    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16.
-
-    For 3-D+ inputs, flatten to 2-D before the op (stagger_to_standard_ea is
-    proven correct for 1-D / 2-D; higher-rank staggered tensors must be
-    flattened first because their physical device-dim interleaving makes
-    reshape(-1, N) give the correct row mapping only when done while staggered).
-    """
-    staggered = x.to(torch.float16)
-    orig_shape = list(staggered.shape)
-    n = orig_shape[-1]
-    if staggered.dim() > 2:
-        m = staggered.numel() // n
-        result = torch.ops.spyre.stagger_to_standard_ea(staggered.reshape(m, n))
-        return result.reshape(orig_shape)
-    return torch.ops.spyre.stagger_to_standard_ea(staggered)
+    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
+    return torch.ops.spyre.stagger_to_standard_ea(x.to(torch.float16))
 
 
 @pytest.mark.parametrize(
@@ -252,3 +234,6 @@ def test_stagger_to_standard_ea(x):
     spyre_result = compiled_fn(x.to("spyre"))
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
+# Made with Bob

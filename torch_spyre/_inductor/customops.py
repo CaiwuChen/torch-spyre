@@ -827,15 +827,13 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
         P[stick_base + local_logical, phys_j] = 1.0
     P = P.to(device=device)
 
-    # Reshape to 2D for mm, then restore original shape.
-    # Callers are expected to pass a 1-D or 2-D tensor; higher-rank inputs
-    # should be flattened to 2-D before calling this op.
+    # Flatten all dims except the last into a single batch dim for mm,
+    # then restore the original shape.  This works for any rank >= 1:
+    # the stagger pattern only affects the last (stick) dimension, so
+    # flattening leading dims produces the correct row ordering for mm.
     orig_shape = list(x.shape)
-    if x.dim() == 1:
-        result = torch.mm(x.unsqueeze(0), P.t()).squeeze(0)
-    else:
-        m = x.numel() // n
-        result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
+    m = x.numel() // n
+    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
     return result
 
 
