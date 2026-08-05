@@ -781,6 +781,69 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op(
+    "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
+)
+def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
+    """Restore standard Element Arrangement (EA) from staggered EA.
+
+    The fp32todl16 conversion reorders elements when converting fp32 to fp16,
+    producing staggered EA in the output.  This op applies mm(x, P.t()) to
+    permute the last dimension back to standard EA so downstream ops see a
+    normal fp16 tensor.
+
+    The permutation matrix P encodes the hardware fp32→fp16 stagger pattern.
+    Each fp16 stick (64 elements) staggers independently:
+        stick_base = (phys // 64) * 64
+        local_phys = phys % 64
+        k, w = local_phys // 8, local_phys % 8
+        local_logical = k*4 + w            if w < 4
+                      = k*4 + (w-4) + 32   otherwise   (32 = fp16_stick // 2)
+        logical = stick_base + local_logical
+
+    ``half`` is always 32 (half of one fp16 stick), independent of N.
+    N = x.shape[-1] must be a multiple of 64.
+
+    P is built on CPU and transferred to the device.  It is determined solely
+    by N, so it is constant for a given tensor width and can be reused across
+    ops (lt, eq, etc.) that produce the same stagger pattern.
+
+    Input:  fp16 tensor with staggered EA, any shape [..., N]
+    Output: fp16 tensor with standard EA, same shape [..., N]
+    """
+    n = x.shape[-1]
+    device = x.device
+
+    # Build N×N permutation matrix on CPU, transfer to device.
+    # Each fp16 stick (64 elements) staggers independently with half=32.
+    FP16_STICK = 64
+    half = FP16_STICK // 2  # 32 — fixed, independent of n
+    P = torch.zeros(n, n, dtype=torch.float16, device="cpu")
+    for phys_j in range(n):
+        stick_base = (phys_j // FP16_STICK) * FP16_STICK
+        local_phys = phys_j % FP16_STICK
+        k, w = local_phys // 8, local_phys % 8
+        local_logical = k * 4 + w if w < 4 else k * 4 + (w - 4) + half
+        P[stick_base + local_logical, phys_j] = 1.0
+    P = P.to(device=device)
+
+    # Reshape to 2D for mm, then restore original shape.
+    # Callers are expected to pass a 1-D or 2-D tensor; higher-rank inputs
+    # should be flattened to 2-D before calling this op.
+    orig_shape = list(x.shape)
+    if x.dim() == 1:
+        result = torch.mm(x.unsqueeze(0), P.t()).squeeze(0)
+    else:
+        m = x.numel() // n
+        result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
+    return result
+
+
+@stagger_to_standard_ea.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
 def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     pass
