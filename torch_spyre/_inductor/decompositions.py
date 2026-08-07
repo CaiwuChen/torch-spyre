@@ -962,14 +962,16 @@ def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
           → stagger_to_standard_ea [restore standard EA via mm(P.t())]
           → bool(fp16, standard EA)
 
+    Supports 1D and 2D tensors. For rank >= 3 the Spyre lesserthan op
+    produces incorrect results (independent backend bug), so higher-rank
+    inputs return NotImplemented and fall through to the in-tree lowering.
+
     For non-int64 inputs returns NotImplemented so the in-tree lowering runs.
     """
     if x.dtype != torch.int64:
         return NotImplemented
 
-    # Only 1D is supported. Multi-dimensional int64 lt is left for a follow-up
-    # PR that will handle the stagger→standard EA pattern for higher-rank inputs.
-    if x.dim() != 1:
+    if x.dim() > 2:
         return NotImplemented
 
     device = x.device
@@ -979,7 +981,7 @@ def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
     # and has no auto-pad, so we pad explicitly here before lt.
     x_fp32 = x.to(torch.float32)
     orig_last_dim = x_fp32.shape[-1]
-    needs_pad = orig_last_dim % 64 != 0  # x is guaranteed 1D here
+    needs_pad = orig_last_dim % 64 != 0
     if needs_pad:
         padded_last_dim = math.ceil(orig_last_dim / 64) * 64
         pad_extent = padded_last_dim - orig_last_dim
@@ -1009,7 +1011,7 @@ def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
     result = torch.ops.spyre.stagger_to_standard_ea(bool_fp16)
 
     if needs_pad:
-        result = result[:orig_last_dim]
+        result = result[..., :orig_last_dim]
 
     # Reinterpret fp16 result as bool (identity cast on Spyre)
     return result.to(torch.bool)

@@ -1764,6 +1764,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(100, 1000, (64,), dtype=torch.int64),
                     50,
                 ),
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    32,
+                ),
+                "2d_4x44": (
+                    torch.randint(0, 1000, (4, 44), dtype=torch.int64),
+                    500,
+                ),
             },
         },
         (

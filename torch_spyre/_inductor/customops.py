@@ -408,11 +408,6 @@ def restickify(  # type: ignore[empty-body]
     pass
 
 
-@restickify.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
