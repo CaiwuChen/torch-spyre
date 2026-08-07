@@ -721,6 +721,55 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
 
 
+@torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
+def scaled_mm(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Raw FP8 matrix multiplication, with no scaling or bias applied.
+
+    Scaling (scale_a, scale_b) and bias are intentionally NOT applied here -
+    they're applied afterward at the decomposition level by scaled_mm_decomp,
+    mirroring how dequantize_fp8_with_scale keeps its FP8->FP16 conversion
+    separate from the subsequent scale multiply.
+    """
+    pass
+
+
+@scaled_mm.register_fake
+def _(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:
+    output_shape = [mat1.shape[0], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    pass
+
+
+@quantize_weight_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
+def qfp8wt(input: torch.Tensor) -> torch.Tensor:
+    pass
+
+
+@qfp8wt.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
 @torch.library.custom_op("spyre::causal_mask", mutates_args=(), device_types="spyre")
 def causal_mask(
     seqlen_q: int,
@@ -806,13 +855,13 @@ def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
         P[stick_base + local_logical, phys_j] = 1.0
     P = P.to(device=device)
 
-    # Reshape to 2D for mm, then restore original shape
+    # Flatten all dims except the last into a single batch dim for mm,
+    # then restore the original shape.  This works for any rank >= 1:
+    # the stagger pattern only affects the last (stick) dimension, so
+    # flattening leading dims produces the correct row ordering for mm.
     orig_shape = list(x.shape)
-    if x.dim() == 1:
-        result = torch.mm(x.unsqueeze(0), P.t()).squeeze(0)
-    else:
-        m = x.numel() // n
-        result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
+    m = x.numel() // n
+    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
     return result
 
 
