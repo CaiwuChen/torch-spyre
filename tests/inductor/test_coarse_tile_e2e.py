@@ -58,6 +58,7 @@ from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor import config
 from torch_spyre._inductor import spyre_hint
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+from torch._inductor.exc import InductorError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
@@ -133,7 +134,7 @@ def run_coarse_tile_test(
     correctness=True,
     atol=None,
     rtol=None,
-    scale=0.01,
+    scale=1.0,
 ):
     """Compile fn on Spyre once, then check loopspec and/or correctness.
 
@@ -148,6 +149,7 @@ def run_coarse_tile_test(
     Always compiles exactly once, regardless of which checks are enabled.
     """
 
+    torch.manual_seed(0xC0A75E)
     cpu_tensors = [
         s.value
         if s.value is not None
@@ -775,9 +777,7 @@ def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     ):
                         return x.amin(dim=0)
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: inconsistent loop_count across reduction fill/combine nodes
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -794,9 +794,7 @@ def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
                     ):
                         return x.amin(dim=1)
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: inconsistent loop_count across reduction fill/combine nodes
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
@@ -842,7 +840,7 @@ def test_add_min_2d_512x256_reduce_dim0_A4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_add_min_2d_512x256_reduce_dim0_B4():
@@ -883,7 +881,7 @@ def test_add_min_2d_512x256_reduce_dim0_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4():
@@ -921,7 +919,7 @@ def test_add_min_2d_512x256_reduce_dim1_B4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4_B4():
@@ -943,7 +941,7 @@ def test_add_min_2d_512x256_reduce_dim1_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -967,9 +965,7 @@ def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -993,9 +989,7 @@ def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -1019,9 +1013,7 @@ def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    run_coarse_tile_test(
-        fn, inputs, loopspec=None, correctness=False
-    )  # scheduler crash: mixed loop counts in 3D nested tiling + reduction
+    run_coarse_tile_test(fn, inputs)
 
 
 # dense+dense: both inputs reduce over dim=0 → [B] dense outputs, then add
@@ -1040,7 +1032,7 @@ def test_reduce_both_dense_add_2d_512x256_A4():
             with spyre_hint(expected_named_dims=["B"]):
                 return a.amin(dim=0) + b.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_reduce_both_dense_add_2d_512x256_B4():
@@ -1071,7 +1063,7 @@ def test_reduce_both_dense_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["B"]):
                     return a.amin(dim=0) + b.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4():
@@ -1101,7 +1093,7 @@ def test_reduce_both_sparse_add_2d_512x256_B4():
             with spyre_hint(expected_named_dims=["A"]):
                 return a.amin(dim=1) + b.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4_B4():
@@ -1117,7 +1109,7 @@ def test_reduce_both_sparse_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A"]):
                     return a.amin(dim=1) + b.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 # softmax decomposes into amax + pointwise + sum + pointwise — exercises
@@ -1143,7 +1135,7 @@ def test_softmax_2d_512x256_dim1_B4():
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_softmax_2d_512x256_dim1_A4_B4():
@@ -1155,7 +1147,7 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_softmax_2d_512x256_dim0_A4():
@@ -1166,7 +1158,7 @@ def test_softmax_2d_512x256_dim0_A4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_softmax_2d_512x256_dim0_B4():
@@ -1189,7 +1181,7 @@ def test_softmax_2d_512x256_dim0_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 # ---------------------------------------------------------------------------
@@ -1715,8 +1707,15 @@ def test_copy_rmw_correction_512x256_A4_B4():
 # copies sparse reduction result into a dense buffer
 
 
-def test_copy_after_reduction_512x256_A4():
-    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4."""
+def test_copy_not_deleted():
+    """Regression: copy_ must not be eliminated by noop_registry removal.
+
+    If copy_ is deleted before lowering, the expected_reduction_dims hint on
+    the copy op is never checked (no op to check), and the test passes
+    vacuously.  If copy_ is present, validate_named_dims fires and raises
+    because copy_ has no reduction dim -- that AssertionError is the expected
+    outcome, proving the copy survived.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1726,7 +1725,84 @@ def test_copy_after_reduction_512x256_A4():
                 out.copy_(x.amin(dim=0))
         return out
 
-    run_coarse_tile_test(fn, inputs)
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_out_not_deleted():
+    """Regression: aten.copy.out must not be eliminated by noop_registry.
+
+    aten.copy.out normalizes to aten.copy.default before remove_noop_ops runs,
+    so the existing copy.default registry pop covers it.  This test confirms
+    that coverage: if copy.out were eliminated, the hint would never fire.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                torch.ops.aten.copy.out(amin, amin, out=out)
+        return out
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_clone_not_deleted():
+    """Regression: aten.clone must not be eliminated by noop_registry.
+
+    If clone is eliminated before lowering, the hint never fires and
+    pytest.raises fails.  If it survives, validate_named_dims raises on
+    the wrong expected_reduction_dims.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                return amin.clone()
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_clone_out_not_deleted():
+    """Regression: aten.clone.out must not be eliminated by noop_registry.
+
+    aten.clone.out is the out-variant of clone.  Confirms it is covered by
+    the clone.out registry pop (or normalizes to clone.default which is covered).
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            amin = x.amin(dim=0)
+            out = torch.empty_like(amin)
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                torch.ops.aten.clone.out(amin, out=out)
+        return out
+
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_after_reduction_512x256_A4():
+    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                temp = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                out.copy_(temp)
+        return out
+
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
 def test_copy_after_reduction_512x256_B4():
@@ -1737,10 +1813,12 @@ def test_copy_after_reduction_512x256_B4():
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
-                out.copy_(x.amin(dim=0))
+                temp = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)
 
 
 def test_copy_after_reduction_512x256_A4_B4():
@@ -1754,10 +1832,12 @@ def test_copy_after_reduction_512x256_A4_B4():
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
-                    out.copy_(x.amin(dim=0))
+                    temp = x.amin(dim=0)
+                with spyre_hint(expected_named_dims=["B"]):
+                    out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 def test_copy_running_max_4d_H4_Lq4():
@@ -1888,7 +1968,7 @@ def test_copy_accum_with_reduction_512x256_B4():
                 acc.copy_(acc * scale + r)
         return acc
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
@@ -1913,7 +1993,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
                     acc.copy_(acc * scale + r)
         return acc
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 # --- two copies in same hint scope: c1.copy_(a+b); c2.copy_(a*b) ---
@@ -2125,7 +2205,7 @@ def test_outside_consumer_two_accum_512x256_A4():
                 denom.copy_(denom + x.sum(dim=1))
         return out / denom.unsqueeze(1)
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_outside_consumer_two_accum_512x256_B4():
@@ -2169,7 +2249,7 @@ def test_outside_consumer_two_accum_512x256_A4_B4():
                     denom.copy_(denom + x.sum(dim=1))
         return out / denom.unsqueeze(1)
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 # --- reduction inside loop, result consumed outside ---
@@ -2225,7 +2305,7 @@ def test_outside_consumer_reduction_512x256_A4_B4():
                     s = x.amin(dim=0)
         return s + bias
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
 
 
 # ---------------------------------------------------------------------------
@@ -2602,7 +2682,6 @@ def test_flash_tile_B():
         ),
         _flash_v1_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2629,7 +2708,6 @@ def test_flash_tile_Lk():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2642,7 +2720,6 @@ def test_flash_tile_B_H():
         ),
         _flash_v1_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4]),
-        correctness=False,
     )
 
 
@@ -2654,7 +2731,7 @@ def test_flash_tile_H_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,
+        correctness=False,  # Numerically incorrect answer
     )
 
 
@@ -2669,7 +2746,6 @@ def test_flash_tile_H_Lq_Lk():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -2693,7 +2769,6 @@ def test_flash_tile_all():
         ),
         _flash_v1_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -2828,7 +2903,6 @@ def test_flash_v2_tile_B():
         ),
         _flash_v2_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2843,7 +2917,6 @@ def test_flash_v2_tile_Lq():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2858,7 +2931,6 @@ def test_flash_v2_tile_Lk():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -2871,7 +2943,6 @@ def test_flash_v2_tile_B_H():
         ),
         _flash_v2_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4]),
-        correctness=False,
     )
 
 
@@ -2886,7 +2957,6 @@ def test_flash_v2_tile_H_Lq():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,
     )
 
 
@@ -2912,7 +2982,6 @@ def test_flash_v2_tile_H_Lq_Lk():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -2939,7 +3008,6 @@ def test_flash_v2_tile_all():
         ),
         _flash_v2_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -3067,7 +3135,6 @@ def test_flash_v3_tile_B():
         ),
         _flash_v3_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3094,7 +3161,6 @@ def test_flash_v3_tile_Lk():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3107,7 +3173,6 @@ def test_flash_v3_tile_B_H():
         ),
         _flash_v3_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4]),
-        correctness=False,
     )
 
 
@@ -3145,7 +3210,6 @@ def test_flash_v3_tile_H_Lq_Lk():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -3172,7 +3236,6 @@ def test_flash_v3_tile_all():
         ),
         _flash_v3_inputs(2, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -3264,7 +3327,6 @@ def test_flash_v4_tile_H():
         lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, h_tiles=4),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=False,
     )
 
 
@@ -3277,7 +3339,6 @@ def test_flash_v4_tile_B():
         lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, b_tiles=2),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3290,7 +3351,6 @@ def test_flash_v4_tile_Lq():
         lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, lq_tiles=2),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3305,7 +3365,6 @@ def test_flash_v4_tile_H_Lq():
         ),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,
     )
 
 
@@ -3320,7 +3379,6 @@ def test_flash_v4_tile_H_Lq_Lk():
         ),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -3335,7 +3393,6 @@ def test_flash_v4_tile_all():
         ),
         _flash_v4_inputs(2, 256, 8, 64),
         loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
-        correctness=False,
     )
 
 
@@ -6472,9 +6529,6 @@ def test_sum_reduce_implicit_accumulator():
     torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
 
 
-@pytest.mark.skip(
-    reason="zeros with named_dims hint acquires wrong layout in tiled scope"
-)
 def test_zeros_named_dims_hint_correctness():
     """zeros with explicit named_dims hint inside a tiled scope should be correct.
 
