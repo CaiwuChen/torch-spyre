@@ -950,6 +950,7 @@ def spyre_prod_dim_int(
 
     return acc
 
+
 @register_spyre_decompositions([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Scalar])
 def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
     """Decompose aten.lt for int64 inputs via the full Spyre conversion chain:
@@ -1014,8 +1015,8 @@ def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
 
     # Reinterpret fp16 result as bool (identity cast on Spyre)
     return result.to(torch.bool)
-  
-  
+
+
 def _masked_scatter_reject_reason(
     self: torch.Tensor,
     mask: torch.Tensor,
