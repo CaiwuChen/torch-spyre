@@ -1763,6 +1763,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_cmp_le_int64", "test_cmp_le_int64_cpu"): {
+            "ops_dict": {
+                "le": torch.le,
+            },
+            "param_sets": {
+                # 1-D: aligned and unaligned
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int64),
+                    torch.randint(0, 1000, (64,), dtype=torch.int64),
+                ),
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                ),
+                # 2-D: aligned and unaligned last dim
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                ),
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                ),
+                # 3-D
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                ),
+                "3d_3x5x44": (
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                ),
+                # Broadcast: [1,1,1,2048] (kv_idx) <= [1,1,H,1] (q_idx)
+                # Origin: transformers masking_utils.py#L80  kv_idx <= q_idx
+                "4d_broadcast_12heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (12,), dtype=torch.int64).as_strided(
+                        [1, 1, 12, 1], [12, 12, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_14heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (14,), dtype=torch.int64).as_strided(
+                        [1, 1, 14, 1], [14, 14, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_855heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (855,), dtype=torch.int64).as_strided(
+                        [1, 1, 855, 1], [855, 855, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_41heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (41,), dtype=torch.int64).as_strided(
+                        [1, 1, 41, 1], [41, 41, 1, 1]
+                    ),
+                ),
+                "4d_broadcast_29heads": (
+                    torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
+                        [1, 1, 1, 2048], [2048, 2048, 2048, 1]
+                    ),
+                    torch.randint(0, 1000, (29,), dtype=torch.int64).as_strided(
+                        [1, 1, 29, 1], [29, 29, 1, 1]
+                    ),
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
@@ -5714,6 +5790,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_cmp_scalar_int64_cpu(self, op, x, scalar):
         # Test comparison ops with int64 tensors and scalar values.
         self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
+
+    def test_cmp_le_int64_cpu(self, op, x, y):
+        # Test le with int64 tensors (broadcast: [1,1,1,2048] <= [1,1,H,1])
+        # Origin: transformers masking_utils.py#L80  kv_idx <= q_idx
+        self.compare_with_cpu(op, x, y, run_eager=False)
 
     def test_linear_fn(self, x, weight, bias):
         # NOTE: relaxing atol from 2e-1 to 3e-1 for multi-dim work division, single element fails without

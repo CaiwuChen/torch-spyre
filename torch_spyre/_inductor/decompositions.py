@@ -1268,3 +1268,32 @@ def spyre_masked_scatter(
     # input rank-aligned with the output.
     gathered = source_2d[row_idx].reshape(self.shape)
     return torch.where(mask, gathered, self)
+
+
+@register_spyre_decompositions([torch.ops.aten.le.Tensor, torch.ops.aten.le.Scalar])
+def spyre_le_int64(x: torch.Tensor, y) -> torch.Tensor:
+    """Decompose aten.le for int64 inputs via the Spyre conversion chain:
+
+        int64 (IEEE_INT32)
+          → .to(fp32)   [int32tofp32 — CPU fallback via to_dtype_cpu]
+          → le(fp32)    [Spyre lesserequal → IEEE_FP32 bool, standard EA]
+          → .to(bool)   [IEEE_FP32 bool; generate_dci uses stl.device_dtype]
+
+    generate_dci (spyre_mem.cpp) now reads stl.device_dtype for the actual
+    on-device format, so IEEE_FP32 bool readback is correct without needing
+    fp32todl16 or stagger_to_standard_ea.
+
+    For non-int64 inputs returns NotImplemented so the in-tree lowering runs.
+    """
+    if x.dtype != torch.int64:
+        return NotImplemented
+
+    # Step 1: int64 → fp32
+    x_fp32 = x.to(torch.float32)
+    y_fp32 = y.to(torch.float32) if isinstance(y, torch.Tensor) else float(y)
+
+    # Step 2: le(fp32) → IEEE_FP32 bool (standard EA)
+    bool_fp32 = torch.le(x_fp32, y_fp32)
+
+    # Step 3: IEEE_FP32 bool → bool; generate_dci uses stl.device_dtype (IEEE_FP32)
+    return bool_fp32.to(torch.bool)

@@ -379,11 +379,19 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
           dev_format_dev != DataFormats::INVALID,
       "Unsupported Spyre tensor dtype for DMA transfer: ", dev_str_type);
 
+  // For bool tensors the scalar_type() lookup hardcodes SEN169_FP16, but the
+  // actual on-device format may differ (e.g. IEEE_FP32 from a fp32 comparison).
+  // Use stl.device_dtype when it is valid and differs from the table default.
+  DataFormats actual_dev_format =
+      (stl.device_dtype != DataFormats::INVALID && stl.device_dtype != DataFormats::BOOL)
+          ? stl.device_dtype
+          : dev_format_dev;
+
   DataConversionInfo dci{};
   dci.dci_dsName_ = "DCI-Tensor-0";
   dci.isHostToSen_ = host2device;
-  dci.dataformat_src_ = host2device ? cpu_format_host : dev_format_dev;
-  dci.dataformat_dst_ = host2device ? dev_format_dev : cpu_format_host;
+  dci.dataformat_src_ = host2device ? cpu_format_host : actual_dev_format;
+  dci.dataformat_dst_ = host2device ? actual_dev_format : cpu_format_host;
   TORCH_CHECK(
       isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
       "Unsupported DCI data format conversion: src=",
