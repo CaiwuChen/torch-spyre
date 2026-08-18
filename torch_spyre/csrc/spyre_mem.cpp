@@ -381,9 +381,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   // For bool tensors the scalar_type() lookup hardcodes SEN169_FP16, but the
   // actual on-device format may differ (e.g. IEEE_FP32 from a fp32 comparison).
-  // Use stl.device_dtype when it is valid and differs from the table default.
+  // Only override dev_format_dev for bool tensors; all other dtypes use the
+  // table-derived format to avoid corrupting the DMA conversion for non-bool
+  // tensors whose stl.device_dtype matches their normal table entry anyway.
   DataFormats actual_dev_format =
-      (stl.device_dtype != DataFormats::INVALID && stl.device_dtype != DataFormats::BOOL)
+      (dev_tensor->scalar_type() == c10::ScalarType::Bool &&
+       stl.device_dtype != DataFormats::INVALID &&
+       stl.device_dtype != DataFormats::BOOL)
           ? stl.device_dtype
           : dev_format_dev;
 
