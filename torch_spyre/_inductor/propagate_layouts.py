@@ -503,8 +503,12 @@ def _single_arg_op_layout(
             input_ea = stl.element_arrangement
 
             # Determine output EA based on conversion direction and input EA
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                # FP16 → FP32 conversion
+            if (
+                in_layout.dtype in (torch.float16, torch.bfloat16)
+                and output.dtype == torch.float32
+            ):
+                # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
+                # storage and the DL16TOFP32 hardware op.
                 if input_ea == ElementArrangement.STANDARD:
                     # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
                     fmt = ElementArrangement.DL16_TO_FP32
@@ -1447,27 +1451,26 @@ def _target_device_layout(target, name: str):
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
     if not layouts:
-        # Also check candidate layouts set by propagate_layouts on the producing
-        # ComputedBuffer (e.g. a constant-fill op that precedes the copy_forced).
+        # Also check candidate layouts on the producing ComputedBuffer —
+        # graph intermediates are not in graph_inputs.
         # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
-        # synthetic buffers whose layouts must be derived from their first
-        # writer, not locked here. Only use this when the producer has a
-        # single unambiguous candidate: with multiple candidates, arbitrarily
-        # picking next(iter(...)) here would lock the mutation op (and
-        # everything downstream of it) onto one candidate even when the
-        # beam search needs the freedom to pick a different one -- mirrors
-        # the same single-candidate guard in the copy-back elision pass
-        # above.
+        # synthetic buffers whose layouts are derived via separate paths.
+        # Exactly one candidate is required; the assert below enforces this.
         buf = V.graph.get_buffer(name) if name else None
         if buf is not None and not isinstance(
             buf, (SpyreEmptyFallback, SpyreConstantFallback)
         ):
             buf_layouts = getattr(buf, "layouts", None)
-            if buf_layouts and len(buf_layouts) == 1:
+            if buf_layouts:
                 layouts = buf_layouts
 
     if not layouts:
         return None
+    assert len(layouts) == 1, (
+        f"_target_device_layout: {name!r} has {len(layouts)} candidate layouts; "
+        f"multiple mutation ops writing the same target with different layouts "
+        f"is not yet supported"
+    )
     return next(iter(layouts))
 
 
