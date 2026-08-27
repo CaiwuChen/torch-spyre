@@ -1874,6 +1874,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_cmp_scalar_int64", "test_cmp_scalar_int64_cpu"): {
             "ops_dict": {
                 "ne": torch.ne,
+                # torch.ge.1_spyre: expert_ids_g >= num_experts
+                # https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/moe.py#L426
+                "ge": torch.ge,
             },
             "param_sets": {
                 # [1, 64] int64 non-contiguous (stride (64,1)) != scalar
@@ -1882,6 +1885,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (1, 64), (64, 1)
                     ),
                     0,
+                ),
+                # [272] int64 >= scalar 128 — grouped_mm_experts_forward sentinel mask
+                # sentinel_mask = (expert_ids_g >= self.num_experts).unsqueeze(-1)
+                "ge_1d_272_int64_scalar128": (
+                    torch.randint(0, 1000, (272,), dtype=torch.int64),
+                    128,
                 ),
             },
         },
