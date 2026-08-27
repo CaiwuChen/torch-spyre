@@ -1886,11 +1886,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     0,
                 ),
-                # [272] int64 >= scalar 128 — grouped_mm_experts_forward sentinel mask
+                # 1-D: model case — expert_ids_g >= num_experts (grouped_mm_experts_forward)
                 # sentinel_mask = (expert_ids_g >= self.num_experts).unsqueeze(-1)
+                # https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/moe.py#L426
                 "ge_1d_272_int64_scalar128": (
                     torch.randint(0, 1000, (272,), dtype=torch.int64),
                     128,
+                ),
+                # 1-D: stick-aligned
+                "ge_1d_256_int64_scalar128": (
+                    torch.randint(0, 1000, (256,), dtype=torch.int64),
+                    128,
+                ),
+                # 1-D: small non-aligned
+                "ge_1d_44_int64_scalar32": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int64),
+                    32,
+                ),
+                # 2-D: stick-aligned last dim
+                "ge_2d_4x64_int64_scalar500": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 2-D: non-aligned last dim
+                "ge_2d_7x44_int64_scalar32": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int64),
+                    32,
+                ),
+                # 3-D: stick-aligned
+                "ge_3d_2x4x64_int64_scalar500": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 3-D: non-aligned
+                "ge_3d_3x5x44_int64_scalar32": (
+                    torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
+                    32,
+                ),
+                # 4-D: stick-aligned
+                "ge_4d_2x3x4x64_int64_scalar500": (
+                    torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int64),
+                    500,
+                ),
+                # 4-D: non-aligned
+                "ge_4d_2x3x4x44_int64_scalar32": (
+                    torch.randint(0, 1000, (2, 3, 4, 44), dtype=torch.int64),
+                    32,
                 ),
             },
         },
