@@ -35,7 +35,6 @@ from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code, InputType
 
-
 from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
@@ -53,7 +52,8 @@ from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
-from torch_spyre._inductor.spyre_kernel import _remap_work_division, simplify_op_spec
+from torch_spyre._inductor.core_mapping import remap_work_division
+from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
@@ -241,18 +241,18 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
             )
 
-    def test_apply_work_div_hint_rejects_pinned_split(self):
+    def test_apply_work_div_hint_rejects_illegal_split(self):
         m = Symbol("M")
         op = self._fake_op({m: ["M"]})
 
-        with self.assertRaisesRegex(Exception, "pinned to split=1"):
+        with self.assertRaisesRegex(Exception, "legal splits are"):
             _wd._apply_user_hint(
                 op,
                 {m: 2},
                 {m: 64},
                 self._fake_output_td([m]),
                 max_cores=32,
-                pinned={m: 1},
+                allowed_splits={m: frozenset({1})},
             )
 
     @config.patch({"sencores": 8})
@@ -556,9 +556,11 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
 _CORE_ID = Symbol("core_id")
 _SOURCE_VIEW = PerCoreView(
-    ((0, 4), (1, 2)), ((0, floor(_CORE_ID / 2)), (1, Mod(_CORE_ID, 2)))
+    ((0, 4), (1, 2)),
+    ((0, floor(_CORE_ID / 2)), (1, Mod(_CORE_ID, 2))),
+    num_cores=8,
 )
-_DESTINATION_VIEW = PerCoreView(((0, 8),), ((0, _CORE_ID),))
+_DESTINATION_VIEW = PerCoreView(((0, 8),), ((0, _CORE_ID),), num_cores=8)
 
 
 def _relayout_plan(source="source", consumers="consumer"):
@@ -586,6 +588,74 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source({"input": dep}, producer)
 
 
+def test_lx_relayout_planner_rejects_equal_projected_ownership():
+    m = Symbol("m")
+    source_view = PerCoreView(
+        ((1, 32),),
+        ((1, Mod(_CORE_ID, 32)),),
+        num_cores=32,
+    )
+    destination_view = PerCoreView(
+        ((0, 32),),
+        ((0, Mod(_CORE_ID, 32)),),
+        num_cores=32,
+    )
+    coordinates = [m, m]
+    source_work_division = work_division_from_view(source_view, coordinates, (m,))
+    destination_work_division = work_division_from_view(
+        destination_view, coordinates, (m,)
+    )
+    assert source_view != destination_view
+    assert source_work_division == destination_work_division
+
+    source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
+    producer = SimpleNamespace(
+        layout=SimpleNamespace(device_layout=SimpleNamespace()),
+        data=SimpleNamespace(),
+        get_name=lambda: "source",
+    )
+    consumer = SimpleNamespace(
+        layout=SimpleNamespace(),
+        data=SimpleNamespace(),
+        get_name=lambda: "consumer",
+    )
+    graph = SimpleNamespace(operations=[producer, consumer])
+
+    def read_writes(op):
+        if op is producer:
+            return SimpleNamespace(reads=[], writes=[source_dep])
+        return SimpleNamespace(reads=[source_dep], writes=[])
+
+    with (
+        mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "Pointwise", SimpleNamespace),
+        mock_patch.object(
+            lx_relayout_module, "op_read_writes", side_effect=read_writes
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "_per_core_view_on_buf",
+            side_effect=[
+                (source_view, False, True),
+                (destination_view, False, True),
+            ],
+        ),
+        mock_patch.object(lx_relayout_module, "_op_num_cores", return_value=32),
+        mock_patch.object(
+            lx_relayout_module, "try_device_coordinates", return_value=coordinates
+        ),
+        mock_patch.object(
+            lx_relayout_module, "iteration_space_from_op", return_value=(m,)
+        ),
+        mock_patch.object(
+            lx_relayout_module, "op_short_name", return_value="pointwise"
+        ),
+    ):
+        assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
+
+
 def _compile_spec(spec, normalize=True):
     if normalize:
         simplify_op_spec(spec)
@@ -602,10 +672,12 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     source_view = PerCoreView(
         ((1, 4), (2, 2)),
         ((1, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))),
+        num_cores=8,
     )
     destination_view = PerCoreView(
         ((1, 2), (2, 4)),
         ((1, Mod(_CORE_ID, 2)), (2, floor(_CORE_ID / 2))),
+        num_cores=8,
     )
     coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
     base = TensorArg(
@@ -636,8 +708,8 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     ]
     assert root["numWkSlicesPerDim_"] == {"mb": 1, "x": 8, "out": 1}
     maps = [node["coordinates_"]["coreIdToWkSlice_"] for node in allocations]
-    assert [maps[0][str(i)]["x"] for i in range(8)] == [i // 2 for i in range(8)]
-    assert [maps[0][str(i)]["out"] for i in range(8)] == [i % 2 for i in range(8)]
+    assert [maps[0][str(i)]["x"] for i in range(8)] == [i % 4 for i in range(8)]
+    assert [maps[0][str(i)]["out"] for i in range(8)] == [i // 4 for i in range(8)]
     assert [maps[1][str(i)]["x"] for i in range(8)] == [i % 2 for i in range(8)]
     assert [maps[1][str(i)]["out"] for i in range(8)] == [i // 2 for i in range(8)]
     coord_info = [node["coordinates_"]["coordInfo"] for node in allocations]
@@ -661,8 +733,10 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         base,
         work_division=TensorWorkDivision({old: 16}, {old: Mod(_CORE_ID, 16)}),
     )
-    _remap_work_division(remapped, {old: ((inner, 2), (outer, 8))})
     assert remapped.work_division is not None
+    remapped.work_division = remap_work_division(
+        remapped.work_division, {old: ((inner, 2), (outer, 8))}
+    )
     core_three = {
         dim: int(slot.subs(_CORE_ID, 3))
         for dim, slot in remapped.work_division.core_id_to_work_slice.items()
@@ -676,6 +750,10 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
         "lx_planning": True,
         "allow_all_ops_in_lx_planning": True,
         "lx_planner_relayout": True,
+        # LX relayout needs a paired-buffer-capable solver; only the greedy
+        # solver sets supports_paired_buffers. Pin it explicitly so this test
+        # keeps exercising relayout regardless of the default layout_solver.
+        "layout_solver": "greedy",
     }
 )
 @pytest.mark.parametrize("second_consumer", ["pointwise", "matmul_lhs", "matmul_rhs"])
@@ -800,6 +878,71 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
     )
+
+
+def _assert_live_buffers_do_not_share_addresses(buffers, limit):
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, limit)
+    allocation = allocator._solve(allocator._build_solver(buffers))
+    assert all(buffer.address is not None for buffer in allocation)
+    for index, left in enumerate(allocation):
+        for right in allocation[index + 1 :]:
+            if not left.overlaps_in_time(right):
+                continue
+            assert left.address + left.size <= right.address or (
+                right.address + right.size <= left.address
+            )
+
+
+def test_lx_relayout_copies_loop_lifetime_to_every_destination():
+    plans = [
+        _relayout_plan("source", ("consumer_a", "consumer_b")),
+        LXRelayoutPlan(
+            "source",
+            ("consumer_c",),
+            _SOURCE_VIEW,
+            PerCoreView(((1, 8),), ((1, _CORE_ID),)),
+            8,
+        ),
+    ]
+    graph = SimpleNamespace(
+        operations=[
+            SimpleNamespace(get_name=lambda name=name: name)
+            for name in ("producer", "consumer_a", "consumer_b", "consumer_c")
+        ]
+    )
+    source = LifetimeBoundBuffer("source", 64, [0, 1, 2, 3], lifetime_end_override=6)
+    source.lx_relayout_plans = list(plans)
+    buffers = [source]
+    ScratchpadAllocator(GreedyLayoutSolver, 256)._append_lx_relayout_destinations(
+        graph, buffers
+    )
+
+    assert source.lifetime_end_override is None
+    assert [buffer.lifetime_end_override for buffer in source.paired_with] == [12, 12]
+    tail = LifetimeBoundBuffer("tail", 64, [8, 11])
+    buffers.append(tail)
+    _assert_live_buffers_do_not_share_addresses(buffers, 384)
+
+
+def test_lx_relayout_keeps_source_lifetime_for_later_original_reader():
+    graph = SimpleNamespace(
+        operations=[
+            SimpleNamespace(get_name=lambda name=name: name)
+            for name in ("producer", "relayout_consumer", "ordinary_consumer")
+        ]
+    )
+    source = LifetimeBoundBuffer("source", 64, [0, 1, 2], lifetime_end_override=4)
+    source.lx_relayout_plans = [_relayout_plan("source", "relayout_consumer")]
+    buffers = [source]
+    ScratchpadAllocator(GreedyLayoutSolver, 192)._append_lx_relayout_destinations(
+        graph, buffers
+    )
+
+    assert source.lifetime_end_override == 8
+    assert source.paired_with[0].lifetime_end_override == 8
+    tail = LifetimeBoundBuffer("tail", 64, [6, 7])
+    buffers.append(tail)
+    _assert_live_buffers_do_not_share_addresses(buffers, 384)
 
 
 @config.patch({"lx_planner_relayout": True})
