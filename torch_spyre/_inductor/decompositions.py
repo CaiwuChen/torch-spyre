@@ -1294,7 +1294,7 @@ def spyre_le_int64(x: torch.Tensor, y) -> torch.Tensor:
     """Decompose aten.le for int64 inputs via the Spyre conversion chain:
 
         int64 (IEEE_INT32)
-          → .to(fp32)   [int32tofp32 — CPU fallback via to_dtype_cpu]
+          → .to(fp32)   [int32tofp32]
           → le(fp32)    [Spyre lesserequal → bool, standard EA]
 
     For non-int64 inputs returns NotImplemented so the in-tree lowering runs.

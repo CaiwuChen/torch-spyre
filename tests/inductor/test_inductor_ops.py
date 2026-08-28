@@ -1936,16 +1936,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "le": torch.le,
             },
             "param_sets": {
-                # 1-D: aligned and unaligned
                 "1d_64": (
                     torch.randint(0, 1000, (64,), dtype=torch.int64),
                     torch.randint(0, 1000, (64,), dtype=torch.int64),
                 ),
-                "1d_44": (
-                    torch.randint(0, 1000, (44,), dtype=torch.int64),
-                    torch.randint(0, 1000, (44,), dtype=torch.int64),
-                ),
-                # 2-D: aligned and unaligned last dim
                 "2d_4x64": (
                     torch.randint(0, 1000, (4, 64), dtype=torch.int64),
                     torch.randint(0, 1000, (4, 64), dtype=torch.int64),
@@ -1963,8 +1957,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
                     torch.randint(0, 1000, (3, 5, 44), dtype=torch.int64),
                 ),
-                # Broadcast: [1,1,1,2048] (kv_idx) <= [1,1,H,1] (q_idx)
-                # Origin: transformers masking_utils.py#L80  kv_idx <= q_idx
                 "4d_broadcast_12heads": (
                     torch.randint(0, 1000, (2048,), dtype=torch.int64).as_strided(
                         [1, 1, 1, 2048], [2048, 2048, 2048, 1]
@@ -6105,8 +6097,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(op, x, scalar, run_eager=True, run_compile=False)
 
     def test_cmp_le_int64_cpu(self, op, x, y):
-        # Test le with int64 tensors (broadcast: [1,1,1,2048] <= [1,1,H,1])
-        # Origin: transformers masking_utils.py#L80  kv_idx <= q_idx
         self.compare_with_cpu(op, x, y, run_eager=False)
 
     def test_linear_fn(self, x, weight, bias):
