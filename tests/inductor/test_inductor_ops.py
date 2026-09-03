@@ -2073,6 +2073,100 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # -----------------------------------------------------------------------
+        # int32 scalar comparisons: all 6 ops, multiple shapes.
+        # int32 inputs are cast to fp32 inside the lowering (int32tofp32 OpFunc).
+        # -----------------------------------------------------------------------
+        ("test_cmp_int32_scalar", "test_cmp_int32_scalar_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "param_sets": {
+                # 1-D: stick-aligned
+                "1d_256_scalar128": (
+                    torch.randint(0, 1000, (256,), dtype=torch.int32),
+                    128,
+                ),
+                # 1-D: non-aligned
+                "1d_44_scalar32": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                    32,
+                ),
+                # 2-D: stick-aligned last dim
+                "2d_4x64_scalar500": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 2-D: non-aligned last dim
+                "2d_7x44_scalar32": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                    32,
+                ),
+                # 3-D
+                "3d_2x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+                # 4-D
+                "4d_2x3x4x64_scalar500": (
+                    torch.randint(0, 1000, (2, 3, 4, 64), dtype=torch.int32),
+                    500,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
+        # int32 tensor-vs-tensor comparisons: all 6 ops, multiple shapes.
+        # -----------------------------------------------------------------------
+        ("test_cmp_int32_tensor", "test_cmp_int32_tensor_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "lt": torch.lt,
+                "le": torch.le,
+                "gt": torch.gt,
+                "ge": torch.ge,
+            },
+            "param_sets": {
+                # 1-D: stick-aligned
+                "1d_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                ),
+                # 1-D: non-aligned
+                "1d_44": (
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                    torch.randint(0, 1000, (44,), dtype=torch.int32),
+                ),
+                # 2-D
+                "2d_4x64": (
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                    torch.randint(0, 1000, (4, 64), dtype=torch.int32),
+                ),
+                "2d_7x44": (
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                    torch.randint(0, 1000, (7, 44), dtype=torch.int32),
+                ),
+                # 3-D
+                "3d_2x4x64": (
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                    torch.randint(0, 1000, (2, 4, 64), dtype=torch.int32),
+                ),
+                # broadcast: [1,1,1,64] vs [1,1,8,1]
+                "4d_broadcast": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32).as_strided(
+                        [1, 1, 1, 64], [64, 64, 64, 1]
+                    ),
+                    torch.randint(0, 1000, (8,), dtype=torch.int32).as_strided(
+                        [1, 1, 8, 1], [8, 8, 1, 1]
+                    ),
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
@@ -6172,6 +6266,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_cmp_int64_tensor_cpu(self, op, x, y):
         # int64 tensor-vs-tensor comparison: compiled path only.
+        self.compare_with_cpu(op, x, y, run_eager=False)
+
+    def test_cmp_int32_scalar_cpu(self, op, x, scalar):
+        # int32 scalar comparison: compiled path only (int32→fp32 cast in lowering).
+        self.compare_with_cpu(op, x, scalar, run_eager=False)
+
+    def test_cmp_int32_tensor_cpu(self, op, x, y):
+        # int32 tensor-vs-tensor comparison: compiled path only.
         self.compare_with_cpu(op, x, y, run_eager=False)
 
     def test_linear_fn(self, x, weight, bias):

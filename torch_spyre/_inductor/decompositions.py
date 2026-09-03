@@ -1289,57 +1289,6 @@ def spyre_masked_scatter(
     return torch.where(mask, gathered, self)
 
 
-# ---------------------------------------------------------------------------
-# Comparison ops: aten.{eq,ne,lt,le,gt,ge}.Tensor / aten.{eq,ne,lt,le,gt,ge}.Scalar
-#
-# Spyre does not support integer operands for comparison operations natively.
-# int64 inputs are converted to float32 before the comparison so that the
-# upstream fp32 lowering handles broadcasting correctly.
-# ---------------------------------------------------------------------------
-
-
-def _decompose_cmp_int64(x: torch.Tensor, y, cmp_fn):
-    """Shared helper: cast int64 operands to fp32, then apply cmp_fn.
-
-    Returning NotImplemented for non-int64 inputs lets the in-tree lowering run.
-    """
-    if x.dtype != torch.int64:
-        return NotImplemented
-    x_fp32 = x.to(torch.float32)
-    y_fp32 = y.to(torch.float32) if isinstance(y, torch.Tensor) else float(y)
-    return cmp_fn(x_fp32, y_fp32)
-
-
-@register_spyre_decompositions([torch.ops.aten.eq.Tensor, torch.ops.aten.eq.Scalar])
-def spyre_eq_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.eq)
-
-
-@register_spyre_decompositions([torch.ops.aten.ne.Tensor, torch.ops.aten.ne.Scalar])
-def spyre_ne_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.ne)
-
-
-@register_spyre_decompositions([torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Scalar])
-def spyre_lt_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.lt)
-
-
-@register_spyre_decompositions([torch.ops.aten.le.Tensor, torch.ops.aten.le.Scalar])
-def spyre_le_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.le)
-
-
-@register_spyre_decompositions([torch.ops.aten.gt.Tensor, torch.ops.aten.gt.Scalar])
-def spyre_gt_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.gt)
-
-
-@register_spyre_decompositions([torch.ops.aten.ge.Tensor, torch.ops.aten.ge.Scalar])
-def spyre_ge_int64(x: torch.Tensor, y) -> torch.Tensor:
-    return _decompose_cmp_int64(x, y, torch.ge)
-
-
 @register_spyre_decompositions([torch.ops.aten.index_add.default])
 def spyre_index_add(
     self: torch.Tensor,
