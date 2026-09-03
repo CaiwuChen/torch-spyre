@@ -2086,6 +2086,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
+            # 1D non-32-aligned int32 tensors cannot be scheduled by dxp_standalone
+            # (sbf-ddc: no valid candidate). 2D+ shapes with the same last-dim size
+            # work fine because the scheduler distributes work across the outer dim.
+            "expect_fail": ["1d_44_scalar32"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_256_scalar128": (
@@ -2131,6 +2135,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
+            # 1D non-32-aligned int32 tensors cannot be scheduled by dxp_standalone
+            # (sbf-ddc: no valid candidate). 2D+ shapes with the same last-dim size
+            # work fine because the scheduler distributes work across the outer dim.
+            "expect_fail": ["1d_44"],
             "param_sets": {
                 # 1-D: stick-aligned
                 "1d_64": (
