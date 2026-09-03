@@ -37,7 +37,6 @@ from torch_spyre._inductor.errors import Unsupported
 # Spyre has no native bool: a bool tensor reuses whichever physical format
 # produced it (e.g. fp16 vs fp32 comparison results). Maps that format to
 # the logical dtype that natively uses it.
-
 _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
     DataFormats.SEN169_FP16: torch.float16,
     DataFormats.IEEE_FP32: torch.float32,
