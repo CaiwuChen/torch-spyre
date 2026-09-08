@@ -260,6 +260,12 @@ def _get_coordinate_mask(
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
     # fp32 hardware does not support SAMV stick masking; skip for fp32 outputs.
+    # TODO: Enable SAMV (pointwise padding mask) for FP32 tensors once backend support
+    # is available.
+    # Latent risk: If an unaligned FP32 tensor goes through softmax (e.g. to generate
+    # a tensor consumed by torch.topk), unmasked padding elements from torch.exp()
+    # could cause incorrect results if not masked. Currently test cases use aligned inputs
+    # so there is no immediate issue, but SAMV masking should be applied once supported.
     mask_pointwise = (
         op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
     )
