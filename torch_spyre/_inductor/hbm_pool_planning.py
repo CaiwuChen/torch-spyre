@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from typing import Callable
 from sympy import Symbol
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
@@ -123,11 +124,26 @@ def _compute_size_bytes(name: str) -> int:
 def _compute_live_ranges(
     nodes: list[BaseSchedulerNode],
     pool_candidates: set[str],
+    alloc_id_of: "Callable[[str], int | None]",
 ) -> dict[str, tuple[int, int]]:
     """Return {buf_name: (start_step, end_step)} for each pool candidate.
 
     start_step: timestep of the node that writes the buffer.
     end_step: last timestep at which any node reads the buffer.
+
+    Two or more candidate names can share the same underlying
+    FixedTiledLayout.allocation dict object -- see `_alloc_id` -- when a
+    MutationLayoutSHOULDREMOVE retarget (e.g. the copy-in/retarget/copy-back
+    sequence enforce_indirect_access_layout.py's
+    _insert_mutation_relayout_copy inserts for a non-compliant scatter
+    destination) makes one op's layout literally *be* another buffer's
+    layout instance. Since they are truly one physical storage location,
+    their live range must be the union of every aliased name's individual
+    range -- not each name's own range in isolation -- or the allocator
+    could place another buffer's block on top of storage one of the
+    aliased names still needs. Every name in such a group gets the exact
+    same merged (start, end) here so the caller can allocate it once (via
+    `alloc_id_of`) using a range that is safe for every alias.
     """
     start: dict[str, int] = {}
     end: dict[str, int] = {}
@@ -145,6 +161,20 @@ def _compute_live_ranges(
     for name in pool_candidates:
         if name in start:
             live_ranges[name] = (start[name], end.get(name, len(nodes) + 1))
+
+    # Merge ranges within each alias group (same id(layout.allocation)).
+    group_range: dict[int, tuple[int, int]] = {}
+    for name, (s, e) in live_ranges.items():
+        alloc_id = alloc_id_of(name)
+        if alloc_id is None:
+            continue
+        gs, ge = group_range.get(alloc_id, (s, e))
+        group_range[alloc_id] = (min(gs, s), max(ge, e))
+    for name in live_ranges:
+        alloc_id = alloc_id_of(name)
+        if alloc_id is not None and alloc_id in group_range:
+            live_ranges[name] = group_range[alloc_id]
+
     return live_ranges
 
 
@@ -290,17 +320,27 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # aliased names (see _alloc_id) are attributed to the same underlying
     # storage even though they share no name-based dependency edge.
     #
-    # Deliberately write-keyed only: the sole Inductor mechanism that makes
-    # two distinct buffer names share the literal id(layout.allocation)
-    # object is MutationLayoutSHOULDREMOVE, which always attaches to a
-    # write (set via `src.data.layout = MutationLayoutSHOULDREMOVE(dst)` in
-    # Inductor's realize_into/mark_buffer_mutated) -- so walking .writes
-    # alone is provably complete. Inductor's read-only aliasing mechanism
-    # (NonOwningLayout, used for views) builds a new Layout object rather
-    # than sharing one, and such buffers are excluded from pool eligibility
-    # entirely by the isinstance(layout, FixedTiledLayout) checks in
-    # _is_intermediate/_alloc_id, independent of bundle analysis.
+    # The sole Inductor mechanism that makes two distinct buffer names
+    # share the literal id(layout.allocation) object is
+    # MutationLayoutSHOULDREMOVE, which always attaches to a write (set via
+    # `src.data.layout = MutationLayoutSHOULDREMOVE(dst)` in Inductor's
+    # realize_into/mark_buffer_mutated). Inductor's read-only aliasing
+    # mechanism (NonOwningLayout, used for views) builds a new Layout object
+    # rather than sharing one, and such buffers are excluded from pool
+    # eligibility entirely by the isinstance(layout, FixedTiledLayout) checks
+    # in _is_intermediate/_alloc_id, independent of bundle analysis.
     alloc_id_bundles: dict[int, set[str]] = {}
+    # id(layout.allocation) -> every bundle that READ a name resolving to
+    # that allocation dict.  Required, not merely symmetric with the writer
+    # map above: assigning a pool offset writes into the shared allocation
+    # dict (`layout.allocation["hbm_pool"] = offset` below), which relocates
+    # EVERY name resolving to it -- including names that were never pool
+    # candidates and so were never passed to _is_cross_bundle. A co-allocated
+    # sibling read by another bundle would then be addressed pool-relative in
+    # a bundle that owns no pool, tripping generate_bundle's pool_size
+    # assertion. Keying reads by allocation lets _is_cross_bundle reject the
+    # whole allocation when any name on it is read outside its writer.
+    alloc_id_reader_bundles: dict[int, set[str]] = {}
 
     for bundle in nodes:
         bundle_name = bundle.get_name()
@@ -318,6 +358,10 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             for dep in node.read_writes.reads:
                 if dep.name not in graph_inputs:
                     buffer_reader_bundles.setdefault(dep.name, set()).add(bundle_name)
+                    if (alloc_id := _alloc_id(dep.name)) is not None:
+                        alloc_id_reader_bundles.setdefault(alloc_id, set()).add(
+                            bundle_name
+                        )
         # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked
         # write, so they never appear via the dep walk above.  Collect them
         # explicitly, using the underlying buffer's name (node.node.get_name())
@@ -359,8 +403,25 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 sorted(alloc_id_bundles[alloc_id]),
             )
             return True
-        readers = buffer_reader_bundles.get(name, set())
         writer = buffer_writer_bundle.get(name)
+        if alloc_id is not None:
+            # Allocation-scoped, not name-scoped: pooling this name writes
+            # the offset into the allocation dict every co-allocated name
+            # shares, so a read of ANY of those names from another bundle
+            # makes the whole allocation ineligible -- the sibling is not
+            # itself a candidate and would never be checked on its own.
+            alias_readers = alloc_id_reader_bundles.get(alloc_id, set())
+            alias_writers = alloc_id_bundles.get(alloc_id, {writer})
+            if alias_readers - alias_writers:
+                logger.debug(
+                    "hbm_pool_planning: %s shares its allocation with a "
+                    "buffer read in another bundle %s -- excluding from "
+                    "pool eligibility",
+                    name,
+                    sorted(alias_readers - alias_writers),
+                )
+                return True
+        readers = buffer_reader_bundles.get(name, set())
         return bool(readers - {writer})
 
     all_candidates = {
@@ -417,8 +478,31 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             live_range_nodes = [bundle]
         else:
             live_range_nodes = bundle.get_nodes()
-        live_ranges = _compute_live_ranges(live_range_nodes, bundle_candidates)
+        live_ranges = _compute_live_ranges(
+            live_range_nodes, bundle_candidates, _alloc_id
+        )
         sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
+
+        # Two or more candidate names can resolve to the same
+        # id(layout.allocation) (see _alloc_id / _compute_live_ranges) --
+        # they are one physical storage location sharing one merged live
+        # range, and must be allocated exactly once. Group by alloc_id
+        # here (preserving sorted_bufs's (start, end, name) order for the
+        # group's position) so the loop below allocates once per group and
+        # then writes the resulting offset into every member name.
+        alloc_groups: dict[str, list[str]] = {}
+        group_of_alloc_id: dict[int, str] = {}
+        alloc_order: list[str] = []
+        for name, _ in sorted_bufs:
+            alloc_id = _alloc_id(name)
+            rep = group_of_alloc_id.get(alloc_id) if alloc_id is not None else None
+            if rep is not None:
+                alloc_groups[rep].append(name)
+                continue
+            if alloc_id is not None:
+                group_of_alloc_id[alloc_id] = name
+            alloc_groups[name] = [name]
+            alloc_order.append(name)
 
         allocator = Allocator(MAX_POOL_SIZE_BYTES)
 
@@ -426,7 +510,9 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         pending_frees: list[tuple[int, int, int]] = []
         overflowed = 0
 
-        for name, (start, end) in sorted_bufs:
+        for rep_name in alloc_order:
+            start, end = live_ranges[rep_name]
+            grouped_names = alloc_groups[rep_name]
             # Free any blocks whose live range ended before this start step.
             still_live = []
             for entry in pending_frees:
@@ -437,7 +523,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                     still_live.append(entry)
             pending_frees = still_live
 
-            size = _compute_size_bytes(name)
+            size = _compute_size_bytes(rep_name)
             offset = allocator.allocate(size)
 
             if offset is None:
@@ -450,47 +536,53 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                     "hbm_pool_planning: bundle=%s  %s  live=[%d,%d]  size=%d  "
                     "does not fit in pool -- falling back to standalone HBM",
                     bundle_name,
-                    name,
+                    grouped_names,
                     start,
                     end,
                     size,
                 )
                 continue
 
-            # Assign pool offset directly to layout.allocation.
-            buf = V.graph.get_buffer(name)
-            layout = buf.maybe_get_layout()
+            # Assign pool offset directly to layout.allocation. Every name
+            # in grouped_names shares the exact same layout/allocation dict
+            # object, so this single write is visible to all of them.
+            layout = V.graph.get_buffer(rep_name).maybe_get_layout()
             assert isinstance(layout, FixedTiledLayout)
             if config.bundle_symbolic_args:
                 layout.allocation["hbm_pool"] = offset
             else:
                 layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset
 
-            if isinstance(buf, SpyreEmptyFallback):
-                # SpyreEmptyFallback.should_allocate() returns False once
-                # pool-allocated, so the wrapper never emits an AllocateLine
-                # for it. Base Inductor's free machinery
-                # (Scheduler.free_buffers -> codegen_free -> can_reuse) does
-                # not consult should_allocate(); it frees any buffer whose
-                # last use has passed regardless of whether it was ever
-                # allocated. Without this, the generated wrapper emits
-                # `del buf27` with no prior `buf27 = ...`, raising
-                # UnboundLocalError. free_buffers() itself subtracts
-                # V.graph.removed_buffers before iterating, so adding the
-                # name here keeps it out of codegen entirely.
-                V.graph.removed_buffers.add(name)
-
             pending_frees.append((end, offset, size))
-
             logger.debug(
                 "hbm_pool_planning: bundle=%s  %s  live=[%d,%d]  size=%d  offset=%d",
                 bundle_name,
-                name,
+                grouped_names,
                 start,
                 end,
                 size,
                 offset,
             )
+
+            # SpyreEmptyFallback.should_allocate()/removed_buffers is a
+            # per-*name* codegen concern (each name is still emitted as its
+            # own statement even though several share one storage
+            # location), so this must run once for every name in the group.
+            for name in grouped_names:
+                buf = V.graph.get_buffer(name)
+                if isinstance(buf, SpyreEmptyFallback):
+                    # SpyreEmptyFallback.should_allocate() returns False once
+                    # pool-allocated, so the wrapper never emits an
+                    # AllocateLine for it. Base Inductor's free machinery
+                    # (Scheduler.free_buffers -> codegen_free -> can_reuse)
+                    # does not consult should_allocate(); it frees any buffer
+                    # whose last use has passed regardless of whether it was
+                    # ever allocated. Without this, the generated wrapper
+                    # emits `del buf27` with no prior `buf27 = ...`, raising
+                    # UnboundLocalError. free_buffers() itself subtracts
+                    # V.graph.removed_buffers before iterating, so adding the
+                    # name here keeps it out of codegen entirely.
+                    V.graph.removed_buffers.add(name)
 
         peak = allocator.get_peak_usage()
         pool_extent = allocator.get_pool_end()
@@ -506,7 +598,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             "hbm_pool_planning: bundle=%s assigned %d intermediates, peak concurrent "
             "usage %.2f GB, pool extent %.2f GB / %.2f GB",
             bundle_name,
-            len(sorted_bufs) - overflowed,
+            len(alloc_order) - overflowed,
             peak / _BYTES_PER_GB,
             pool_extent / _BYTES_PER_GB,
             MAX_POOL_SIZE_BYTES / _BYTES_PER_GB,
