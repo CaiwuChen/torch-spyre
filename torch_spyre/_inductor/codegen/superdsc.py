@@ -285,13 +285,26 @@ def _get_coordinate_mask(
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
-    # fp32 hardware does not support SAMV stick masking; skip for fp32 outputs.
-    # TODO: Enable SAMV (pointwise padding mask) for FP32 tensors once backend support
-    # is available.
-    # Latent risk: If an unaligned FP32 tensor goes through softmax (e.g. to generate
-    # a tensor consumed by torch.topk), unmasked padding elements from torch.exp()
-    # could cause incorrect results if not masked. Currently test cases use aligned inputs
-    # so there is no immediate issue, but SAMV masking should be applied once supported.
+    #
+    # SAMV coordinate masking is limited to <=16-bit element types by the
+    # backend compiler ("Coordinate masking is supported only up to 16bit
+    # element types"), so the pointwise padding mask cannot be emitted for FP32.
+    # Skipping it is what lets unaligned FP32 `exp` compile at all.
+    #
+    # Risk: the padded lanes of an unaligned FP32 `exp` output hold
+    # `exp(uninitialized)`, so any consumer that ITERATES the padded extent may
+    # produce unexpected results -- a contraction does, since it reads the whole
+    # stick as an operand. Note a restickify also iterates the padded extent and
+    # emits no mask, so the values are relocated rather than dropped; they stay
+    # harmless only as long as the eventual consumer iterates the logical extent.
+    # Known use cases do not hit this limitation:
+    #   * SDPA (softmax -> matmul, the consumer the mask was added for, #3248)
+    #     runs in fp16, where the mask is still applied.
+    #   * The Gemma-4 MoE router (softmax with dtype=torch.float32 -> topk) uses
+    #     stick-aligned tensors, so there are no padded lanes to begin with.
+    # Revisit if either assumption changes. See #3799 (SAMV masking for exp) and
+    # #3290 (padded-stick-state layout enum, the principled replacement for this
+    # bandage).
     mask_pointwise = (
         op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
     )
