@@ -797,12 +797,14 @@ def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
 def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
     """Insert identity de-stagger ops before graph outputs that have staggered EA.
 
-    If a graph output tensor has DL16_TO_FP32 EA (e.g. from h2f softmax or RMSNorm upcast),
-    it must be de-staggered back to STANDARD EA on device before returning to CPU / host.
-    This inserts an identity op with in_ea=DL16_TO_FP32 and out_ea=STANDARD.
+    If a graph output tensor has DL16_TO_FP32 or FP32_TO_DL16 EA (e.g. from h2f softmax,
+    RMSNorm upcast, or fp32→fp16 conversion), it must be de-staggered back to STANDARD EA
+    on device before returning to CPU / host.
+    This inserts an identity op with in_ea=<staggered> and out_ea=STANDARD.
     """
     from .wsr.coarse_tile import _patch_graph_outputs
     from .propagate_layouts import ElementArrangement
+    from .constants import STAGGERED_EAS
 
     operations = graph.operations
     output_names = set(graph.get_output_names())
@@ -814,7 +816,7 @@ def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
         if not isinstance(layout, FixedTiledLayout):
             continue
         stl = layout.device_layout
-        if getattr(stl, "element_arrangement", None) != ElementArrangement.DL16_TO_FP32:
+        if getattr(stl, "element_arrangement", None) not in STAGGERED_EAS:
             continue
 
         # Target layout is identical to stl but with STANDARD ElementArrangement
@@ -831,7 +833,8 @@ def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
         _patch_graph_outputs(op.get_name(), destagger_buf)
 
         logger.info(
-            "insert_destagger_graph_outputs: inserted de-stagger %s -> %s",
+            "insert_destagger_graph_outputs: inserted de-stagger %s -> %s (ea=%s)",
             op.get_name(),
             destagger_buf.get_name(),
+            stl.element_arrangement,
         )

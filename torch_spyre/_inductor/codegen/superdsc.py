@@ -1606,7 +1606,9 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
-            element_arrangement=getattr(arg, "element_arrangement", ElementArrangement.STANDARD),
+            element_arrangement=getattr(
+                arg, "element_arrangement", ElementArrangement.STANDARD
+            ),
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)

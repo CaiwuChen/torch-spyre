@@ -562,18 +562,11 @@ def staggered_ea_identity_stick_blocked_vars(
     variables for any single-input Pointwise whose input carries a staggered EA
     and whose output EA differs (i.e. it is a de-stagger identity op).
     """
-    if (
-        not isinstance(ctx.op.data, Pointwise)
-        or len(ctx.input_tds) != 1
-    ):
+    if not isinstance(ctx.op.data, Pointwise) or len(ctx.input_tds) != 1:
         return ConstraintResult()
 
-    in_ea = getattr(
-        ctx.input_tds[0].layout.device_layout, "element_arrangement", None
-    )
-    out_ea = getattr(
-        ctx.output_td.layout.device_layout, "element_arrangement", None
-    )
+    in_ea = getattr(ctx.input_tds[0].layout.device_layout, "element_arrangement", None)
+    out_ea = getattr(ctx.output_td.layout.device_layout, "element_arrangement", None)
     # Only applies when the input is staggered and output is STANDARD (de-stagger).
     if in_ea not in STAGGERED_EAS or out_ea == in_ea:
         return ConstraintResult()
