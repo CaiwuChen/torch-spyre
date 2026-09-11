@@ -21,7 +21,7 @@ import sympy
 
 import torch
 
-from .constants import ELIDED_COPY_BACK_ATTR
+from .constants import ELIDED_COPY_BACK_ATTR, STAGGERED_EAS
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
@@ -39,7 +39,7 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
 
@@ -803,8 +803,6 @@ def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
     This inserts an identity op with in_ea=<staggered> and out_ea=STANDARD.
     """
     from .wsr.coarse_tile import _patch_graph_outputs
-    from .propagate_layouts import ElementArrangement
-    from .constants import STAGGERED_EAS
 
     operations = graph.operations
     output_names = set(graph.get_output_names())

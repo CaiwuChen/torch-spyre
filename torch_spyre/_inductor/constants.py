@@ -217,9 +217,6 @@ TOPK_MAX_K_PER_CORE = _MAX_K_PER_CORE
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
-# Layout labels for EA-conversion identity ops (de-stagger / re-stagger):
-# input tensor gets "INPUT", output tensor gets "OUTPUT".
-EA_CONV_LAYOUT_LABELS = ["INPUT", "OUTPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
