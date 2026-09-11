@@ -792,3 +792,46 @@ def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
                     f"restickify inserted on mutation target buffer {target_name!r} "
                     f"as input to its own mutation op {op.get_name()!r}"
                 )
+
+
+def insert_destagger_graph_outputs(graph: GraphLowering) -> None:
+    """Insert identity de-stagger ops before graph outputs that have staggered EA.
+
+    If a graph output tensor has DL16_TO_FP32 EA (e.g. from h2f softmax or RMSNorm upcast),
+    it must be de-staggered back to STANDARD EA on device before returning to CPU / host.
+    This inserts an identity op with in_ea=DL16_TO_FP32 and out_ea=STANDARD.
+    """
+    from .wsr.coarse_tile import _patch_graph_outputs
+    from .propagate_layouts import ElementArrangement
+
+    operations = graph.operations
+    output_names = set(graph.get_output_names())
+
+    for op in list(operations):
+        if not isinstance(op, ComputedBuffer) or op.get_name() not in output_names:
+            continue
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, FixedTiledLayout):
+            continue
+        stl = layout.device_layout
+        if getattr(stl, "element_arrangement", None) != ElementArrangement.DL16_TO_FP32:
+            continue
+
+        # Target layout is identical to stl but with STANDARD ElementArrangement
+        std_stl = stl.with_element_arrangement(ElementArrangement.STANDARD)
+        destagger_layout = _fixed_tiled(layout, std_stl)
+
+        # Create identity de-stagger node using _create_restickify_node machinery
+        _, destagger_buf = _create_restickify_node(
+            {"arg_name": op.get_name(), "target_layout": destagger_layout},
+            op,
+        )
+
+        # Patch graph outputs to point to destagger_buf
+        _patch_graph_outputs(op.get_name(), destagger_buf)
+
+        logger.info(
+            "insert_destagger_graph_outputs: inserted de-stagger %s -> %s",
+            op.get_name(),
+            destagger_buf.get_name(),
+        )
