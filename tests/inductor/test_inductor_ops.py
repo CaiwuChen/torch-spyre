@@ -2307,18 +2307,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # lowering has to promote them to a common one (torch semantics: the wider
         # float wins, an integer promotes to the other side's float type).
         #
-        # fp16 x fp32 -> fp32: dl16tofp32 is a STICK-REORDERING conversion.
-        # expect_fail for two different reasons depending on the operand:
-        #   - no stick-dim broadcaster: propagate_layouts.py rejects the mixed-EA
-        #     pointwise op (clean compile error).
-        #   - with a stick-dim broadcaster: the compare is computed correctly but
-        #     the staggered result reads back PERMUTED -- a pre-existing defect in
-        #     the copy-out path (see issue #4393), not in this lowering.
-        #     These two xfail on a NUMERIC mismatch; they should XPASS once
-        #     copy-out honours element_arrangement.
+        # How each promotion is executed differs, and the distinction matters more
+        # than the pass/fail column suggests:
         #
-        # int32 x fp32 -> fp32: int32tofp32 is 4B->4B, EA unchanged, on device.
-        # int32 x fp16 -> fp16: int32->fp16 absent from DtypeOpTable, cast on HOST.
+        #   fp16  x fp32 -> fp32 : dl16tofp32 is a STICK-REORDERING conversion
+        #                          (2B -> 4B changes the element arrangement).
+        #                          expect_fail, but for TWO different reasons
+        #                          depending on the other operand:
+        #                            - neither operand broadcasts at the stick
+        #                              dim: propagate_layouts.py rejects the
+        #                              mixed-EA pointwise op. A clean compile
+        #                              error.
+        #                            - the other operand DOES broadcast at the
+        #                              stick dim: that combination is legal and
+        #                              propagate_layouts allows it, correctly.
+        #                              The compare is computed CORRECTLY too.
+        #                              But the result carries the staggered EA,
+        #                              and the D2H copy-out ignores
+        #                              element_arrangement and reads the buffer
+        #                              as STANDARD, so the mask comes back
+        #                              PERMUTED with no error raised (issue
+        #                              #4393). These two cases are therefore
+        #                              skipped: the defect is pre-existing and
+        #                              not in this lowering.
+        #
+        #   int32 x fp32 -> fp32 : int32tofp32 is 4B -> 4B, so the EA is unchanged
+        #                          and this runs entirely on device. The only
+        #                          genuinely on-device mixed case here.
+        #
+        #   int32 x fp16 -> fp16 : NOT a device conversion at all. int32 -> fp16 is
+        #                          absent from DtypeOpTable, so to_dtype takes its
+        #                          eager_fallback branch and the cast is done on the
+        #                          HOST ("conversion from torch.int32 to
+        #                          torch.float16 is falling back to cpu"). The EA
+        #                          question never comes up; the compare itself then
+        #                          runs on device in fp16. It passes, but the green
+        #                          means "correct via a host round-trip", NOT
+        #                          "supported on device".
+        #
+        # Promoting to fp16 also inherits fp16's 11-bit significand, so integers
+        # above 2048 lose their distinction. That is not a divergence: eager does
+        # the identical promotion, so CPU and device agree on the same rounded
+        # answer. Operands here stay small; the analogous fp32 boundary is covered
+        # by the bigint family below.
         # -----------------------------------------------------------------------
         ("test_cmp_mixed_dtype", "test_cmp_mixed_dtype_cpu"): {
             "ops_dict": {
@@ -2334,6 +2365,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp32_fp16_1d256",
                 "fp16_fp32_2d4x64",
                 "fp32_fp16_2d4x64",
+            ],
+            "skip": [
                 "fp16_fp32_bcast_stick",
                 "fp16_fp32_bcast_0dim",
             ],
@@ -2371,7 +2404,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.float16
                     ),
                 ),
-                # broadcaster at stick dim: compute correct, readback PERMUTED (#4393)
+                # fp16 vs a broadcaster at the stick dim: skipped, result incorrect
                 "fp16_fp32_bcast_stick": (
                     torch.ceil(cached_randn((4, 64), abs=True, scale=10.0)).to(
                         dtype=torch.float16
@@ -2386,7 +2419,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ),
                     torch.tensor(2.0, dtype=torch.float32),
                 ),
-                # int32 -> fp16: cast on HOST (eager_fallback), compare on device
+                # int32 -> fp16 is unsupported on device: cast runs on the HOST
+                # (eager_fallback), the compare then runs on device in fp16
                 "int32_fp16_1d256": (
                     torch.randint(0, 100, (256,), dtype=torch.int32),
                     torch.ceil(cached_randn((256,), abs=True, scale=50.0)).to(
@@ -2458,11 +2492,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
-        # Large integers: int -> fp32 is LOSSY above 2**24.
-        # fp32 has a 24-bit significand; two distinct ints that round to the same
-        # float compare EQUAL, inverting the answer for every op.
-        # expect_fail to record the boundary; control cases below 2**24 pass.
-        # See _cmp_operand_dtype in lowering.py for the design note.
+        # Large integers: int -> fp32 is LOSSY. fp32 carries a 24-bit significand,
+        # so above 2**24 the gaps between representable values exceed 1 and two
+        # distinct integers can round to the same float. Once they do, they
+        # compare EQUAL on device, which inverts the answer for every op.
+        #
+        # At 2e9 the fp32 ulp is 128, so operands 1 apart always collapse. The
+        # operands below interleave a>b and a<b so that all six ops are wrong
+        # (with a single ordering, two of the six would agree by coincidence:
+        # collapsing a>b to a==b leaves `lt` and `ge` unchanged).
+        #
+        # The hardware has no integer compare, so a single fp32 element cannot be
+        # exact. These cases are expect_fail to record the boundary rather than to
+        # demand a fix; anything relying on exact large-int compares must stay off
+        # device for now.
+        #
+        # Exactness over the full integer range is reachable as a future extension
+        # -- split the integer into 24-bit-or-less limbs across the mantissas of
+        # several fp32 elements and compare limb by limb -- but a single element is
+        # already exact for every integer an LLM actually compares (token ids,
+        # positions, sequence lengths, mask indices), so the single-element form is
+        # a deliberate choice. If that changes, these three cases are the ones that
+        # will XPASS.
         # -----------------------------------------------------------------------
         ("test_cmp_bigint", "test_cmp_bigint_cpu"): {
             "ops_dict": {
