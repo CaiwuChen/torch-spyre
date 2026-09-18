@@ -1292,6 +1292,61 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+@torch.library.custom_op(
+    "spyre::compute_expert_ids", mutates_args=(), device_types="spyre"
+)
+def compute_expert_ids(
+    offs: torch.Tensor,
+    total_tokens: int,
+) -> torch.Tensor:
+    """Compute per-token expert_ids [T] from cumsum boundary offsets offs [E]."""
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    token_ids_cpu = torch.arange(total_tokens, dtype=torch.int32)
+    expert_ids_cpu = (
+        (token_ids_cpu.unsqueeze(1) >= offs_cpu.unsqueeze(0))
+        .to(torch.int32)
+        .sum(dim=-1)
+    )
+    return expert_ids_cpu.to(device=offs.device)
+
+
+@compute_expert_ids.register_fake
+def _(
+    offs: torch.Tensor,
+    total_tokens: int,
+) -> torch.Tensor:
+    return torch.empty(total_tokens, dtype=torch.int32, device=offs.device)
+
+
+@torch.library.custom_op(
+    "spyre::grouped_mm_dynamic", mutates_args=(), device_types="spyre"
+)
+def grouped_mm_dynamic(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    offs: torch.Tensor,
+) -> torch.Tensor:
+    """Execute grouped_mm with runtime dynamic offsets via CPU-assisted batch dispatch."""
+    a_cpu = mat_a.to("cpu")
+    b_cpu = mat_b.to("cpu")
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    out_cpu = torch._grouped_mm(a_cpu, b_cpu, offs=offs_cpu)
+    return out_cpu.to(device=mat_a.device)
+
+
+@grouped_mm_dynamic.register_fake
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    offs: torch.Tensor,
+) -> torch.Tensor:
+    out_dim = mat_b.shape[-1]
+    out_shape = (
+        (mat_a.shape[0], out_dim) if mat_a.dim() == 2 else (*mat_a.shape[:-1], out_dim)
+    )
+    return torch.empty(out_shape, dtype=mat_a.dtype, device=mat_a.device)
+
+
 # LX-safe means: this op's eager body generates no intermediate buffer that
 # could get pinned to LX (today, that requires a nested torch.compile; plain
 # CPU work or a body that never touches a spyre tensor has nothing to plan).
@@ -1303,6 +1358,8 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
+mark_lx_safe(torch.ops.spyre.compute_expert_ids.default)
+mark_lx_safe(torch.ops.spyre.grouped_mm_dynamic.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)
