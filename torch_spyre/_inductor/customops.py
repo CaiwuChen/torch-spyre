@@ -1292,39 +1292,52 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+# int32 values per 128-byte Spyre stick
+_INT32_PER_STICK = 32
+
+
 @torch.library.custom_op(
     "spyre::compute_block_expert_ids", mutates_args=(), device_types="spyre"
 )
 def compute_block_expert_ids(
     offs: torch.Tensor,
-    num_blocks: int,
-    block_size: int,
+    num_tokens: int,
 ) -> torch.Tensor:
-    """Compute per-block expert_ids [num_blocks] from cumsum boundary offsets offs [E].
+    """Compute a stick-aligned per-token expert-id table [num_tokens, _INT32_PER_STICK].
 
-    For each block b, its representative row is b*block_size.  The expert id is
-    the count of offs values <= block_starts[b], i.e. (block_starts[b] >= offs[e]).sum().
-    offs[e] is the exclusive end of expert e, so token i belongs to expert e iff
-    starts[e] <= i < ends[e], which equals (i >= offs).sum().
-    Runs entirely on CPU; returns a device tensor of shape [num_blocks].
+    ``offs[e]`` is the exclusive end row of expert ``e`` in mat_a (cumsum of
+    per-expert token counts).  Token ``t`` belongs to expert ``e`` iff
+    ``offs[e-1] <= t < offs[e]``, equivalently ``(t >= offs).sum() == e``.
+
+    The result has shape ``[num_tokens, _INT32_PER_STICK]``: token ``t``'s
+    expert id is stored at column 0 of row ``t``; the remaining
+    ``_INT32_PER_STICK-1`` columns are zero-padded.  Each row is exactly one
+    128-byte int32 stick, so Spyre's EA engine always reads in-bounds when
+    for_each_tile slices dim=0 with tile_size=1.
+
+    Runs entirely on CPU; returns a device tensor.
     """
     offs_cpu = offs.to("cpu", dtype=torch.int32)
-    block_starts = torch.arange(
-        0, num_blocks * block_size, block_size, dtype=torch.int32
-    )
+    token_ids = torch.arange(0, num_tokens, dtype=torch.int32)  # [T]
+    # expert_id[t] = number of offs values that t has already reached or passed,
+    # i.e. count of e where token t >= offs[e] (offs[e] is exclusive end of e).
     expert_ids_cpu = (
-        (block_starts.unsqueeze(1) >= offs_cpu.unsqueeze(0)).to(torch.int32).sum(dim=-1)
-    )
-    return expert_ids_cpu.to(device=offs.device)
+        (token_ids.unsqueeze(1) >= offs_cpu.unsqueeze(0)).to(torch.int32).sum(dim=-1)
+    )  # [T]
+    # Lay out as [T, _INT32_PER_STICK], expert id in column 0, then return 2-D.
+    table = torch.zeros(num_tokens, _INT32_PER_STICK, dtype=torch.int32)
+    table[:, 0] = expert_ids_cpu
+    return table.to(device=offs.device)  # [T, _INT32_PER_STICK]
 
 
 @compute_block_expert_ids.register_fake
 def _(
     offs: torch.Tensor,
-    num_blocks: int,
-    block_size: int,
+    num_tokens: int,
 ) -> torch.Tensor:
-    return torch.empty(num_blocks, dtype=torch.int32, device=offs.device)
+    return torch.empty(
+        num_tokens, _INT32_PER_STICK, dtype=torch.int32, device=offs.device
+    )
 
 
 # LX-safe means: this op's eager body generates no intermediate buffer that

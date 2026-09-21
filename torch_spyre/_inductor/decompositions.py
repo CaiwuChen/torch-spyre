@@ -51,7 +51,7 @@ from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
-from .wsr import for_each_tile, Gather
+from .wsr import for_each_tile
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
@@ -79,7 +79,6 @@ _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 
 _SWA_CALIBRATED_NUM_CORES = 32
 _SWA_CALIBRATED_MIN_LX_BUDGET = 1_625_344
-_GROUPED_MM_BLOCK_SIZE = 64
 # Values are (maximum physical window, maximum explicit K/V block width). Both
 # calibrated geometries run fastest without an additional coarse head loop;
 # ordinary work division then schedules the individual operations. The sweeps
@@ -106,6 +105,8 @@ _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT = 1024
 # This is deliberately a performance hint rather than an allocation guarantee;
 # the allocator remains the authority on whether the value is actually kept.
 _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
+
+_INT32_PER_STICK = 32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2848,7 +2849,7 @@ def spyre_grouped_mm(
     bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Decomposition of aten._grouped_mm via block-padded for_each_tile + Gather.
+    """Decomposition of aten._grouped_mm via per-token for_each_tile + index_select.
 
     When ``offs`` is provided (2D mat_a × 3D mat_b with variable-M groups):
 
@@ -2856,22 +2857,23 @@ def spyre_grouped_mm(
       exclusive end row of expert ``e`` in ``mat_a``.
 
       Algorithm:
-        1. Pad ``mat_a [T, K]`` to ``[num_blocks * block_size, K]`` with zero
-           rows (``block_size = _GROUPED_MM_BLOCK_SIZE``, stick-aligned).
-           Reshape to ``[num_blocks, block_size, K]``.
-        2. Compute ``block_expert_ids [num_blocks]`` at runtime from ``offs``
-           using ``spyre::compute_block_expert_ids``.  Each block's id is the
-           expert that owns its first row.  This is a runtime tensor — its
-           *shape* is static (``num_blocks``), its *values* are not read at
-           trace time, so no graph break occurs.
-        3. Use ``for_each_tile`` with ``Gather(axis=0, index=block_expert_ids)``
-           on ``mat2 [E, K, N]`` to select the right weight matrix per block.
-           The loop trip count is ``num_blocks`` (from ``index.shape[0]``),
-           which is a static Python int derived from ``T`` and ``block_size``.
-        4. Each body step: ``block [block_size, K] @ weight [K, N]``
-           → tile ``[block_size, N]`` written at ``out_dim=0``.
-        5. Slice ``[:T]`` from the ``[num_blocks * block_size, N]`` result to
-           drop padding rows.
+        1. Reshape ``mat_a [T, K]`` to ``[T, 1, K]`` so each for_each_tile
+           step delivers one token as ``[1, 1, K]``.
+        2. Build a per-token expert-id table ``[T, _INT32_PER_STICK]`` at
+           runtime from ``offs`` using ``spyre::compute_block_expert_ids``.
+           Token ``t``'s expert id is at column 0 of row ``t``; remaining
+           columns are zero-padded to fill one 128-byte int32 stick, keeping
+           Spyre's EA engine in-bounds.  Shape is static (``T``), values are
+           runtime-only — no graph break.
+        3. Use ``for_each_tile`` over ``(mat_a_3d, index_table, mat2)`` with
+           ``dims=(0, 0, None)`` and ``tile_size=1``.  Each step:
+             a. ``blk   [1, 1, K]``  — current token (SLICE dim=0)
+             b. ``stick [1, _INT32_PER_STICK]`` — expert-id row (SLICE dim=0)
+             c. ``pool  [E, K, N]``  — full weight tensor (INVARIANT)
+           Flatten ``stick`` → take ``[0:1]`` as the index, select
+           ``weight = pool.index_select(0, expert_id)`` → ``[1, K, N]``,
+           then ``bmm(blk, weight).reshape(1, N)``.
+        4. for_each_tile writes tiles at ``out_dim=0`` → result ``[T, N]``.
 
     When ``offs`` is None (3D × 3D batched case) the original chunk + mm path
     is used unchanged.
@@ -2881,46 +2883,39 @@ def spyre_grouped_mm(
     if offs is not None:
         total_tokens: int = self.shape[0]
         K: int = self.shape[1]
-        block_size: int = _GROUPED_MM_BLOCK_SIZE
-
-        # Pad mat_a to a multiple of block_size rows, then reshape to blocks.
-        pad_rows = (-total_tokens) % block_size
-        num_blocks: int = (total_tokens + block_size - 1) // block_size
-        if pad_rows > 0:
-            mat_a_padded = torch.nn.functional.pad(self, (0, 0, 0, pad_rows))
-        else:
-            mat_a_padded = self
-        # [num_blocks, block_size, K]
-        mat_a_blocks = mat_a_padded.reshape(num_blocks, block_size, K)
-
-        # Compute per-block expert ids at runtime (shape [num_blocks], int32).
-        # compute_block_expert_ids runs on CPU: for each block b, the expert is
-        # determined by the first row index b*block_size against offs. Returns a
-        # device tensor of shape [num_blocks] — no secondary index op on device,
-        # so no small non-stick-aligned tensor is produced in the compiled graph.
-        block_expert_ids = torch.ops.spyre.compute_block_expert_ids(
-            offs, num_blocks, block_size
-        )  # [num_blocks], int32
-
-        # mat2 is [E, K, N] (already transposed by spyre_linear).
-        mat2_c = mat2.contiguous()  # ensure contiguous for index_select
-
         N: int = mat2.shape[-1]
 
+        # Reshape mat_a to [T, 1, K]: each for_each_tile step gets one token.
+        mat_a_3d = self.reshape(total_tokens, 1, K)
+
+        # Per-token expert-id table: [T, _INT32_PER_STICK], int32.
+        # Token t's expert id is at column 0 of row t; rest zero-padded.
+        index_table = torch.ops.spyre.compute_block_expert_ids(
+            offs, total_tokens
+        )  # [T, _INT32_PER_STICK]
+
+        # mat2 is [E, K, N].
+        mat2_c = mat2.contiguous()  # ensure contiguous for index_select
+
         def grouped_mm_body(carry, tiles):
-            blk, weight = tiles  # blk: [1, block_size, K], weight: [1, K, N]
-            out_tile = torch.bmm(blk, weight).reshape(block_size, N)  # [block_size, N]
+            # blk:   [1, 1, K]              — one token (SLICE dim=0)
+            # stick: [1, _INT32_PER_STICK]  — one expert-id row (SLICE dim=0)
+            # pool:  [E, K, N]              — full weight tensor (INVARIANT)
+            blk, stick, pool = tiles
+            # stick is [1, _INT32_PER_STICK]; take element 0 as a [1] index.
+            expert_id = stick.reshape(_INT32_PER_STICK)[0:1]  # [1], int32
+            weight = pool.index_select(0, expert_id)  # [1, K, N]
+            out_tile = torch.bmm(blk, weight).reshape(1, N)  # [1, N]
             return None, out_tile
 
-        _, out_full = for_each_tile(
+        _, out = for_each_tile(
             grouped_mm_body,
-            (mat_a_blocks, mat2_c),
-            dims=(0, Gather(axis=0, index=block_expert_ids)),
+            (mat_a_3d, index_table, mat2_c),
+            dims=(0, 0, None),
             tile_size=1,
             out_dim=0,
         )
-        # out_full: [num_blocks * block_size, N] — drop padding rows
-        out = out_full[:total_tokens]
+        # out: [T, N] — no padding rows to drop
     else:
         chunks = list(self.chunk(num_experts, dim=0))
         results = [chunks[i] @ mat2[i] for i in range(num_experts)]

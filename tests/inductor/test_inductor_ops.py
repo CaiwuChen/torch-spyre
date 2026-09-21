@@ -9172,6 +9172,57 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
+    def _make_grouped_mm_offs(
+        self, num_experts: int, total: int, seed: int
+    ) -> torch.Tensor:
+        """Build cumsum offsets for grouped_mm tests (fork_rng-isolated)."""
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            counts = torch.zeros(num_experts, dtype=torch.int32)
+            counts.scatter_add_(
+                0,
+                torch.randint(0, num_experts, (total,)),
+                torch.ones(total, dtype=torch.int32),
+            )
+        t = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        assert int(t[-1]) == total
+        return t
+
+    def test_grouped_mm_bf16_case1(self):
+        """[192,2816] x [128,2816,1408] bf16 — gemma-4-26B-A4B-it torch._grouped_mm.1."""
+        # seed=500123 mirrors oot_test_config_models cumsum_offsets(seed=123+500000)
+        offs = self._make_grouped_mm_offs(128, 192, seed=500123)
+        mat_a = torch.nn.init.xavier_uniform_(
+            torch.empty(192, 2816, dtype=torch.bfloat16)
+        )
+        mat_b = torch.nn.init.xavier_uniform_(
+            torch.empty(128, 2816, 1408, dtype=torch.bfloat16)
+        )
+
+        def fn(a, b, o):
+            return torch._grouped_mm(a, b, offs=o)
+
+        self.compare_with_cpu(
+            fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
+        )
+
+    def test_grouped_mm_bf16_case2(self):
+        """[192,704] x [128,704,2816] bf16 — gemma-4-26B-A4B-it torch._grouped_mm.2."""
+        offs = self._make_grouped_mm_offs(128, 192, seed=500123)
+        mat_a = torch.nn.init.xavier_uniform_(
+            torch.empty(192, 704, dtype=torch.bfloat16)
+        )
+        mat_b = torch.nn.init.xavier_uniform_(
+            torch.empty(128, 704, 2816, dtype=torch.bfloat16)
+        )
+
+        def fn(a, b, o):
+            return torch._grouped_mm(a, b, offs=o)
+
+        self.compare_with_cpu(
+            fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
+        )
+
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]
