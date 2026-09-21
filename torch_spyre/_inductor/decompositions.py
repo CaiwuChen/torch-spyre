@@ -51,7 +51,7 @@ from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
-from .wsr import for_each_tile
+from .wsr import for_each_tile, Gather
 from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
@@ -2811,6 +2811,90 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
+def _adapt_dtype(v, to_dtype: torch.dtype, only_if: Optional[torch.dtype] = None):
+    """Adapt tensor or scalar to ``to_dtype``, optionally only when ``only_if`` matches."""
+    if isinstance(v, torch.Tensor):
+        return torch.ops.spyre.adapt_dtype(v, to_dtype, only_if=only_if)
+    return torch.ops.spyre.adapt_dtype_scalar(v, to_dtype, only_if=only_if)
+
+
+def _broadcast_if_tensors(a, b):
+    """Broadcast two tensor operands to a common shape if their shapes differ."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        if a.shape != b.shape:
+            return torch.broadcast_tensors(a, b)
+    return a, b
+
+
+@register_spyre_decompositions(
+    [
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Tensor_mode,
+        torch.ops.aten.div.Scalar,
+        torch.ops.aten.div.Scalar_mode,
+    ]
+)
+def spyre_div(x: torch.Tensor, y, *, rounding_mode=None) -> torch.Tensor:
+    """Decompose torch.div for Spyre.
+
+    Integer inputs (int32, int64) are upcast to fp32 before division so that
+    Spyre's fp32 divide op can be used.  The quotient is cast back to the
+    original integer dtype when ``rounding_mode`` is set.
+    """
+    int_dtypes = (torch.int32, torch.int64)
+    xf = _adapt_dtype(
+        x, to_dtype=torch.float32, only_if=x.dtype if x.dtype in int_dtypes else None
+    )
+    yf = _adapt_dtype(
+        y,
+        to_dtype=torch.float32,
+        only_if=y.dtype
+        if isinstance(y, torch.Tensor) and y.dtype in int_dtypes
+        else (torch.int64 if isinstance(y, int) else None),
+    )
+    xf, yf = _broadcast_if_tensors(xf, yf)
+    if rounding_mode == "floor":
+        qf = torch.ops.prims.div(xf, yf)
+        qf = torch.ops.aten.floor.default(qf)
+        r = xf - qf * yf
+        qf = torch.where(r >= yf, qf + 1, qf)
+        qf = torch.where(r < 0, qf - 1, qf)
+        if x.dtype in int_dtypes:
+            return _adapt_dtype(qf, to_dtype=x.dtype)
+        return qf
+    elif rounding_mode == "trunc":
+        qf = torch.ops.prims.div(xf, yf)
+        qf = torch.ops.aten.trunc.default(qf)
+        r = xf - qf * yf
+        qf = torch.where(r >= yf, qf + 1, qf)
+        qf = torch.where(r <= -yf, qf - 1, qf)
+        if x.dtype in int_dtypes:
+            return _adapt_dtype(qf, to_dtype=x.dtype)
+        return qf
+    else:
+        return torch.ops.prims.div(xf, yf)
+
+
+@register_spyre_decompositions(
+    [torch.ops.aten.true_divide.Tensor, torch.ops.aten.true_divide.Scalar]
+)
+def spyre_true_divide(x: torch.Tensor, y) -> torch.Tensor:
+    """Decompose aten.true_divide for Spyre (always true division)."""
+    int_dtypes = (torch.int32, torch.int64)
+    xf = _adapt_dtype(
+        x, to_dtype=torch.float32, only_if=x.dtype if x.dtype in int_dtypes else None
+    )
+    yf = _adapt_dtype(
+        y,
+        to_dtype=torch.float32,
+        only_if=y.dtype
+        if isinstance(y, torch.Tensor) and y.dtype in int_dtypes
+        else (torch.int64 if isinstance(y, int) else None),
+    )
+    xf, yf = _broadcast_if_tensors(xf, yf)
+    return torch.ops.prims.div(xf, yf)
+
+
 @torch.library.register_fake("aten::_grouped_mm")
 def _fake_grouped_mm(
     mat_a: torch.Tensor,
@@ -2828,6 +2912,9 @@ def _fake_grouped_mm(
     return torch.empty(out_shape, dtype=dtype, device=mat_a.device)
 
 
+_GROUPED_MM_BLOCK_SIZE = 1
+
+
 @register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
 def spyre_grouped_mm(
     self: torch.Tensor,
@@ -2836,31 +2923,84 @@ def spyre_grouped_mm(
     bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Decomposition of aten._grouped_mm via indirect gather → bmm.
+    """Decomposition of aten._grouped_mm via block-padded for_each_tile + Gather.
 
-    When ``offs`` is provided (2D mat_a [T,K] × 3D mat_b [E,K,N] with
-    variable-M groups):
+    When ``offs`` is provided (2D mat_a × 3D mat_b with variable-M groups):
 
-      1. Derive a per-token expert-id vector ``expert_ids [T]`` from ``offs``
-         entirely on device using a comparison against the cumsum boundaries.
-         No values are read at compile time; ``offs`` participates as an
-         ordinary graph tensor, so the compiled graph is valid for any token
-         distribution without recompilation.
-      2. Gather the matching expert weight slab for every token via
-         ``mat2[expert_ids]`` — an indirect (gather-style) read that Spyre's
-         indirect-access engine executes on device.  The result shape
-         ``[T, K, N]`` is fully static.
-      3. A single ``bmm`` over ``self[:, None, :] × mat2[expert_ids]``
-         computes every token's output in one kernel.
+      ``offs`` is a cumulative-sum end-offset vector: ``offs[e]`` is the
+      exclusive end row of expert ``e`` in ``mat_a``.
+
+      Algorithm:
+        1. Pad ``mat_a [T, K]`` to ``[num_blocks * block_size, K]`` with zero
+           rows (``block_size = _GROUPED_MM_BLOCK_SIZE``, stick-aligned).
+           Reshape to ``[num_blocks, block_size, K]``.
+        2. Compute ``block_expert_ids [num_blocks]`` at runtime from ``offs``
+           using ``spyre::compute_block_expert_ids``.  Each block's id is the
+           expert that owns its first row.  This is a runtime tensor — its
+           *shape* is static (``num_blocks``), its *values* are not read at
+           trace time, so no graph break occurs.
+        3. Use ``for_each_tile`` with ``Gather(axis=0, index=block_expert_ids)``
+           on ``mat2 [E, K, N]`` to select the right weight matrix per block.
+           The loop trip count is ``num_blocks`` (from ``index.shape[0]``),
+           which is a static Python int derived from ``T`` and ``block_size``.
+        4. Each body step: ``block [block_size, K] @ weight [K, N]``
+           → tile ``[block_size, N]`` written at ``out_dim=0``.
+        5. Slice ``[:T]`` from the ``[num_blocks * block_size, N]`` result to
+           drop padding rows.
 
     When ``offs`` is None (3D × 3D batched case) the original chunk + mm path
     is used unchanged.
     """
-    num_experts = mat2.shape[0]
 
+    num_experts = mat2.shape[0]
     if offs is not None:
-        # Dynamic-offs case: execute via custom op with CPU-assisted batch dispatch.
-        out = torch.ops.spyre.grouped_mm_dynamic(self, mat2, offs)
+        total_tokens: int = self.shape[0]
+        K: int = self.shape[1]
+        block_size: int = _GROUPED_MM_BLOCK_SIZE
+
+        # Pad mat_a to a multiple of block_size rows, then reshape to blocks.
+        pad_rows = (-total_tokens) % block_size
+        num_blocks: int = (total_tokens + block_size - 1) // block_size
+        if pad_rows > 0:
+            mat_a_padded = torch.nn.functional.pad(self, (0, 0, 0, pad_rows))
+        else:
+            mat_a_padded = self
+        # [num_blocks, block_size, K]
+        mat_a_blocks = mat_a_padded.reshape(num_blocks, block_size, K)
+
+        # Compute per-block expert ids at runtime (shape [num_blocks], int32).
+        # compute_block_expert_ids runs on CPU: for each block b, the expert is
+        # determined by the first row index b*block_size against offs. Returns a
+        # device tensor of shape [num_blocks] — no secondary index op on device,
+        # so no small non-stick-aligned tensor is produced in the compiled graph.
+        block_expert_ids = torch.ops.spyre.compute_block_expert_ids(
+            offs, num_blocks, block_size
+        )  # [num_blocks], int32
+
+        # mat2 is [E, K, N] (already transposed by spyre_linear).
+        mat2_c = mat2.contiguous()  # ensure contiguous for index_select
+
+        N: int = mat2.shape[-1]
+
+        def grouped_mm_body(carry, tiles):
+            # tile_size=1 preserves the leading dim: blk [1, block_size, K],
+            # weight [1, K, N].  Squeeze the batch dim so the returned tile is
+            # [block_size, N]; for_each_tile's out_dim=0 then stacks num_blocks
+            # tiles into [num_blocks, block_size, N] and flattens to
+            # [num_blocks * block_size, N].
+            blk, weight = tiles  # blk: [1, block_size, K], weight: [1, K, N]
+            out_tile = torch.bmm(blk, weight).reshape(block_size, N)  # [block_size, N]
+            return None, out_tile
+
+        _, out_full = for_each_tile(
+            grouped_mm_body,
+            (mat_a_blocks, mat2_c),
+            dims=(0, Gather(axis=0, index=block_expert_ids)),
+            tile_size=1,
+            out_dim=0,
+        )
+        # out_full: [num_blocks * block_size, N] — drop padding rows
+        out = out_full[:total_tokens]
     else:
         chunks = list(self.chunk(num_experts, dim=0))
         results = [chunks[i] @ mat2[i] for i in range(num_experts)]
