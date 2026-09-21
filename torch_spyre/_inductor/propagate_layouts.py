@@ -219,6 +219,22 @@ def _compute_dim_order(stick_dim, size, coords):
     return dim_order
 
 
+def _project_pointwise_dim_order(
+    dim_order: list[int], output_rank: int, input_rank: int
+) -> list[int]:
+    """Project a pointwise output order onto a trailing-aligned input."""
+    rank_diff = output_rank - input_rank
+    if rank_diff >= 0:
+        return [d - rank_diff for d in dim_order if d >= rank_diff]
+
+    # A loop tile can be a rank-preserving view of a higher-rank backing
+    # buffer. Its extra leading axes are fixed by the loop, while the body
+    # operates on the trailing axes. Keep those backing axes in the layout
+    # permutation and shift the body's order onto the trailing dimensions.
+    leading = list(range(-rank_diff))
+    return leading + [d - rank_diff for d in dim_order]
+
+
 def _pick_stick_dim(stick_expr, out_coords) -> int:
     """Map a stick expression to an output dimension index, or -1 if it doesn't survive."""
     maybe = matching_dim(out_coords, stick_expr)
@@ -351,6 +367,36 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
             )
 
 
+def _convert_reads_whole_input(
+    in_layout: FixedLayout,
+    output: FixedLayout,
+    dep: MemoryDep,
+    output_dep: MemoryDep,
+) -> bool:
+    """Whether a dtype conversion traverses its input exactly as it writes its output.
+
+    Only then may the conversion inherit the input buffer's
+    ``device_size``/``stride_map`` (rescaled for the new stick depth). When the
+    read is a *slice* of a wider buffer -- Gemma's ``q_norm``/``k_norm`` upcast
+    part of the fused QKV projection into a fresh, narrower per-head buffer --
+    the inherited row span belongs to the input buffer while the elements land
+    in a buffer with a different row stride. ``compute_coordinates`` then folds
+    that mismatch into the outer coordinate as ``Mod(a*var, b)`` with
+    ``a/b = row_out/row_in`` in lowest terms, which either falls outside the
+    normalization grammar (``a != 1``, a codegen-time hard error) or, worse, is
+    representable but addresses the wrong sticks (``a == 1``, silently wrong
+    results). Mirrors the identical-access test the general convert path uses,
+    minus the element-width condition -- rescaling the stick depth is exactly
+    what this path is for.
+    """
+    return (
+        list(in_layout.size) == list(output.size)
+        and dep.index == output_dep.index
+        and host_coordinates(in_layout, dep, None)
+        == host_coordinates(output, output_dep, None)
+    )
+
+
 def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLayout:
     """Output layout of ``qfp8ch``: fp16 (64/stick) -> fp8 (128/stick) quantization.
 
@@ -400,7 +446,7 @@ def _qfp8wt_stl(
         in_layout: Inductor ``FixedLayout`` for the op's input tensor.
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
-    stick_dim_size = in_layout.size[-1]
+    stick_dim_size = concretize_expr(in_layout.size[-1])
     unaligned = stick_dim_size % in_eps
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
@@ -536,11 +582,15 @@ def _single_arg_op_layout(
             # Two strategies, chosen by whether a staggered EA is involved:
             #
             # 1. Staggered conversions (RMSNorm up/down-cast and their
-            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16). The
-            #    staggered element ordering only exists on the physical device
-            #    layout, so we must propagate the input's device_size/stride_map
-            #    and rescale just the stick depth via rescale_stl_for_dtype.
-            #    Reconstructing from the logical host size would lose it.
+            #    restoration: STANDARD<->DL16_TO_FP32 / FP32_TO_DL16) that
+            #    traverse the whole input. The staggered element ordering only
+            #    exists on the physical device layout, so propagate the input's
+            #    device_size/stride_map and rescale just the stick depth via
+            #    rescale_stl_for_dtype; reconstructing from the logical host size
+            #    would lose the stick choice a downstream reduction needs.
+            #    Inheriting is only sound for an identical access -- see
+            #    _convert_reads_whole_input; a sliced read falls through to (2),
+            #    which still stamps the staggered EA.
             #
             # 2. Plain conversions (e.g. fp8->fp16 after qfp8ch). Here the input
             #    device layout can be degenerate — qfp8ch rescales a size-1
@@ -549,7 +599,10 @@ def _single_arg_op_layout(
             #    changing the layout rank and downstream graph partitioning.
             #    Rebuild a clean dense layout from the output host size instead,
             #    as the general (non-EA) convert path does.
-            if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+            staggered = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+            if staggered and _convert_reads_whole_input(
+                in_layout, output, dep, output_dep
+            ):
                 layouts = [rescale_stl_for_dtype(stl, output.dtype, fmt)]
 
                 # A conversion that creates a staggered EA must also expose
@@ -678,9 +731,7 @@ def _clone_layout(
     data = op.data
 
     assert isinstance(data, Pointwise)
-    origin_node = next(iter(data.origins))
-    aten_op = origin_node.target
-    assert aten_op == aten.clone.default
+    assert any(origin.target == aten.clone.default for origin in data.origins)
 
     in_dep = args[0].dep
     in_stl = next(iter(args[0].layouts))
@@ -1512,9 +1563,9 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
+            projected_dim_order = _project_pointwise_dim_order(
+                dim_order, len(output.size), len(arg.layout.size)
+            )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
@@ -1711,7 +1762,9 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    op.restick_cost_fn = AllSameNode.from_args(
+        args, results, output_dep, op, forbidden_stick_sym=reduction_var
+    )
     return results
 
 
@@ -1907,7 +1960,7 @@ def compute_layouts(
     if aten_op == spyreop.compact.default:
         return _compact_layout(op, output, output_dep, args)
 
-    if aten_op == aten.clone.default:
+    if any(origin.target == aten.clone.default for origin in data.origins):
         # clone materializes a new buffer in a fixed row-major layout regardless of
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
@@ -1975,8 +2028,9 @@ def generic_layout(op: Operation) -> SpyreTensorLayout:
 
 def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # tl;dr: usually pick the blind identity stick-dim order; only override
-    # it for a FixedLayout whose most-contiguous dim isn't already last,
-    # since that's the one shape where the blind order is provably wrong.
+    # it for a FixedLayout whose most-contiguous REAL dim isn't already
+    # last, since that's the one shape where the blind order is provably
+    # wrong.
     #
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
@@ -1984,29 +2038,48 @@ def _generic_layout_for(output: FixedLayout) -> SpyreTensorLayout:
     # SpyreTensorLayout's bare (size, dtype) constructor synthesizes its own
     # row-major host strides from size alone (identity dim order, last dim =
     # stick dim) -- blind to output.stride. That's correct for the
-    # overwhelming majority of ops, including a BROADCAST layout (zero
-    # stride) like test_building_blocks' causal-SDPA buf29 -- so it's left
-    # in place except in the one case below.
+    # overwhelming majority of ops, including a purely-broadcast layout
+    # (every dim zero stride) like test_building_blocks' causal-SDPA buf29
+    # -- so it's left in place except in the one case below.
     #
     # A FixedLayout can carry a non-monotonic stride whose last dim is NOT
-    # its most-contiguous one (e.g. it's shared with a later mutation write
-    # into the same buffer, as in test_map_mode_split_m's transposed pad
-    # target, size=[6, 64] stride=[1, 6]). There the blind order picks the
-    # wrong stick dim, producing an unrepresentable stick expression
-    # downstream ("Unexpected stick expression d0 + 2*(Mod(3*d1, 32))" out of
-    # _find_alt_target_stl's device_coordinates call). The two conditions
-    # below isolate exactly that case (no zero strides, so broadcast layouts
-    # like buf29 are excluded; min stride not already last, so a natural
-    # row-major layout is untouched) and sort dims by decreasing stride
-    # (ties by original position) so the most-contiguous dim lands last,
-    # matching every other SpyreTensorLayout call site in this module (e.g.
-    # _all_constant_layouts, _make_output_stl).
+    # its most-contiguous REAL (non-broadcast) dim (e.g. it's shared with a
+    # later mutation write into the same buffer, as in
+    # test_map_mode_split_m's transposed pad target, size=[6, 64]
+    # stride=[1, 6], or issue #4460's constant_pad_nd target buf60, size=
+    # [2, 6, 64] stride=[0, 1, 6] -- a legitimate broadcast dim (stride 0,
+    # size 2) alongside two real dims that are themselves non-monotonic).
+    # There the blind order picks the wrong stick dim, producing an
+    # unrepresentable stick expression downstream ("Unexpected stick
+    # expression d0 + 2*(Mod(3*d1, 32))" out of _find_alt_target_stl's
+    # device_coordinates call).
+    #
+    # A broadcast dim (stride 0, size > 1) has no real address contribution
+    # and must never be picked as the stick dim, nor influence which real
+    # dim is most-contiguous -- ranking it by its raw stride value would
+    # place it first (0 sorts as smallest), corrupting the choice. Exclude
+    # broadcast dims from the ranking (mirroring lower_pad_sequence's own
+    # broadcast-dim exclusion in pass_utils.py) and place them ahead of the
+    # ranked real dims in dim_order; a size-1 dim's stride is irrelevant
+    # regardless.
+    #
+    # The two conditions below isolate exactly the "non-monotonic among
+    # real dims" case (at least one nonzero stride to rank; most-contiguous
+    # real dim not already last) and sort the real dims by decreasing
+    # stride (ties by original position) so the most-contiguous one lands
+    # last, matching every other SpyreTensorLayout call site in this module
+    # (e.g. _all_constant_layouts, _make_output_stl).
+    real_dims = [
+        d for d in range(len(c_size)) if not (c_stride[d] == 0 and c_size[d] > 1)
+    ]
     if (
         len(c_size) > 1
-        and all(s != 0 for s in c_stride)
-        and min(c_stride) != c_stride[-1]
+        and real_dims
+        and min(c_stride[d] for d in real_dims) != c_stride[-1]
     ):
-        dim_order = sorted(range(len(c_size)), key=lambda d: (-c_stride[d], d))
+        broadcast_dims = [d for d in range(len(c_size)) if d not in real_dims]
+        ordered_real = sorted(real_dims, key=lambda d: (-c_stride[d], d))
+        dim_order = broadcast_dims + ordered_real
         return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     return SpyreTensorLayout(c_size, output.dtype)
 
@@ -2612,7 +2685,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)
@@ -2886,16 +2959,20 @@ def _real_layout_matches_op_size(
     body's own mutation op writes only a `[2, 6]` tile of a `[4, 2, 6]`
     invariant buffer at an offset like `12*u0`).
 
-    A *static* ReinterpretView slice (concrete, symbol-free offset) of a
-    buffer that already has its own committed FixedTiledLayout is not that
-    case: the op writes a fixed sub-region of a real, already-laid-out
-    buffer once (e.g. constant_pad_nd's fill/copy ops writing the pad strip
-    vs. the copied interior of the same padded output buffer), so
-    real_layout() -- the target buffer's own layout -- is exactly right to
-    reuse, size mismatch notwithstanding: this op's write is smaller than
-    the buffer only because it is one piece of it, not because real_layout()
-    picked the wrong tiling scheme.
+    A *static*, rank-preserving ReinterpretView slice (concrete, symbol-free
+    offset) of a buffer that already has its own committed FixedTiledLayout
+    is not that case: the op writes a fixed sub-region of a real,
+    already-laid-out buffer once (e.g. constant_pad_nd's fill/copy ops writing
+    the pad strip vs. the copied interior of the same padded output buffer),
+    so real_layout() -- the target buffer's own layout -- is exactly right to
+    reuse, size mismatch notwithstanding.  A rank-changing view is different:
+    its logical coordinates cannot be indexed with the backing layout's
+    strides, even when the offset is static, so it must use the clean logical
+    layout built below.
     """
+    logical_size = list(node.data.get_size())
+    if len(logical_size) != len(real.size):
+        return False
     if list(node.get_layout().size) == list(real.size):
         return True
     target = node.get_layout().target
@@ -3024,17 +3101,6 @@ def propagate_mutation_layouts(
                     output.stride,
                     layouts[0],
                     offset=output.offset,
-                )
-        elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout) and _real_layout_matches_op_size(
-                n.node, real
-            ):
-                n.node.layout = real
-            else:
-                logger.warning(
-                    "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
                 )
         else:
             logger.warning(
