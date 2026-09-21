@@ -146,6 +146,11 @@ def _sdpa_num_head_tiles(num_heads: int) -> int:
     return 1
 
 
+def _sdpa_num_batch_tiles(batch_size: int) -> int:
+    """Return the batch split count shared by lowering and the cost model."""
+    return max(1, batch_size // 2)
+
+
 def _num_tiles_for_max_extent(
     sequence_length: int, max_extent: int, *, tile_alignment: int = 1
 ) -> int:
@@ -525,8 +530,13 @@ def _select_sdpa_tiling(
     elif not is_decode and work_div is None:
         reason = "no exact head/sequence work division"
     else:
+        num_batch_tiles = _sdpa_num_batch_tiles(batch_size)
+        batch_rows_per_tile = (batch_size + num_batch_tiles - 1) // num_batch_tiles
         candidates = _sdpa_kv_candidates(
-            batch_size=batch_size,
+            # The outer coarse tile limits every kernel to one batch tile.
+            # Charging all physical batch rows here can reject an otherwise
+            # LX-feasible K/V block and introduce an unnecessary Lk loop.
+            batch_size=batch_rows_per_tile,
             num_heads=num_heads,
             num_kvheads=num_kvheads,
             max_seqlen_q=max_seqlen_q,
@@ -1338,6 +1348,17 @@ def spyre__sdpa_overrideable(
         tile_alignment=_SDPA_SEQUENCE_TILE_ALIGNMENT,
     )
     kv_tile_size = max_seqlen_kv // num_kv_tiles
+    packed_key_strides = (
+        max_seqlen_kv * num_kvheads * head_dim,
+        head_dim,
+        num_kvheads * head_dim,
+        1,
+    )
+    rebase_unaligned_packed_key = (
+        batch_size > 1
+        and key.stride() == packed_key_strides
+        and kv_tile_size % get_elem_in_stick(key.dtype) != 0
+    )
 
     score_dim_names = (
         [
@@ -1368,7 +1389,7 @@ def spyre__sdpa_overrideable(
                 f"length, got {attn_bias.size(-1)} and {max_seqlen_kv}"
             )
 
-    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+    with spyre_hint(tiles={"batch_size": _sdpa_num_batch_tiles(batch_size)}):
         head_tiles = {} if use_gqa else {"num_heads": tiling.num_head_tiles}
         with spyre_hint(tiles=head_tiles):
             with (
@@ -1390,6 +1411,14 @@ def spyre__sdpa_overrideable(
                         k_blk = k_blk.unsqueeze(2)
                         v_blk = v_blk.unsqueeze(2)
 
+                    # A packed [B*S, H, D] input viewed as [B, H, S, D]
+                    # shares one physical row dimension between B and S.  When
+                    # the S tile is not stick-aligned, rebase it before the
+                    # transpose restickify so one batch's padded tail cannot
+                    # read the next batch's first row.  Aligned tiles retain
+                    # the direct one-copy keys_T path.
+                    if rebase_unaligned_packed_key:
+                        k_blk = k_blk.contiguous()
                     keys_T = k_blk.transpose(-1, -2).contiguous()
 
                     with spyre_hint(named_dims=score_dim_names):

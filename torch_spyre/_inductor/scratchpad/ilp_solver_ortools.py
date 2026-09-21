@@ -150,8 +150,12 @@ _BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 # constant to scale log of core split. error ~0.5%
 _CORE_LOG_SCALE = 32.0
-# constant to scale inverse of core split. error ~1%
+# fallback scale for the inverse of a core split, used when the LCM of the
+# split's candidate values (see _SympyExprToCpSat._inv_scale) exceeds it.
+# error <= ~2.5%
 _CORE_INV_SCALE = 1024
+# constant limit on product terms to avoid int32 overflow in CP-SAT
+_MAX_PRODUCT_BOUND = 2**30
 
 
 @dataclass
@@ -610,10 +614,7 @@ class _SympyExprToCpSat(Printer):
             lambda e: e.func == sympy.Mul,
             lambda e: self._min_piecewise_expand(e),
         )
-        cost_expr = cost_expr.replace(
-            lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
-            lambda e: self._truncate_floats_min(e),
-        )
+        cost_expr = self._integerize_minmax(cost_expr)
         return cost_expr
 
     @classmethod
@@ -640,6 +641,16 @@ class _SympyExprToCpSat(Printer):
     @staticmethod
     def _is_split_sym(expr):
         return expr.is_Symbol and expr.name.startswith("split_")
+
+    def _inv_scale(self, name: str) -> int:
+        """Fixed-point scale of ``inv_<name>``: the LCM of ``name``'s values
+        across the candidate divisions, so every ``scale // v`` is exact and the
+        variable spans only the bits it needs. ``_CORE_INV_SCALE`` when there
+        are no values or their LCM exceeds it."""
+        _, raw = self._buffer_map.get(name, (None, ()))
+        if not raw or min(raw) < 1:
+            return _CORE_INV_SCALE
+        return min(math.lcm(*map(int, raw)), _CORE_INV_SCALE)
 
     def _inv_log_sym(self, expr):
         # replaces log(sym) with log2_sym and 1/sym with inv_sym
@@ -673,10 +684,9 @@ class _SympyExprToCpSat(Printer):
                     (0.0287191888771944 * arg + 1.45940018593522, True),
                 )
             if expr.exp == -1:
-                return (
-                    sympy.Symbol(f"inv_{arg.name}", integer=True, nonnegative=True)
-                    / _CORE_INV_SCALE
-                )
+                return sympy.Symbol(
+                    f"inv_{arg.name}", integer=True, nonnegative=True
+                ) / self._inv_scale(arg.name)
         elif expr.func == sympy.Mul:
             symbols = [
                 arg
@@ -689,8 +699,13 @@ class _SympyExprToCpSat(Printer):
                 sorted([symbol.name[4:] for symbol in symbols])
             )
             if product in self._sym_map:
+                # The coefficient already divides by each factor's own scale;
+                # swap those for the product's scale to keep the magnitude.
                 result = sympy.Symbol(f"inv_{product}", integer=True, nonnegative=True)
-                result *= _CORE_INV_SCALE ** (len(symbols) - 1)
+                result *= sympy.Rational(
+                    math.prod(self._inv_scale(s.name[4:]) for s in symbols),
+                    self._inv_scale(product),
+                )
                 result *= math.prod([arg for arg in expr.args if arg not in symbols])
                 return result
         return expr
@@ -777,6 +792,21 @@ class _SympyExprToCpSat(Printer):
             )
         return expr
 
+    @classmethod
+    def _integerize_minmax(cls, expr):
+        # Only Min/Max constraints require integer operands. A conditional
+        # objective supports float values directly; rounding its coefficients
+        # can erase a large cost multiplied by scaled reciprocal variables.
+        # Keep upstream's lazy Min/Max classes when rebuilding their subtrees.
+        if isinstance(expr, (sympy.Min, sympy.Max)):
+            return expr.replace(
+                lambda e: isinstance(e, (sympy.Min, sympy.Max, sympy.Piecewise)),
+                cls._truncate_floats_min,
+            )
+        if not expr.has(sympy.Min, sympy.Max):
+            return expr
+        return expr.func(*(cls._integerize_minmax(arg) for arg in expr.args))
+
     @staticmethod
     def _truncate_floats_min(expr):
         # re-writes Min(x*0.5, y*0.5) as Min(x, y)/2
@@ -854,7 +884,6 @@ class _SympyExprToCpSat(Printer):
         if name in self._sym_map:
             return self._print_multiply_two(math.prod(nonints), self._sym_map[name])
 
-        bounds = [self._affine_bounds(arg) for arg in ints]
         # The product is multilinear (degree 1 in each factor), so its
         # extrema over the box of bounds occur at the box's vertices. Rather
         # than enumerating all 2**len(ints) vertices, fold the bounds
@@ -862,12 +891,23 @@ class _SympyExprToCpSat(Printer):
         # the partial product over its factors (a continuous function over a
         # connected box), so it can be treated as one more independent
         # interval factor and combined via standard interval multiplication.
-        (lb, ub), *rest = bounds
+        (lb, ub), *rest = [self._affine_bounds(arg) for arg in ints]
         for a, b in rest:
             candidates = (lb * a, lb * b, ub * a, ub * b)
             lb, ub = min(candidates), max(candidates)
+
+        # A product past _MAX_PRODUCT_BOUND needs more dynamic range than the
+        # model can carry. Rescaling its factors would trade the overflow for
+        # rounding that can zero a small factor such as a split count, so
+        # refuse it and let _minimize_cost_expr apply its fallback policy.
+        if max(abs(lb), abs(ub)) > _MAX_PRODUCT_BOUND:
+            raise ValueError(
+                f"product {' * '.join(arg.name for arg in ints)} spans "
+                f"[{lb}, {ub}], past the {_MAX_PRODUCT_BOUND} CP-SAT bound"
+            )
+
         product = self._model.new_int_var(int(lb), int(ub), name)
-        self._model.AddMultiplicationEquality(product, ints)
+        self._model.add_multiplication_equality(product, ints)
         self._sym_map[name] = product
         return self._print_multiply_two(math.prod(nonints), product)
 
@@ -885,11 +925,10 @@ class _SympyExprToCpSat(Printer):
             cp_var = self._model.new_int_var_from_domain(domain, expr.name)
             self._model.add_element(b.division, values, cp_var)
         else:
-            values = [int(round(_CORE_INV_SCALE // v)) for v in raw]
+            scale = self._inv_scale(name)
+            values = [scale // v for v in raw]
             cp_var = self._model.new_int_var(min(values), max(values), expr.name)
-            self._model.AddDivisionEquality(
-                cp_var, int(_CORE_INV_SCALE), self._sym_map[name]
-            )
+            self._model.AddDivisionEquality(cp_var, scale, self._sym_map[name])
         self._sym_map[expr.name] = cp_var
         return cp_var
 
@@ -1033,11 +1072,45 @@ class _SympyExprToCpSat(Printer):
         assert lb <= ub
         return lb, ub
 
+    def _lin_max_operand(self, arg):
+        """``arg`` as a ``lin_max`` operand: a constant or a single (affine)
+        variable as is, a sum over several variables behind its own IntVar
+        tied to it by a linear equality.
+
+        Presolve reasons about a ``lin_max`` operand through its exact
+        reachable domain. For a weighted sum of Booleans -- the HBM read and
+        write totals behind the cost model's ``alpha * min(R, W)`` turnaround
+        term sum ``bytes * (1 - is_lx)`` over a bundle's arguments -- that is
+        the set of its subset sums, exponential in the number of distinct
+        coefficients. On a Granite 4.0 decode block it was 4 s of
+        ``PresolveToFixPoint`` (99% of the solve, on 1209 constraints) that
+        neither probing, symmetry nor presolve-iteration limits shorten, and
+        with presolve off it made the LNS
+        workers, whose neighbourhood solves presolve, run out of memory. Behind
+        an IntVar with interval bounds the same operand costs nothing and the
+        optimum is unchanged. Float-coefficient operands pass through as
+        before (``AddMaxEquality`` rejects them and ``_minimize_cost_expr``
+        falls back)."""
+        if isinstance(arg, (int, float)):
+            return arg
+        try:
+            if len(cp_model.FlatIntExpr(arg).vars) <= 1:
+                return arg
+        except TypeError:
+            return arg
+        var = self._model.new_int_var(
+            *self._affine_bounds(arg), f"minmax_arg_{self._count}"
+        )
+        self._count += 1
+        self._model.add(var == arg)
+        return var
+
     def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return max(args)  # a lazy Max of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
@@ -1049,6 +1122,7 @@ class _SympyExprToCpSat(Printer):
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return min(args)  # a lazy Min of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
@@ -1071,7 +1145,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
-        time_limit_seconds: float = 120.0,
+        time_limit_seconds: Optional[float] = None,
         bottom_justify: bool = True,
     ) -> None:
         if cp_model is None:
@@ -1084,7 +1158,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
-        self._time_limit_seconds = time_limit_seconds
+        self._time_limit_seconds = (
+            config.cpsat_time_limit_seconds
+            if time_limit_seconds is None
+            else time_limit_seconds
+        )
         self._bottom_justify = bottom_justify
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
@@ -1230,10 +1308,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(cp_cost)
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
+                raise SolveError(
+                    f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                    f"after {solver.WallTime():.2f}s"
+                )
             return status
-        except (RuntimeError, TypeError, ValueError):
-            logger.warning("[CP-SAT layout solver] cannot linearize the sympy expr")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[CP-SAT layout solver] cannot linearize the sympy expr: %s", exc
+            )
             if not config._cpsat_warn_on_cost_expr:
                 raise
             return None
@@ -1257,10 +1340,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        # Relayout copies whose source is in the solve are free to become
-        # resident; CP-SAT's presolve scales super-linearly in their number
-        # (see config.lx_solver_relayout_presolve_max_copies), so past the
-        # threshold search runs on the raw model instead.
+        # Priced relayout models couple division tables, optional copies and
+        # variable-sized placements. Their first presolve pass can consume the
+        # budget before search starts, even below the copy-count threshold.
+        # Search the same model directly; do not change its objective or budget.
+        # Keep the existing threshold for models without a cost objective.
         free_copies = sum(
             isinstance(
                 tensors.get(copy_w.buffer.relayout_parent),
@@ -1269,13 +1353,15 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             for copy_w in copies.values()
         )
         max_copies = config.lx_solver_relayout_presolve_max_copies
-        if max_copies > 0 and free_copies > max_copies:
+        if (cost_expr is not None and free_copies) or (
+            max_copies > 0 and free_copies > max_copies
+        ):
             solver.parameters.cp_model_presolve = False
             logger.info(
-                "[CP-SAT layout solver] %d relayout copies exceed the presolve "
-                "threshold of %d; solving without presolve",
+                "[CP-SAT layout solver] %d free relayout copies, priced=%s; "
+                "solving without presolve",
                 free_copies,
-                max_copies,
+                cost_expr is not None,
             )
         solver.parameters.num_search_workers = (
             1 if torch.are_deterministic_algorithms_enabled() else get_cpu_count()
@@ -1315,7 +1401,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(hbm_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 # Lock in the residency optimum (the traffic value, not just the
                 # count) so the parallelism step can never trade a spill for
                 # parallelism. Rounding avoids loss of precision as the objective is
@@ -1339,7 +1428,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.maximize(sum(core_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 occupancy = round(solver.ObjectiveValue())
 
                 # Shape balance: holding the parallelism optimum (the objective is
@@ -1352,7 +1444,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(core_cost_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
 
         final_tensors = self._extract(solver, tensors)
 

@@ -46,6 +46,8 @@ from .kernel_cache import (
     compute_specs_hash,
     get_cached_kernel_dir,
     get_kernel_registry,
+    load_symbol_kinds,
+    save_symbol_kinds,
     _move_to_failed_dir,
 )
 
@@ -109,6 +111,36 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
+def _compile_to_dir(
+    kernel_name: str,
+    compile_dir: str,
+    specs,
+    pool_size: int,
+):
+    """Run generate_bundle for ``specs`` into ``compile_dir``.
+
+    Shared by the cache-miss path and the no-cache path so that any change to
+    the compilation sequence is applied in both places automatically.
+
+    Returns:
+        The list of ``SymbolKind`` values produced by ``generate_bundle``,
+        describing the kind (address symbol vs. dimension argument) of each
+        symbol in the compiled bundle.
+
+    Raises:
+        NotImplementedError: if any dimension symbol is present, because the
+            runtime kDimension payload is not yet implemented and submitting
+            such a bundle to dxp_standalone would produce a mismatched
+            inputSym_ slot count.
+    """
+    symbol_kinds = generate_bundle(kernel_name, compile_dir, specs, pool_size=pool_size)
+    if any(sk.is_dimension for sk in symbol_kinds):
+        raise NotImplementedError(
+            "SDSC bundle dimension symbols require runtime kDimension support"
+        )
+    return symbol_kinds
+
+
 def _run_dxp(kernel_name: str, compile_dir: str, env: dict[str, str]) -> str:
     """Compile one materialized bundle and return its directory.
 
@@ -145,12 +177,14 @@ class _SpyreCompileFuture(CodeCacheFuture):
         kernel_name: str,
         compile_dir: str,
         kernel_provenance,
+        symbol_kinds,
         cache_key: str | None = None,
     ) -> None:
         self._task = task
         self._kernel_name = kernel_name
         self._compile_dir = compile_dir
         self._kernel_provenance = kernel_provenance
+        self._symbol_kinds = symbol_kinds
         self._cache_key = cache_key
         self._runner: SpyreSDSCKernelRunner | None = None
         self._failure_dir_moved = False
@@ -179,6 +213,7 @@ class _SpyreCompileFuture(CodeCacheFuture):
             self._kernel_name,
             code_dir,
             kernel_provenance=self._kernel_provenance,
+            symbol_kinds=self._symbol_kinds,
         )
         return self._runner
 
@@ -240,6 +275,7 @@ class SpyreAsyncCompile(AsyncCompile):
         kernel_name: str,
         compile_dir: str,
         kernel_provenance,
+        symbol_kinds,
         cache_key: str | None = None,
     ) -> _SpyreCompileFuture:
         future = _SpyreCompileFuture(
@@ -247,6 +283,7 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_name,
             compile_dir,
             kernel_provenance,
+            symbol_kinds,
             cache_key=cache_key,
         )
         self._pending_spyre_futures.append(future)
@@ -315,7 +352,10 @@ class SpyreAsyncCompile(AsyncCompile):
                     logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
                     get_kernel_registry().record_hit(cache_key)
                     return SpyreSDSCKernelRunner(
-                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance=kernel_provenance,
+                        symbol_kinds=load_symbol_kinds(cached_dir),
                     )
 
                 logger.debug("Cache MISS: Compiling kernel")
@@ -325,9 +365,10 @@ class SpyreAsyncCompile(AsyncCompile):
                 # so the rename in commit_compile_dir is atomic on POSIX.
                 compile_dir: str = allocate_compile_dir(cache_key)
                 try:
-                    generate_bundle(
-                        kernel_name, compile_dir, specs, pool_size=pool_size
+                    symbol_kinds = _compile_to_dir(
+                        kernel_name, compile_dir, specs, pool_size
                     )
+                    save_symbol_kinds(compile_dir, symbol_kinds)
                     task = self._submit_dxp(kernel_name, compile_dir)
                     if task is not None:
                         return self._compile_future(
@@ -335,12 +376,16 @@ class SpyreAsyncCompile(AsyncCompile):
                             kernel_name,
                             compile_dir,
                             kernel_provenance,
+                            symbol_kinds,
                             cache_key=cache_key,
                         )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
                     return SpyreSDSCKernelRunner(
-                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance=kernel_provenance,
+                        symbol_kinds=symbol_kinds,
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -351,7 +396,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+        symbol_kinds = _compile_to_dir(kernel_name, output_dir, specs, pool_size)
         task = self._submit_dxp(kernel_name, output_dir)
         if task is not None:
             return self._compile_future(
@@ -359,11 +404,13 @@ class SpyreAsyncCompile(AsyncCompile):
                 kernel_name,
                 output_dir,
                 kernel_provenance,
+                symbol_kinds,
             )
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
             kernel_provenance=kernel_provenance,
+            symbol_kinds=symbol_kinds,
         )
 
     def ktir(

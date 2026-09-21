@@ -342,16 +342,36 @@ def insert_restickify_on_node_inputs(
         # is inserted inside the same loop group, so it must inherit loop_info
         # to remain contiguous in build_loop_scheduler_nodes.
         #
-        # It must inherit a COPY, not the consumer's own object: the restickify
-        # node is a per-iteration stage of old_name, so it TAKES OVER the
-        # consumer's per-read tile advance for that dependency (its own read of
-        # old_name strides through the source), its output is per-iteration
-        # scratch that never advances, and the consumer's read of the stage
-        # must stop advancing. Sharing one CoarseTileInfo (the old behavior)
-        # makes that transfer impossible - both ops kept the advance, so a
-        # coarse-tiled consumer of a cross-loop-group full buffer read the
-        # 1-tile stage with a striding index and ran off its end (issue #4008).
-        if hasattr(op, "loop_info"):
+        # It must inherit a COPY, not the consumer's own object: when old_name
+        # is itself a tiled intra-loop-group product (a per-tile scratch from
+        # this or an enclosing loop group, identifiable by old_name's own
+        # buffer carrying loop_info), the restickify node is a per-iteration
+        # stage of old_name and TAKES OVER the consumer's per-read tile
+        # advance for that dependency (its own read of old_name strides
+        # through the source), its output is per-iteration scratch that never
+        # advances, and the consumer's read of the stage must stop advancing.
+        # Sharing one CoarseTileInfo (the old behavior) makes that transfer
+        # impossible - both ops kept the advance, so a coarse-tiled consumer
+        # of a cross-loop-group full buffer read the 1-tile stage with a
+        # striding index and ran off its end (issue #4008).
+        #
+        # When old_name instead has no loop_info of its own (a graph input or
+        # any other fixed, already-full buffer materialized once outside any
+        # loop), restickify produces a full, non-tiled copy every time
+        # (lower_restickify always sizes it to old_name's full shape) and the
+        # per-trip advance genuinely belongs to the consumer, which strides
+        # through that full copy the same way it would have strided through
+        # old_name directly. Transferring the advance in that case strips it
+        # from the consumer with nothing on the restickify side to replace it
+        # (the restickify's own inner_fn has no loop_var dependence to
+        # advance), silently pinning the consumer's read to one address for
+        # every trip (see test_carry_mode_online_softmax's carried-online-
+        # softmax K case).
+        old_name_buf = V.graph.try_get_buffer(old_name)
+        old_name_is_tiled_stage = old_name_buf is not None and hasattr(
+            old_name_buf, "loop_info"
+        )
+        if hasattr(op, "loop_info") and old_name_is_tiled_stage:
             consumer_li = op.loop_info
             n_levels = len(getattr(consumer_li, "loop_count", []) or [])
             reads_per_dim = getattr(consumer_li, "tiled_dims_per_read", None)
@@ -393,7 +413,7 @@ def insert_restickify_on_node_inputs(
                         f"occurrence {restick_arg_info['occurrence']} cannot "
                         "transfer advancing read metadata independently"
                     )
-                restick_li = copy.copy(consumer_li)
+                restick_li = copy.deepcopy(consumer_li)
                 restick_li.tiled_dims_per_read = [dep_advance]
                 restick_li.squeezed_advance_per_read = (
                     [dep_squeezed] if any(dep_squeezed) else []
@@ -414,6 +434,19 @@ def insert_restickify_on_node_inputs(
                         ]
             else:
                 restick_buff.loop_info = consumer_li
+        elif hasattr(op, "loop_info"):
+            # old_name is not itself a tiled stage: restickify still needs a
+            # copy of loop_info to stay contiguous in
+            # build_loop_scheduler_nodes, but neither its read (a fixed full
+            # copy of old_name, made once) nor its output (consumed at a
+            # fixed address by every trip) advance -- the consumer keeps
+            # whatever per-trip advance it already had.
+            restick_li = copy.deepcopy(op.loop_info)
+            n_levels = len(getattr(restick_li, "loop_count", []) or [])
+            restick_li.tiled_dims_per_read = [[[] for _ in range(n_levels)]]
+            restick_li.squeezed_advance_per_read = []
+            restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
+            restick_buff.loop_info = restick_li
 
     # Wrap inner_fn with InputEdgeSwapHandler so each load is redirected to
     # the correct per-edge restickified buffer via index-matched routing.

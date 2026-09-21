@@ -39,7 +39,7 @@ namespace c10d {
 SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
                                  int rank, int size)
     : Backend(rank, size), group_context_(nullptr) {
-  SPYRE_RUNTIME_DEBUG() << __func__ << ": # [Spyre CCL]: Constructor for "
+  SPYRE_RUNTIME_DEBUG() << "# [Spyre CCL]: Constructor for "
                         << getBackendName();
 
   /*
