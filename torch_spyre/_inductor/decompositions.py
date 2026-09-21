@@ -79,7 +79,7 @@ _SDPA_MAX_BURST_EFFICIENT_KV_BLOCK_SIZE = 1024
 
 _SWA_CALIBRATED_NUM_CORES = 32
 _SWA_CALIBRATED_MIN_LX_BUDGET = 1_625_344
-
+_GROUPED_MM_BLOCK_SIZE = 64
 # Values are (maximum physical window, maximum explicit K/V block width). Both
 # calibrated geometries run fastest without an additional coarse head loop;
 # ordinary work division then schedules the individual operations. The sweeps
@@ -2811,110 +2811,6 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
-def _adapt_dtype(v, to_dtype: torch.dtype, only_if: Optional[torch.dtype] = None):
-    """Adapt tensor or scalar to ``to_dtype``, optionally only when ``only_if`` matches."""
-    if isinstance(v, torch.Tensor):
-        return torch.ops.spyre.adapt_dtype(v, to_dtype, only_if=only_if)
-    return torch.ops.spyre.adapt_dtype_scalar(v, to_dtype, only_if=only_if)
-
-
-def _broadcast_if_tensors(a, b):
-    """Broadcast two tensor operands to a common shape if their shapes differ."""
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.shape != b.shape:
-            return torch.broadcast_tensors(a, b)
-    return a, b
-
-
-@register_spyre_decompositions(
-    [
-        torch.ops.aten.div.Tensor,
-        torch.ops.aten.div.Tensor_mode,
-        torch.ops.aten.div.Scalar,
-        torch.ops.aten.div.Scalar_mode,
-    ]
-)
-def spyre_div(x: torch.Tensor, y, *, rounding_mode=None) -> torch.Tensor:
-    """Decompose torch.div for Spyre.
-
-    Integer inputs (int32, int64) are upcast to fp32 before division so that
-    Spyre's fp32 divide op can be used.  The quotient is cast back to the
-    original integer dtype when ``rounding_mode`` is set.
-    """
-    int_dtypes = (torch.int32, torch.int64)
-    xf = _adapt_dtype(
-        x, to_dtype=torch.float32, only_if=x.dtype if x.dtype in int_dtypes else None
-    )
-    yf = _adapt_dtype(
-        y,
-        to_dtype=torch.float32,
-        only_if=y.dtype
-        if isinstance(y, torch.Tensor) and y.dtype in int_dtypes
-        else (torch.int64 if isinstance(y, int) else None),
-    )
-    xf, yf = _broadcast_if_tensors(xf, yf)
-    if rounding_mode == "floor":
-        qf = torch.ops.prims.div(xf, yf)
-        qf = torch.ops.aten.floor.default(qf)
-        r = xf - qf * yf
-        qf = torch.where(r >= yf, qf + 1, qf)
-        qf = torch.where(r < 0, qf - 1, qf)
-        if x.dtype in int_dtypes:
-            return _adapt_dtype(qf, to_dtype=x.dtype)
-        return qf
-    elif rounding_mode == "trunc":
-        qf = torch.ops.prims.div(xf, yf)
-        qf = torch.ops.aten.trunc.default(qf)
-        r = xf - qf * yf
-        qf = torch.where(r >= yf, qf + 1, qf)
-        qf = torch.where(r <= -yf, qf - 1, qf)
-        if x.dtype in int_dtypes:
-            return _adapt_dtype(qf, to_dtype=x.dtype)
-        return qf
-    else:
-        return torch.ops.prims.div(xf, yf)
-
-
-@register_spyre_decompositions(
-    [torch.ops.aten.true_divide.Tensor, torch.ops.aten.true_divide.Scalar]
-)
-def spyre_true_divide(x: torch.Tensor, y) -> torch.Tensor:
-    """Decompose aten.true_divide for Spyre (always true division)."""
-    int_dtypes = (torch.int32, torch.int64)
-    xf = _adapt_dtype(
-        x, to_dtype=torch.float32, only_if=x.dtype if x.dtype in int_dtypes else None
-    )
-    yf = _adapt_dtype(
-        y,
-        to_dtype=torch.float32,
-        only_if=y.dtype
-        if isinstance(y, torch.Tensor) and y.dtype in int_dtypes
-        else (torch.int64 if isinstance(y, int) else None),
-    )
-    xf, yf = _broadcast_if_tensors(xf, yf)
-    return torch.ops.prims.div(xf, yf)
-
-
-@torch.library.register_fake("aten::_grouped_mm")
-def _fake_grouped_mm(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    offs: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """FakeTensor/Meta registration for aten._grouped_mm supporting float16/bfloat16."""
-    out_dim = mat_b.shape[-1]
-    out_shape = (
-        (mat_a.shape[0], out_dim) if mat_a.dim() == 2 else (*mat_a.shape[:-1], out_dim)
-    )
-    dtype = out_dtype or mat_a.dtype
-    return torch.empty(out_shape, dtype=dtype, device=mat_a.device)
-
-
-_GROUPED_MM_BLOCK_SIZE = 1
-
-
 @register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
 def spyre_grouped_mm(
     self: torch.Tensor,
@@ -2983,11 +2879,6 @@ def spyre_grouped_mm(
         N: int = mat2.shape[-1]
 
         def grouped_mm_body(carry, tiles):
-            # tile_size=1 preserves the leading dim: blk [1, block_size, K],
-            # weight [1, K, N].  Squeeze the batch dim so the returned tile is
-            # [block_size, N]; for_each_tile's out_dim=0 then stacks num_blocks
-            # tiles into [num_blocks, block_size, N] and flattens to
-            # [num_blocks * block_size, N].
             blk, weight = tiles  # blk: [1, block_size, K], weight: [1, K, N]
             out_tile = torch.bmm(blk, weight).reshape(block_size, N)  # [block_size, N]
             return None, out_tile
