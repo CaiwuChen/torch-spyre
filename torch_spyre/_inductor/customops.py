@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional, Sequence
 
 import torch
@@ -1297,46 +1298,80 @@ _INT32_PER_STICK = 32
 
 
 @torch.library.custom_op(
-    "spyre::compute_block_expert_ids", mutates_args=(), device_types="spyre"
+    "spyre::compute_grouped_mm_routing_tables",
+    mutates_args=(),
+    device_types="spyre",
 )
-def compute_block_expert_ids(
+def compute_grouped_mm_routing_tables(
     offs: torch.Tensor,
-    num_tokens: int,
-) -> torch.Tensor:
-    """Compute a stick-aligned per-token expert-id table [num_tokens, _INT32_PER_STICK].
+    total_tokens: int,
+    num_experts: int,
+    block_size: int,
+    max_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute lightweight index tables on CPU for on-device grouped_mm gathering.
 
-    ``offs[e]`` is the exclusive end row of expert ``e`` in mat_a (cumsum of
-    per-expert token counts).  Token ``t`` belongs to expert ``e`` iff
-    ``offs[e-1] <= t < offs[e]``, equivalently ``(t >= offs).sum() == e``.
-
-    The result has shape ``[num_tokens, _INT32_PER_STICK]``: token ``t``'s
-    expert id is stored at column 0 of row ``t``; the remaining
-    ``_INT32_PER_STICK-1`` columns are zero-padded.  Each row is exactly one
-    128-byte int32 stick, so Spyre's EA engine always reads in-bounds when
-    for_each_tile slices dim=0 with tile_size=1.
-
-    Runs entirely on CPU; returns a device tensor.
+    Returns:
+      src_indices: [max_blocks * block_size], int32 — maps each row in the flattened
+                   padded_a buffer to a row in mat_a (or to total_tokens for zero padding).
+      dst_indices: [total_tokens], int32 — maps each output token to its flat row in padded_out.
+      descriptor:  [max_blocks, _INT32_PER_STICK], int32 — stick-aligned descriptor with expert_id in col 0.
     """
-    offs_cpu = offs.to("cpu", dtype=torch.int32)
-    token_ids = torch.arange(0, num_tokens, dtype=torch.int32)  # [T]
-    # expert_id[t] = number of offs values that t has already reached or passed,
-    # i.e. count of e where token t >= offs[e] (offs[e] is exclusive end of e).
-    expert_ids_cpu = (
-        (token_ids.unsqueeze(1) >= offs_cpu.unsqueeze(0)).to(torch.int32).sum(dim=-1)
-    )  # [T]
-    # Lay out as [T, _INT32_PER_STICK], expert id in column 0, then return 2-D.
-    table = torch.zeros(num_tokens, _INT32_PER_STICK, dtype=torch.int32)
-    table[:, 0] = expert_ids_cpu
-    return table.to(device=offs.device)  # [T, _INT32_PER_STICK]
+    offs_cpu = offs.to("cpu", dtype=torch.int32).tolist()
+    dummy_zero_row_idx = total_tokens
+
+    src_indices = torch.full(
+        (max_blocks * block_size,), dummy_zero_row_idx, dtype=torch.int32
+    )
+    dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
+    descriptor = torch.zeros(max_blocks, _INT32_PER_STICK, dtype=torch.int32)
+
+    block_idx = 0
+    start = 0
+    for e in range(num_experts):
+        end = offs_cpu[e]
+        count = end - start
+        if count > 0:
+            num_b = math.ceil(count / block_size)
+            for b in range(num_b):
+                row_start = start + b * block_size
+                row_end = min(row_start + block_size, end)
+                rows = row_end - row_start
+
+                flat_dest_start = block_idx * block_size
+                flat_dest_end = flat_dest_start + rows
+
+                src_indices[flat_dest_start:flat_dest_end] = torch.arange(
+                    row_start, row_end, dtype=torch.int32
+                )
+                dst_indices[row_start:row_end] = torch.arange(
+                    flat_dest_start, flat_dest_end, dtype=torch.int32
+                )
+                descriptor[block_idx, 0] = e
+                block_idx += 1
+        start = end
+
+    return (
+        src_indices.to(device=offs.device),
+        dst_indices.to(device=offs.device),
+        descriptor.to(device=offs.device),
+    )
 
 
-@compute_block_expert_ids.register_fake
+@compute_grouped_mm_routing_tables.register_fake
 def _(
     offs: torch.Tensor,
-    num_tokens: int,
-) -> torch.Tensor:
-    return torch.empty(
-        num_tokens, _INT32_PER_STICK, dtype=torch.int32, device=offs.device
+    total_tokens: int,
+    num_experts: int,
+    block_size: int,
+    max_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(max_blocks * block_size, dtype=torch.int32, device=offs.device),
+        torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
+        torch.empty(
+            max_blocks, _INT32_PER_STICK, dtype=torch.int32, device=offs.device
+        ),
     )
 
 
@@ -1351,7 +1386,7 @@ def _(
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
-mark_lx_safe(torch.ops.spyre.compute_block_expert_ids.default)
+mark_lx_safe(torch.ops.spyre.compute_grouped_mm_routing_tables.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
 # registered via ops/fallbacks.py's register_fallback, which already appends
 # them to fallback_ops -- _is_cpu_only_fallback (lx_context_switching.py)
