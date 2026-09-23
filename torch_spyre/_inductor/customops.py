@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Optional, Sequence
 
 import torch
@@ -1293,10 +1292,6 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
-# int32 values per 128-byte Spyre stick
-_INT32_PER_STICK = 32
-
-
 @torch.library.custom_op(
     "spyre::compute_grouped_mm_routing_tables",
     mutates_args=(),
@@ -1306,55 +1301,40 @@ def compute_grouped_mm_routing_tables(
     offs: torch.Tensor,
     total_tokens: int,
     num_experts: int,
-    block_size: int,
-    max_blocks: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute lightweight index tables on CPU for on-device grouped_mm gathering.
+    t_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute lightweight index tables on CPU for on-device direct bmm grouped_mm.
 
     Returns:
-      src_indices: [max_blocks * block_size], int32 — maps each row in the flattened
-                   padded_a buffer to a row in mat_a (or to total_tokens for zero padding).
-      dst_indices: [total_tokens], int32 — maps each output token to its flat row in padded_out.
-      descriptor:  [max_blocks, _INT32_PER_STICK], int32 — stick-aligned descriptor with expert_id in col 0.
+      src_indices: [num_experts * t_max], int32 — maps each row in padded_a [E, t_max, K]
+                   to a row in mat_a (or to total_tokens for zero padding).
+      dst_indices: [total_tokens], int32 — maps each output token to its row in flat padded_out.
     """
     offs_cpu = offs.to("cpu", dtype=torch.int32).tolist()
-    dummy_zero_row_idx = total_tokens
+    dummy_zero_row = total_tokens
 
-    src_indices = torch.full(
-        (max_blocks * block_size,), dummy_zero_row_idx, dtype=torch.int32
-    )
+    src_indices = torch.full((num_experts * t_max,), dummy_zero_row, dtype=torch.int32)
     dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
-    descriptor = torch.zeros(max_blocks, _INT32_PER_STICK, dtype=torch.int32)
 
-    block_idx = 0
     start = 0
     for e in range(num_experts):
         end = offs_cpu[e]
         count = end - start
         if count > 0:
-            num_b = math.ceil(count / block_size)
-            for b in range(num_b):
-                row_start = start + b * block_size
-                row_end = min(row_start + block_size, end)
-                rows = row_end - row_start
-
-                flat_dest_start = block_idx * block_size
-                flat_dest_end = flat_dest_start + rows
-
-                src_indices[flat_dest_start:flat_dest_end] = torch.arange(
-                    row_start, row_end, dtype=torch.int32
-                )
-                dst_indices[row_start:row_end] = torch.arange(
-                    flat_dest_start, flat_dest_end, dtype=torch.int32
-                )
-                descriptor[block_idx, 0] = e
-                block_idx += 1
+            valid_len = min(count, t_max)
+            slot_start = e * t_max
+            slot_end = slot_start + valid_len
+            src_indices[slot_start:slot_end] = torch.arange(
+                start, start + valid_len, dtype=torch.int32
+            )
+            dst_indices[start : start + valid_len] = torch.arange(
+                slot_start, slot_end, dtype=torch.int32
+            )
         start = end
 
     return (
         src_indices.to(device=offs.device),
         dst_indices.to(device=offs.device),
-        descriptor.to(device=offs.device),
     )
 
 
@@ -1363,15 +1343,11 @@ def _(
     offs: torch.Tensor,
     total_tokens: int,
     num_experts: int,
-    block_size: int,
-    max_blocks: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    t_max: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     return (
-        torch.empty(max_blocks * block_size, dtype=torch.int32, device=offs.device),
+        torch.empty(num_experts * t_max, dtype=torch.int32, device=offs.device),
         torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
-        torch.empty(
-            max_blocks, _INT32_PER_STICK, dtype=torch.int32, device=offs.device
-        ),
     )
 
 

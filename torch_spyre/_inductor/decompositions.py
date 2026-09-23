@@ -106,7 +106,6 @@ _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT = 1024
 # the allocator remains the authority on whether the value is actually kept.
 _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
 
-_INT32_PER_STICK = 32
 _GROUPED_MM_BLOCK_SIZE = 64
 
 
@@ -2850,91 +2849,111 @@ def spyre_grouped_mm(
     bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Decomposition of aten._grouped_mm via on-device index_select + for_each_tile.
+    """Decomposition of aten._grouped_mm covering all 4 upstream shape variants:
 
-    When ``offs`` is provided (2D mat_a [T,K] × 3D mat_b [E,K,N]):
-
-      ``offs`` is a cumulative-sum end-offset vector: ``offs[e]`` is the
-      exclusive end row of expert ``e`` in ``mat_a``.
-
-      Algorithm:
-        1. Compute ``max_blocks = min(T, T // block_size + num_experts)``.
-        2. CPU op ``spyre::compute_grouped_mm_routing_tables`` generates 3 lightweight
-           index/descriptor tables from ``offs``:
-             - ``src_indices [max_blocks * block_size]``: maps rows in padded_a to mat_a
-               (or to row index T for zero-padding).
-             - ``dst_indices [total_tokens]``: maps output tokens to flat rows in padded_out.
-             - ``descriptor [max_blocks, 32]``: stick-aligned descriptor with expert_id.
-        3. On-device pack via ``index_select``:
-           Append 1 zero-row to ``mat_a`` -> ``[T+1, K]``, then gather rows into
-           ``padded_a [max_blocks, block_size, K]`` completely on Spyre.
-        4. ``for_each_tile`` over ``(padded_a, descriptor, mat2)`` with
-           ``dims=(0, 0, None)`` and ``tile_size=1``, loop count = max_blocks.
-           Each step:
-             a. ``blk    [1, block_size, K]``       — one block  (SLICE dim=0)
-             b. ``stick  [1, _INT32_PER_STICK]``    — descriptor (SLICE dim=0)
-             c. ``pool   [E, K, N]``                — weights    (INVARIANT)
-           Extract expert_id from stick → ``index_select`` → ``bmm`` →
-           ``[1, block_size, N]``.
-        5. On-device unpack via ``index_select``:
-           Flatten ``padded_out`` to ``[max_blocks * block_size, N]``, then gather
-           valid tokens via ``dst_indices`` -> ``out [T, N]`` completely on Spyre.
-
-      Zero data tensors (mat_a / padded_out) are transferred between Host and Device.
+    1. 2D x 3D with offs (mat_a [T, K] x mat_b [E, K, N]):
+       On-device Pack (index_select) -> Direct 3D BMM [E, t_max, K] @ [E, K, N]
+       -> On-device Unpack (index_select) -> out [T, N].
+    2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
+       Direct 3D BMM -> out [E, M, N].
+    3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
+       Slice along mat_b dim 1 -> out [M, T].
+    4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
+       Slice along reduction dim K -> out [E, M, N].
     """
-    num_experts: int = mat2.shape[0]
+    a_is_2d = self.dim() == 2
+    b_is_2d = mat2.dim() == 2
+    mat2_c = mat2.contiguous()
 
-    if offs is not None:
+    if a_is_2d and not b_is_2d:
+        # Case 1: 2D x 3D with offs -> out [T, N]
+        assert offs is not None, "2D x 3D grouped_mm requires offs"
         total_tokens: int = self.shape[0]
         K: int = self.shape[1]
+        num_experts: int = mat2.shape[0]
         N: int = mat2.shape[-1]
 
-        block_size: int = _GROUPED_MM_BLOCK_SIZE
-        max_blocks: int = min(total_tokens, total_tokens // block_size + num_experts)
+        t_max: int = _GROUPED_MM_BLOCK_SIZE
 
         # Step 1: CPU computes small routing tables (no mat_a or output transferred).
-        src_indices, dst_indices, descriptor = (
-            torch.ops.spyre.compute_grouped_mm_routing_tables(
-                offs, total_tokens, num_experts, block_size, max_blocks
-            )
+        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, total_tokens, num_experts, t_max
         )
 
         # Step 2: On-device pack via index_select
         zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
         self_with_zero = torch.cat([self, zero_row], dim=0)
         padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
-            max_blocks, block_size, K
+            num_experts, t_max, K
         )
 
-        mat2_c = mat2.contiguous()
-
-        def grouped_mm_body(carry, tiles):
-            # blk:   [1, block_size, K]    — one block of tokens (SLICE dim=0)
-            # stick: [1, _INT32_PER_STICK] — block descriptor    (SLICE dim=0)
-            # pool:  [E, K, N]             — weight tensor       (INVARIANT)
-            blk, stick, pool = tiles
-            expert_id = stick.reshape(_INT32_PER_STICK)[0:1]  # [1], int32
-            weight = pool.index_select(0, expert_id)  # [1, K, N]
-            out_tile = torch.bmm(blk, weight)  # [1, block_size, N]
-            return None, out_tile
-
-        # Step 3: On-device for_each_tile + bmm
-        _, padded_out = for_each_tile(
-            grouped_mm_body,
-            (padded_a, descriptor, mat2_c),
-            dims=(0, 0, None),
-            tile_size=1,
-            out_dim=0,
-        )
-        # padded_out: [max_blocks, block_size, N]
+        # Step 3: On-device direct 3D BMM (single kernel launch)
+        padded_out = torch.bmm(padded_a, mat2_c)  # [E, t_max, N]
 
         # Step 4: On-device unpack via index_select
-        flat_out = padded_out.reshape(max_blocks * block_size, N)
+        flat_out = padded_out.reshape(num_experts * t_max, N)
         out = torch.index_select(flat_out, 0, dst_indices)  # [T, N]
-    else:
-        chunks = list(self.chunk(num_experts, dim=0))
-        results = [chunks[i] @ mat2[i] for i in range(num_experts)]
-        out = torch.cat(results, dim=0)
+
+    elif not a_is_2d and not b_is_2d:
+        # Case 4: 3D x 3D without offs -> out [E, M, N]
+        out = torch.bmm(self, mat2_c)
+
+    elif not a_is_2d and b_is_2d:
+        # Case 2: 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T] -> out [M, T])
+        assert offs is not None, "3D x 2D grouped_mm requires offs"
+        num_experts = self.shape[0]
+        M = self.shape[1]
+        K = self.shape[2]
+        T = mat2.shape[1]
+        t_max = _GROUPED_MM_BLOCK_SIZE
+
+        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, num_experts, t_max
+        )
+
+        b_2d_T = mat2.transpose(0, 1).contiguous()
+        zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([b_2d_T, zero_row], dim=0)
+        padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, t_max, K
+        )
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()  # [E, K, t_max]
+
+        padded_out = torch.bmm(self, padded_b)  # [E, M, t_max]
+        flat_padded_out_T = (
+            padded_out.transpose(1, 2).reshape(num_experts * t_max, M).contiguous()
+        )
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)  # [T, M]
+        out = out_T.transpose(0, 1).contiguous()  # [M, T]
+
+    elif a_is_2d and b_is_2d:
+        # Case 3: 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N] -> out [E, M, N])
+        assert offs is not None, "2D x 2D grouped_mm requires offs"
+        num_experts = offs.shape[0]
+        M = self.shape[0]
+        K_total = self.shape[1]
+        N = mat2.shape[1]
+        k_max = _GROUPED_MM_BLOCK_SIZE
+
+        src_indices, _ = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, K_total, num_experts, k_max
+        )
+
+        a_T = self.transpose(0, 1).contiguous()
+        zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
+        a_with_zero = torch.cat([a_T, zero_row_a], dim=0)
+        padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
+            num_experts, k_max, M
+        )
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()  # [E, M, k_max]
+
+        zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
+        b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
+        padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
+            num_experts, k_max, N
+        )  # [E, k_max, N]
+
+        out = torch.bmm(padded_a, padded_b)  # [E, M, N]
 
     if bias is not None:
         out = out + bias

@@ -374,6 +374,27 @@ def _cached_fp32_for_int32_cast(shape):
     return src_int.to(torch.float32)
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_grouped_mm_offs(num_experts: int, total: int, seed: int = 500123):
+    """Return deterministic cumsum offsets for grouped_mm tests.
+
+    Mirrors oot_test_config_models cumsum_offsets(seed=123+500000) used by
+    the gemma-4-26B-A4B-it model ops tests.  seed=500123 = 123 + 500000.
+    Uses fork_rng so the global RNG state is not affected.
+    """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        counts = torch.zeros(num_experts, dtype=torch.int32)
+        counts.scatter_add_(
+            0,
+            torch.randint(0, num_experts, (total,)),
+            torch.ones(total, dtype=torch.int32),
+        )
+    t = torch.cumsum(counts, dim=0, dtype=torch.int32)
+    assert int(t[-1]) == total
+    return t
+
+
 def _cached_to_dtype_input(shape, src):
     if src.is_floating_point:
         return cached_randn(shape, dtype=src)
@@ -6115,6 +6136,90 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
             },
         },
+        # ------------------------------------------------------------------ #
+        # grouped_mm — torch._grouped_mm parameterized tests                  #
+        #                                                                      #
+        # Each param_set is (mat_a, mat_b, offs_or_None) where offs is a      #
+        # cumsum-offsets int32 tensor or None for the 3D×3D no-offs variant.  #
+        # The base function test_grouped_mm_base unpacks it accordingly.      #
+        # ------------------------------------------------------------------ #
+        ("test_grouped_mm", "test_grouped_mm_base"): {
+            "param_sets": {
+                # ---- 2D×3D with offs (model-ops shapes) ---- #
+                "model_ops_case1": (
+                    cached_xavier((192, 2816), dtype=torch.bfloat16),
+                    cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
+                    _cached_grouped_mm_offs(128, 192),
+                ),
+                "model_ops_case2": (
+                    cached_xavier((192, 704), dtype=torch.bfloat16),
+                    cached_xavier((128, 704, 2816), dtype=torch.bfloat16),
+                    _cached_grouped_mm_offs(128, 192),
+                ),
+                # ---- 2D×3D with offs (large batch) ---- #
+                "large_batch_T4096": (
+                    cached_xavier((4096, 2816), dtype=torch.bfloat16),
+                    cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
+                    _cached_grouped_mm_offs(128, 4096),
+                ),
+                "large_batch_T8192": (
+                    cached_xavier((8192, 2816), dtype=torch.bfloat16),
+                    cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
+                    _cached_grouped_mm_offs(128, 8192),
+                ),
+                # ---- 2D×3D with offs (varied distributions) ---- #
+                "small_tokens_T64_E16": (
+                    cached_xavier((64, 512), dtype=torch.bfloat16),
+                    cached_xavier((16, 512, 256), dtype=torch.bfloat16),
+                    _cached_grouped_mm_offs(16, 64),
+                ),
+                "skewed_dist_T128_E8": (
+                    cached_xavier((128, 256), dtype=torch.bfloat16),
+                    cached_xavier((8, 256, 128), dtype=torch.bfloat16),
+                    torch.cumsum(
+                        torch.tensor([64, 32, 32, 0, 0, 0, 0, 0], dtype=torch.int32),
+                        dim=0,
+                        dtype=torch.int32,
+                    ),
+                ),
+                "uniform_1tok_per_expert_T32_E32": (
+                    cached_xavier((32, 256), dtype=torch.bfloat16),
+                    cached_xavier((32, 256, 128), dtype=torch.bfloat16),
+                    torch.arange(1, 33, dtype=torch.int32),
+                ),
+                # ---- 3D×2D with offs ---- #
+                "3d_x_2d_E4": (
+                    cached_xavier((4, 16, 64), dtype=torch.bfloat16),
+                    cached_xavier((64, 32), dtype=torch.bfloat16),
+                    torch.cumsum(
+                        torch.tensor([8, 8, 8, 8], dtype=torch.int32),
+                        dim=0,
+                        dtype=torch.int32,
+                    ),
+                ),
+                # ---- 2D×2D with offs ---- #
+                "2d_x_2d_E4": (
+                    cached_xavier((16, 64), dtype=torch.bfloat16),
+                    cached_xavier((64, 32), dtype=torch.bfloat16),
+                    torch.cumsum(
+                        torch.tensor([16, 16, 16, 16], dtype=torch.int32),
+                        dim=0,
+                        dtype=torch.int32,
+                    ),
+                ),
+                # ---- 3D×3D without offs ---- #
+                "3d_x_3d_no_offs_E8_M32": (
+                    cached_xavier((8, 32, 256), dtype=torch.bfloat16),
+                    cached_xavier((8, 256, 128), dtype=torch.bfloat16),
+                    None,
+                ),
+                "3d_x_3d_no_offs_E64_M16": (
+                    cached_xavier((64, 16, 512), dtype=torch.bfloat16),
+                    cached_xavier((64, 512, 256), dtype=torch.bfloat16),
+                    None,
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -9172,56 +9277,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
-    def _make_grouped_mm_offs(
-        self, num_experts: int, total: int, seed: int
-    ) -> torch.Tensor:
-        """Build cumsum offsets for grouped_mm tests (fork_rng-isolated)."""
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(seed)
-            counts = torch.zeros(num_experts, dtype=torch.int32)
-            counts.scatter_add_(
-                0,
-                torch.randint(0, num_experts, (total,)),
-                torch.ones(total, dtype=torch.int32),
+    def test_grouped_mm_base(self, mat_a, mat_b, offs):
+        """Base method for parameterized torch._grouped_mm tests.
+
+        offs is a cumsum int32 offsets tensor for the 2D/3D-with-offs variants,
+        or None for the 3D×3D no-offs variant.
+        """
+        if offs is None:
+
+            def fn(a, b):
+                return torch._grouped_mm(a, b)
+
+            self.compare_with_cpu(
+                fn, mat_a, mat_b, atol=0.005, rtol=0.005, run_eager=False
             )
-        t = torch.cumsum(counts, dim=0, dtype=torch.int32)
-        assert int(t[-1]) == total
-        return t
+        else:
 
-    def test_grouped_mm_bf16_case1(self):
-        """[192,2816] x [128,2816,1408] bf16 — gemma-4-26B-A4B-it torch._grouped_mm.1."""
-        # seed=500123 mirrors oot_test_config_models cumsum_offsets(seed=123+500000)
-        offs = self._make_grouped_mm_offs(128, 192, seed=500123)
-        mat_a = torch.nn.init.xavier_uniform_(
-            torch.empty(192, 2816, dtype=torch.bfloat16)
-        )
-        mat_b = torch.nn.init.xavier_uniform_(
-            torch.empty(128, 2816, 1408, dtype=torch.bfloat16)
-        )
+            def fn(a, b, o):
+                return torch._grouped_mm(a, b, offs=o)
 
-        def fn(a, b, o):
-            return torch._grouped_mm(a, b, offs=o)
-
-        self.compare_with_cpu(
-            fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
-        )
-
-    def test_grouped_mm_bf16_case2(self):
-        """[192,704] x [128,704,2816] bf16 — gemma-4-26B-A4B-it torch._grouped_mm.2."""
-        offs = self._make_grouped_mm_offs(128, 192, seed=500123)
-        mat_a = torch.nn.init.xavier_uniform_(
-            torch.empty(192, 704, dtype=torch.bfloat16)
-        )
-        mat_b = torch.nn.init.xavier_uniform_(
-            torch.empty(128, 704, 2816, dtype=torch.bfloat16)
-        )
-
-        def fn(a, b, o):
-            return torch._grouped_mm(a, b, offs=o)
-
-        self.compare_with_cpu(
-            fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
-        )
+            self.compare_with_cpu(
+                fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
+            )
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
