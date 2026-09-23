@@ -156,6 +156,43 @@ def carry_bindings_for(
     ]
 
 
+def _body_fx_carry_is_passthrough(while_op: "ir.WhileLoop", carry_index: int) -> bool:
+    """Return whether the original body returns this carry placeholder unchanged.
+
+    ``WhileLoop.create`` applies ``require_exact_strides`` to every lowered IR
+    body output after tracing the body FX graph.  For a scan ``xs`` carry that
+    is semantically pass-through, that stride repair can introduce a copy and
+    make the IR output's buffer name differ from the placeholder name.  The FX
+    graph still retains the semantic identity: output ``i`` is placeholder
+    ``i``.  Consult it so the copy is not mistaken for an accumulator update
+    and rewritten in place onto a differently-ranked input view.
+    """
+    from torch.utils._pytree import tree_leaves
+
+    body_graph = getattr(getattr(while_op, "body_subgraph", None), "graph", None)
+    module = getattr(body_graph, "module", None)
+    fx_graph = getattr(module, "graph", None)
+    if fx_graph is None:
+        logger.debug(
+            "cannot inspect FX pass-through identity for carry %d: "
+            "body_subgraph.graph.module.graph is unavailable",
+            carry_index,
+        )
+        return False
+
+    placeholders = [node for node in fx_graph.nodes if node.op == "placeholder"]
+    output = next((node for node in fx_graph.nodes if node.op == "output"), None)
+    if output is None or not output.args:
+        return False
+
+    outputs = tree_leaves(output.args[0])
+    return (
+        carry_index < len(placeholders)
+        and carry_index < len(outputs)
+        and outputs[carry_index] is placeholders[carry_index]
+    )
+
+
 def fold_stacked_carry_layout(node: Any, trip_count: Any) -> bool:
     """Collapse a stacking carry's buffer from [trip, *tile] to the folded shape.
 
@@ -889,9 +926,20 @@ def splice_while_loop(
             # this function's docstring. The read side still resolves to the
             # real buffer below, exactly as for a pass-through carry, since
             # the spliced body reads the same object it writes.
-            if trip_count is not None and not fold_stacked_carry_layout(
-                real_input, trip_count
-            ):
+            #
+            # A caller can mark a carry stacking (carry_bindings_for's
+            # stacking_indices) independently of what trip_count it passes
+            # here -- the two APIs don't couple them. Without trip_count the
+            # fold can't even be attempted, so the destination is left in its
+            # unfolded [trip, *tile] shape with no fold and no diagnostic:
+            # any outside consumer expecting the flat shape silently reads
+            # a wrong-shaped buffer. Raise instead of letting that happen.
+            if trip_count is None:
+                raise Unsupported(
+                    f"stacking carry {binding.carry_index} ({real_name}) "
+                    f"requires a trip_count to fold its layout; got None"
+                )
+            if not fold_stacked_carry_layout(real_input, trip_count):
                 logger.debug(
                     "splice_while_loop: carry %d (%s) marked stacking but its "
                     "layout is not a foldable [trip, *tile] shape; leaving it "
@@ -904,7 +952,9 @@ def splice_while_loop(
             continue
 
         body_output_name = getattr(binding.body_output, "get_name", lambda: None)()
-        is_passthrough = body_output_name == placeholder_name
+        is_passthrough = body_output_name == placeholder_name or (
+            _body_fx_carry_is_passthrough(while_op, binding.carry_index)
+        )
         if body_output_name is not None and not is_passthrough:
             # Real per-iteration rewrite of an ACCUMULATOR carry. Redirect
             # its write in place into the carry's own initial buffer, so the
