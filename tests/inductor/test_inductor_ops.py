@@ -6136,16 +6136,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_3d": (cached_randn((3, 5, 256), dtype=torch.float16),),
             },
         },
-        # ------------------------------------------------------------------ #
-        # grouped_mm — torch._grouped_mm parameterized tests                  #
-        #                                                                      #
-        # Each param_set is (mat_a, mat_b, offs_or_None) where offs is a      #
-        # cumsum-offsets int32 tensor or None for the 3D×3D no-offs variant.  #
-        # The base function test_grouped_mm_base unpacks it accordingly.      #
-        # ------------------------------------------------------------------ #
+        # grouped_mm — torch._grouped_mm parameterized tests
         ("test_grouped_mm", "test_grouped_mm_base"): {
             "param_sets": {
-                # ---- 2D×3D with offs (model-ops shapes) ---- #
                 "model_ops_case1": (
                     cached_xavier((192, 2816), dtype=torch.bfloat16),
                     cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
@@ -6156,7 +6149,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_xavier((128, 704, 2816), dtype=torch.bfloat16),
                     _cached_grouped_mm_offs(128, 192),
                 ),
-                # ---- 2D×3D with offs (large batch) ---- #
                 "large_batch_T4096": (
                     cached_xavier((4096, 2816), dtype=torch.bfloat16),
                     cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
@@ -6167,7 +6159,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_xavier((128, 2816, 1408), dtype=torch.bfloat16),
                     _cached_grouped_mm_offs(128, 8192),
                 ),
-                # ---- 2D×3D with offs (varied distributions) ---- #
                 "small_tokens_T64_E16": (
                     cached_xavier((64, 512), dtype=torch.bfloat16),
                     cached_xavier((16, 512, 256), dtype=torch.bfloat16),
@@ -6187,7 +6178,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_xavier((32, 256, 128), dtype=torch.bfloat16),
                     torch.arange(1, 33, dtype=torch.int32),
                 ),
-                # ---- 3D×2D with offs ---- #
                 "3d_x_2d_E4": (
                     cached_xavier((4, 16, 64), dtype=torch.bfloat16),
                     cached_xavier((64, 32), dtype=torch.bfloat16),
@@ -6197,7 +6187,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.int32,
                     ),
                 ),
-                # ---- 2D×2D with offs ---- #
                 "2d_x_2d_E4": (
                     cached_xavier((16, 64), dtype=torch.bfloat16),
                     cached_xavier((64, 32), dtype=torch.bfloat16),
@@ -6207,7 +6196,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.int32,
                     ),
                 ),
-                # ---- 3D×3D without offs ---- #
                 "3d_x_3d_no_offs_E8_M32": (
                     cached_xavier((8, 32, 256), dtype=torch.bfloat16),
                     cached_xavier((8, 256, 128), dtype=torch.bfloat16),

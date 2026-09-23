@@ -3514,49 +3514,42 @@ def spyre_grouped_mm(
     2. 3D x 3D without offs (mat_a [E, M, K] x mat_b [E, K, N]):
        Direct 3D BMM -> out [E, M, N].
     3. 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T]):
-       Slice along mat_b dim 1 -> out [M, T].
+       On-device Pack (index_select) -> Direct 3D BMM [E, M, K] @ [E, K, t_max]
+       -> On-device Unpack (index_select) -> out [M, T].
     4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
-       Slice along reduction dim K -> out [E, M, N].
+       On-device Pack along reduction dim K -> Direct 3D BMM [E, M, k_max] @ [E, k_max, N]
+       -> out [E, M, N].
     """
     a_is_2d = self.dim() == 2
     b_is_2d = mat2.dim() == 2
     mat2_c = mat2.contiguous()
 
     if a_is_2d and not b_is_2d:
-        # Case 1: 2D x 3D with offs -> out [T, N]
         assert offs is not None, "2D x 3D grouped_mm requires offs"
         total_tokens: int = self.shape[0]
         K: int = self.shape[1]
         num_experts: int = mat2.shape[0]
         N: int = mat2.shape[-1]
-
         t_max: int = _GROUPED_MM_BLOCK_SIZE
 
-        # Step 1: CPU computes small routing tables (no mat_a or output transferred).
         src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, total_tokens, num_experts, t_max
         )
 
-        # Step 2: On-device pack via index_select
         zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
         self_with_zero = torch.cat([self, zero_row], dim=0)
         padded_a = torch.index_select(self_with_zero, 0, src_indices).reshape(
             num_experts, t_max, K
         )
 
-        # Step 3: On-device direct 3D BMM (single kernel launch)
-        padded_out = torch.bmm(padded_a, mat2_c)  # [E, t_max, N]
-
-        # Step 4: On-device unpack via index_select
+        padded_out = torch.bmm(padded_a, mat2_c)
         flat_out = padded_out.reshape(num_experts * t_max, N)
-        out = torch.index_select(flat_out, 0, dst_indices)  # [T, N]
+        out = torch.index_select(flat_out, 0, dst_indices)
 
     elif not a_is_2d and not b_is_2d:
-        # Case 4: 3D x 3D without offs -> out [E, M, N]
         out = torch.bmm(self, mat2_c)
 
     elif not a_is_2d and b_is_2d:
-        # Case 2: 3D x 2D with offs (mat_a [E, M, K] x mat_b [K, T] -> out [M, T])
         assert offs is not None, "3D x 2D grouped_mm requires offs"
         num_experts = self.shape[0]
         M = self.shape[1]
@@ -3574,17 +3567,16 @@ def spyre_grouped_mm(
         padded_b_T = torch.index_select(b_with_zero, 0, src_indices).reshape(
             num_experts, t_max, K
         )
-        padded_b = padded_b_T.transpose(-1, -2).contiguous()  # [E, K, t_max]
+        padded_b = padded_b_T.transpose(-1, -2).contiguous()
 
-        padded_out = torch.bmm(self, padded_b)  # [E, M, t_max]
+        padded_out = torch.bmm(self, padded_b)
         flat_padded_out_T = (
             padded_out.transpose(1, 2).reshape(num_experts * t_max, M).contiguous()
         )
-        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)  # [T, M]
-        out = out_T.transpose(0, 1).contiguous()  # [M, T]
+        out_T = torch.index_select(flat_padded_out_T, 0, dst_indices)
+        out = out_T.transpose(0, 1).contiguous()
 
     elif a_is_2d and b_is_2d:
-        # Case 3: 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N] -> out [E, M, N])
         assert offs is not None, "2D x 2D grouped_mm requires offs"
         num_experts = offs.shape[0]
         M = self.shape[0]
@@ -3602,15 +3594,15 @@ def spyre_grouped_mm(
         padded_a_T = torch.index_select(a_with_zero, 0, src_indices).reshape(
             num_experts, k_max, M
         )
-        padded_a = padded_a_T.transpose(-1, -2).contiguous()  # [E, M, k_max]
+        padded_a = padded_a_T.transpose(-1, -2).contiguous()
 
         zero_row_b = torch.zeros(1, N, dtype=mat2.dtype, device=mat2.device)
         b_with_zero = torch.cat([mat2, zero_row_b], dim=0)
         padded_b = torch.index_select(b_with_zero, 0, src_indices).reshape(
             num_experts, k_max, N
-        )  # [E, k_max, N]
+        )
 
-        out = torch.bmm(padded_a, padded_b)  # [E, M, N]
+        out = torch.bmm(padded_a, padded_b)
 
     if bias is not None:
         out = out + bias
