@@ -114,6 +114,23 @@ _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
 _GROUPED_MM_BLOCK_SIZE = 64
 
 
+def _grouped_mm_t_max(offs: "torch.Tensor", block: int = _GROUPED_MM_BLOCK_SIZE) -> int:
+    """Return t_max: the smallest multiple of *block* that is >= the longest
+    expert segment described by cumulative *offs*.
+
+    Called during Inductor lowering (decomposition), so offs is a concrete
+    tensor at that point.  The result is used as a static integer in reshape
+    and is baked into the compiled graph; a change in t_max triggers
+    recompilation.
+    """
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    counts = torch.diff(offs_cpu, prepend=torch.zeros(1, dtype=torch.int32))
+    max_count = int(counts.max().item()) if counts.numel() > 0 else 0
+    if max_count == 0:
+        return block
+    return int(math.ceil(max_count / block)) * block
+
+
 @dataclasses.dataclass(frozen=True)
 class _SDPATilingConfig:
     """Static SDPA decomposition choices produced by the cost model."""
@@ -3530,7 +3547,7 @@ def spyre_grouped_mm(
         K: int = self.shape[1]
         num_experts: int = mat2.shape[0]
         N: int = mat2.shape[-1]
-        t_max: int = _GROUPED_MM_BLOCK_SIZE
+        t_max: int = _grouped_mm_t_max(offs)
 
         src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, total_tokens, num_experts, t_max
@@ -3555,7 +3572,7 @@ def spyre_grouped_mm(
         M = self.shape[1]
         K = self.shape[2]
         T = mat2.shape[1]
-        t_max = _GROUPED_MM_BLOCK_SIZE
+        t_max = _grouped_mm_t_max(offs)
 
         src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, T, num_experts, t_max
@@ -3582,7 +3599,7 @@ def spyre_grouped_mm(
         M = self.shape[0]
         K_total = self.shape[1]
         N = mat2.shape[1]
-        k_max = _GROUPED_MM_BLOCK_SIZE
+        k_max = _grouped_mm_t_max(offs)
 
         src_indices, _ = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, K_total, num_experts, k_max

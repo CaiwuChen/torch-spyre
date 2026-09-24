@@ -1305,10 +1305,17 @@ def compute_grouped_mm_routing_tables(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute lightweight index tables on CPU for on-device direct bmm grouped_mm.
 
+    t_max must be >= the longest expert segment in offs; the caller
+    (decompositions._grouped_mm_t_max) is responsible for computing it and
+    passing it here.  Every row/reduction term is mapped; no segment is
+    truncated.
+
     Returns:
-      src_indices: [num_experts * t_max], int32 — maps each row in padded_a [E, t_max, K]
-                   to a row in mat_a (or to total_tokens for zero padding).
-      dst_indices: [total_tokens], int32 — maps each output token to its row in flat padded_out.
+      src_indices: [num_experts * t_max], int32 — maps each slot in padded_a
+                   [E, t_max, K] to a row in mat_a, or to total_tokens for
+                   zero-padding slots.
+      dst_indices: [total_tokens], int32 — maps each output token to its row
+                   in flat padded_out [E * t_max, ...].
     """
     offs_cpu = offs.to("cpu", dtype=torch.int32).tolist()
     dummy_zero_row = total_tokens
@@ -1321,14 +1328,12 @@ def compute_grouped_mm_routing_tables(
         end = offs_cpu[e]
         count = end - start
         if count > 0:
-            valid_len = min(count, t_max)
             slot_start = e * t_max
-            slot_end = slot_start + valid_len
-            src_indices[slot_start:slot_end] = torch.arange(
-                start, start + valid_len, dtype=torch.int32
+            src_indices[slot_start : slot_start + count] = torch.arange(
+                start, end, dtype=torch.int32
             )
-            dst_indices[start : start + valid_len] = torch.arange(
-                slot_start, slot_end, dtype=torch.int32
+            dst_indices[start:end] = torch.arange(
+                slot_start, slot_start + count, dtype=torch.int32
             )
         start = end
 
