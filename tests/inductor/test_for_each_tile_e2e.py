@@ -758,5 +758,169 @@ class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
         )
 
 
+# --- trip-range vector gather (loop-trip ranges reach coordinate queries) -----
+
+TRIP_POOL, TRIP_E, TRIP_SIZE, TRIP_HS, TRIP_LQ = 64, 4, 32, 64, 32
+
+
+def trip_range_build(trips, e):
+    pages = (
+        torch.pow(torch.tensor(2.0), (torch.arange(TRIP_POOL) % 8).float()) / 64.0
+    ).to(torch.float16)
+    pages = (
+        pages.reshape(TRIP_POOL, 1, 1)
+        .expand(TRIP_POOL, TRIP_SIZE, TRIP_HS)
+        .contiguous()
+    )
+    q = torch.full((TRIP_LQ, TRIP_HS), 1.0 / 64.0, dtype=torch.float16)
+    table = torch.zeros(trips, 32, dtype=torch.int32)
+    for t in range(trips):
+        for j in range(e):
+            table[t, j] = (t * e + j) % TRIP_POOL
+    return pages, table, q
+
+
+def trip_range_ref(pages, q, ids):
+    pf, qf = pages.float(), q.float()
+    acc = torch.zeros(TRIP_LQ, TRIP_HS)
+    for p in ids:
+        page = pf[int(p)]
+        acc = acc + (qf @ page.T) @ page
+    return acc
+
+
+def trip_range_fn(e):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pages, table, q):
+        def body(acc, tiles):
+            table_row, pages_all, q_whole = tiles
+            idx = table_row[0, 0:e]
+            pages_v = pages_all.index_select(0, idx)
+            scores = torch.matmul(q_whole.unsqueeze(0), pages_v.transpose(-2, -1))
+            out = torch.matmul(scores, pages_v)
+            return acc + out.sum(0), None
+
+        acc0 = torch.zeros(TRIP_LQ, TRIP_HS, dtype=q.dtype, device=q.device)
+        final, _ = for_each_tile(
+            body, (table, pages, q), dims=(0, None, None), tile_size=1, init=acc0
+        )
+        return final
+
+    return fn
+
+
+class TestForEachTileTripRangesE2E(_DynamoResetTestCase):
+    """A VECTOR page gather per trip (vs paged_gather_fn's point read).
+
+    On the base this fails at trips >= 2 with ``indirect symbol u0 not found in
+    indirect_sizes``; with the fix it passes and the output is neither the first
+    group repeated nor the advance applied twice.
+    """
+
+    ATOL = 1e-3
+    RTOL = 1e-3
+
+    def test_multi_trip_vector_page_gather(self):
+        e = TRIP_E
+        for trips in (1, 2, 4):
+            with self.subTest(trips=trips):
+                # Reset per case: without it Dynamo generalizes the fixed trip
+                # counts across subtests and the for_each_tile splice is skipped.
+                torch._dynamo.reset()
+                pages, table, q = trip_range_build(trips, e)
+                ids = [int(table[t, j]) for t in range(trips) for j in range(e)]
+                want = trip_range_ref(pages, q, ids)
+                compiled = torch.compile(
+                    trip_range_fn(e), backend="inductor", fullgraph=True
+                )
+                out = (
+                    compiled(
+                        pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME)
+                    )
+                    .cpu()
+                    .float()
+                )
+                assert torch.isfinite(out).all()
+                torch.testing.assert_close(out, want, atol=self.ATOL, rtol=self.RTOL)
+                if trips >= 2:
+                    rep_first = trip_range_ref(
+                        pages,
+                        q,
+                        [int(table[0, j]) for _ in range(trips) for j in range(e)],
+                    )
+                    adv_twice = trip_range_ref(
+                        pages,
+                        q,
+                        [
+                            int(table[(2 * t) % trips, j])
+                            for t in range(trips)
+                            for j in range(e)
+                        ],
+                    )
+                    assert (out - rep_first).abs().max().item() > 1e-2
+                    assert (out - adv_twice).abs().max().item() > 1e-2
+
+
+# --- sub-stick for_each_tile indirect-index advance (issue #4835) -----------
+
+
+def substick_gather_fn(pool, ids, init):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pool, ids, init):
+        def body(carry, tiles):
+            tile_ids, whole_pool = tiles
+            return (carry[0] + whole_pool[tile_ids],), None
+
+        (acc,), _ = for_each_tile(
+            body, (ids, pool), dims=(0, None), tile_size=SUBSTICK_TILE, init=(init,)
+        )
+        return acc
+
+    return fn(pool, ids, init)
+
+
+SUBSTICK_POOL, SUBSTICK_WIDTH, SUBSTICK_TRIPS, SUBSTICK_TILE = 256, 128, 4, 2
+
+
+class TestForEachTileSubStickAdvanceE2E(_DynamoResetTestCase):
+    """A ``for_each_tile`` whose per-trip indirect-index advance is narrower
+    than one physical stick must be refused at compile time, not silently
+    compiled to a wrong answer.
+
+    ``ids`` is an int32 tile-advancing (``Kind.SLICE``) operand tiled with
+    ``tile_size=SUBSTICK_TILE=2``; each trip therefore advances the index
+    tensor's device stick coordinate by 2 int32 elements, well inside a
+    single 32-element stick. Before the ``UnalignedStickSplit`` guard added
+    by PR #4829, ``SpyreKernel`` computed this sub-stick advance as if it
+    were whole-stick, repeating the first tile's gather on every subsequent
+    trip. #4829's own regression coverage of that guard
+    (``TestIndirectIndexStepGuard`` in test_for_each_tile_lowering.py) only
+    exercises it via a synthetic CPU ``sympy`` expression; no test compiles
+    an actual sub-stick advance on device. This test closes that gap: it
+    asserts that compiling ``substick_gather_fn`` raises the documented
+    ``UnalignedStickSplit`` failure (surfaced through the wrapping
+    ``InductorError``) instead of returning a plausible-looking wrong
+    answer. See issue #4835 and the parent issue #4828.
+    """
+
+    def test_substick_indirect_advance_is_refused(self):
+        import pytest
+        from torch._inductor.exc import InductorError
+
+        ids = torch.arange(SUBSTICK_TRIPS, dtype=torch.int32).to(DEVICE_NAME)
+        pool = torch.randn(SUBSTICK_POOL, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+        init = torch.zeros(SUBSTICK_TILE, SUBSTICK_WIDTH, dtype=torch.float16).to(
+            DEVICE_NAME
+        )
+
+        compiled = torch.compile(substick_gather_fn, backend="inductor", fullgraph=True)
+        with pytest.raises(InductorError, match="cuts tensor.*physical stick"):
+            compiled(pool, ids, init)
+
+
 if __name__ == "__main__":
     unittest.main()
