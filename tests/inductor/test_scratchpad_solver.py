@@ -35,6 +35,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    solved_bindings,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchSolver
@@ -1193,6 +1194,25 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
     solver_class = CpSatLayoutSolver
 
+    def test_symbolic_reciprocal_core_count_selects_the_faster_candidate(self):
+        buf = CoreDivisionBuffer(
+            "reduction_out",
+            128,
+            [0, 1],
+            core_divisions=[
+                CoreDivision(splits={"b": 1, "h": 4, "q": 2}),
+                CoreDivision(splits={"b": 2, "h": 4, "q": 4}),
+            ],
+            residency_reason="no consumer reads it from LX",
+        )
+        cost = sympy.Integer(32_000) / buf.sym_cores
+        (result,) = self.solver_class(
+            [buf], size=1 << 20, alignment=1
+        ).plan_layout_and_core_divisions(cost)
+
+        self.assertEqual(result.chosen_division, 1)
+        self.assertEqual(float(cost.subs(solved_bindings([result]))), 1000.0)
+
     def test_inplace_chain_shares_single_slot(self):
         # A 3-level in-place chain gp -> p -> c (each parent.end_time ==
         # child.start_time + 1) with whole-only divisions and capacity for just
@@ -1811,6 +1831,56 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class SolveStatsTest(TestCase):
+    """``CpSatLayoutSolver.last_solve_stats``: what the solve cost and returned.
+
+    Nothing else in the pipeline records this, and the cost-expression dump
+    reports it as the provenance of the plan it describes -- so a reader can
+    tell an OPTIMAL plan from one that hit a time limit, and a plan the
+    objective chose from one the fallback did.
+    """
+
+    @staticmethod
+    def _bufs():
+        return [
+            CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+            CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+        ]
+
+    def test_nothing_is_recorded_before_a_solve(self):
+        """Empty, so a reader distinguishes "not recorded" from "no solve"."""
+        self.assertEqual(CpSatLayoutSolver(self._bufs(), 1 << 20).last_solve_stats, {})
+
+    def test_an_objective_solve_is_recorded_as_one(self):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        solver.plan_layout_and_core_divisions(4000 * (1 - solver.buffers[0].sym_is_lx))
+        stats = solver.last_solve_stats
+        self.assertEqual(stats["status"], "OPTIMAL")
+        self.assertTrue(stats["objective_used"])
+        self.assertGreater(stats["variables"], 0)
+        self.assertGreater(stats["constraints"], 0)
+
+    def test_the_fallback_passes_record_too(self):
+        """``_run`` solves in its own occupancy passes when no objective status
+        comes back. Recording only the objective solve would leave those plans
+        described by an earlier call's numbers."""
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        solver.plan_layout_and_core_divisions()
+        stats = solver.last_solve_stats
+        self.assertEqual(stats["status"], "OPTIMAL")
+        self.assertFalse(stats["objective_used"], "no objective was minimized")
+
+    def test_an_unlowerable_objective_is_not_reported_as_used(self):
+        """The fallback records over the NOT_LINEARIZABLE entry, because it is
+        the solve that produced the plan -- but the flag must not claim the
+        objective chose it."""
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        unlowerable = sympy.Function("NoSuchNode")(solver.buffers[0].sym_is_lx)
+        with config.patch({"_cpsat_warn_on_cost_expr": True}):
+            solver.plan_layout_and_core_divisions(unlowerable)
+        self.assertFalse(solver.last_solve_stats["objective_used"])
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.
