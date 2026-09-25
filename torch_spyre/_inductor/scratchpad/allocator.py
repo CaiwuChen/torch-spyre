@@ -114,7 +114,11 @@ from torch_spyre._inductor.constants import (
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.loop_info import CarriedReductionRecord, LoopCarryRecord
+from torch_spyre._inductor.loop_info import (
+    CarriedReductionRecord,
+    LoopCarryRecord,
+    ReadCopyElisionRecord,
+)
 from torch_spyre._inductor.padding import is_restickify_op
 from torch_spyre._inductor.scratchpad.lx_relayout import (
     _unsupported_relayout_transition_reason,
@@ -2210,10 +2214,78 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> Sequence[Any]:
         # Joint selection derives its own divisions; fixed-division plans do not apply.
         in_place = self._determine_in_place_division_invariant(graph)
-        buffers = self._build_cd_bound_buffers(
-            graph, in_place, self._division_map(graph)
+        divisions = self._division_map(graph, allow_deferred_read_candidates=True)
+        pending = {
+            op.name: op
+            for op in graph.operations
+            if hasattr(op, "_read_copy_elision_record")
+            and is_restickify_op(op, graph)
+            and divisions[op.name] != [_fixed_core_division(op)]
+        }
+        while True:
+            buffers = self._build_cd_bound_buffers(graph, in_place, divisions)
+            if not pending:
+                return buffers
+            pricing = {
+                op.get_name(): op for op in self._pricing_operations(graph, buffers)
+            }
+            rejected = [
+                name
+                for name, op in pending.items()
+                if pricing.get(name) is op
+                or not self._direct_read_candidates_priced(
+                    pricing.get(name), divisions[name], buffers
+                )
+            ]
+            if not rejected:
+                return buffers
+            for name in rejected:
+                op = pending.pop(name)
+                fixed = _fixed_core_division(op)
+                assert fixed.cores_used <= config.sencores, (
+                    f"{name}: fixed direct-read division over the "
+                    f"{config.sencores}-core budget"
+                )
+                divisions[name] = _legal_fixed_division(
+                    op, [fixed], "unproved or unpriced direct read"
+                )
+            # Menus affect input clones and relayouts. Rebuild their actual
+            # allocation context and recheck the remaining expanded reads.
+            # Rejection is monotonic, so this terminates after at most one pin
+            # per deferred read, without changing the graph or the late proof.
+
+    @staticmethod
+    def _direct_read_candidates_priced(op, divisions, buffers) -> bool:
+        from torch_spyre._inductor.cost_model import transport_dma_cost_available
+        from torch_spyre._inductor.dump_cost_model import extract_op_features
+        from torch_spyre._inductor.scratchpad.sa_cooptimizer import _work_slices
+
+        if op is None or not any(buf.name == op.get_name() for buf in buffers):
+            return False
+        is_lx = {buf.name: buf.sym_is_lx for buf in buffers}
+        return all(
+            transport_dma_cost_available(
+                extract_op_features(op, _work_slices(op, division), is_lx=is_lx),
+                _COST_PARAMS,
+            )
+            for division in divisions
         )
-        return buffers
+
+    @staticmethod
+    def _pricing_operations(graph, buffers):
+        from torch_spyre._inductor.read_copy_elision import (
+            project_transport_read_copies,
+        )
+
+        return project_transport_read_copies(
+            graph,
+            {buf.name: [cd.splits for cd in buf.core_divisions] for buf in buffers},
+            relayout_sources={
+                buf.relayout_parent
+                for buf in buffers
+                if isinstance(buf, RelayoutCopyBuffer)
+            },
+        )
 
     def _solve(self, solver: MemoryPlanSolver, graph: GraphLowering) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
@@ -2222,23 +2294,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # lookup is against this same whole-graph map, and rebuilding it per op
         # turns an O(buffers) cost into O(ops * buffers) on the full graph.
         default_is_lx = {name: buf.sym_is_lx for name, buf in bufmap.items()}
-
-        from torch_spyre._inductor.read_copy_elision import (
-            project_transport_read_copies,
-        )
-
-        pricing_ops = project_transport_read_copies(
-            graph,
-            {
-                name: [cd.splits for cd in buf.core_divisions]
-                for name, buf in bufmap.items()
-            },
-            relayout_sources={
-                buf.relayout_parent
-                for buf in solver.buffers
-                if isinstance(buf, RelayoutCopyBuffer)
-            },
-        )
+        pricing_ops = self._pricing_operations(graph, solver.buffers)
         pricing_by_name = {op.get_name(): op for op in pricing_ops}
 
         # Keyed by buffer name, which is what ``predict_by_bundle`` needs to match
@@ -2334,9 +2390,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             ):
                 cost_expr = cost_expr + copy.cost_term()
         result = solver.plan_layout_and_core_divisions(cost_expr)
-        assert not any(buffer.lx_relayout_plans for buffer in result), (
-            "CoOptimizingAllocator does not support LX relayout"
-        )
+        if any(buffer.lx_relayout_plans for buffer in result):
+            raise AssertionError("CoOptimizingAllocator does not support LX relayout")
         if config.dump_cost_expr_file and cost_expr is not None:
             # The objective as solved: its terms, the chosen symbol values and
             # the evaluated prices, for the summarize-sdsc skill.
@@ -2499,7 +2554,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert isinstance(solver, CoreDivisionLayoutSolver)
         return solver.spill_reasons
 
-    def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
+    def _division_map(
+        self, graph: GraphLowering, *, allow_deferred_read_candidates: bool = False
+    ) -> dict[str, list[CoreDivision]]:
         """Per-op core-division candidates for the joint-division solve.
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
@@ -2559,6 +2616,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 reason = "indirect access entry split"
             elif _reads_offset_slice(op):
                 reason = "offset slice read"
+            elif (
+                is_restickify_op(op, graph)
+                and hasattr(op, "_read_copy_elision_record")
+                and not (
+                    allow_deferred_read_candidates
+                    and config.read_copy_elision
+                    and isinstance(op._read_copy_elision_record, ReadCopyElisionRecord)
+                )
+            ):
+                # The preparation path may provisionally enumerate ordinary
+                # legal candidates, but retains them only after proving and
+                # pricing the direct read in the actual allocation context.
+                # Other callers and unrecognized records keep the fixed pin.
+                reason = "deferred direct graph-input read"
             elif (
                 not config.ignore_work_division_hints
                 and isinstance(op, ComputedBuffer)
@@ -3616,9 +3687,10 @@ def select_allocator() -> ScratchpadAllocator:
       instance. ``"simulated_annealing"`` is served by
       :class:`SaCoOptimizingSolver`, the joint work-division + LX engine.
       Otherwise a core-division-capable factory (currently only ``"cpsat"``, and
-      only when ortools is available) is used directly; every other factory is
-      wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
-      search of all the core division options.
+      only when ortools is available) is used directly; every other factory
+      would need to be wrapped in an :class:`ExhaustiveSearchSolver` that does
+      an exhaustive search of all the core division options -- allowed only
+      when ``allow_exhaustive_search`` is set, else this raises ``ValueError``.
 
     The annealer is deliberately not wrapped in :class:`ExhaustiveSearchSolver`:
     that wrapper solves the layout once per enumerated division candidate, so
@@ -3669,6 +3741,20 @@ def select_allocator() -> ScratchpadAllocator:
         # core-division-capable when the factory may be a plain function (the
         # ortools-availability-aware cpsat factory) rather than a solver class.
         if not isinstance(solver_cls([], size), CoreDivisionLayoutSolver):
+            if not config.allow_exhaustive_search:
+                raise ValueError(
+                    f"co_optimizing_lx_planning=True with layout_solver="
+                    f"'{config.layout_solver}' has no core-division-capable "
+                    "solver to co-optimize with (this requires layout_solver="
+                    "'cpsat' with ortools installed, or "
+                    "layout_solver='simulated_annealing'); the only way to "
+                    "proceed is to fall back to ExhaustiveSearchSolver, an "
+                    "expensive DFS over core-division candidates. Set "
+                    "allow_exhaustive_search=True (or "
+                    "ALLOW_EXHAUSTIVE_SEARCH=1) to allow that fallback, or "
+                    "set co_optimizing_lx_planning=False (or "
+                    "CO_OPTIMIZING_LX_PLANNING=0) to avoid it."
+                )
             return CoOptimizingAllocator(
                 layout_planning=functools.partial(
                     ExhaustiveSearchSolver, inner_factory=solver_cls
