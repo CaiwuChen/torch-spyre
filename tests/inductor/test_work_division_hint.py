@@ -975,7 +975,8 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
             32,
             True,
         ),
-        # Gather then broadcast: every completed slice reaches several cores.
+        # Geometrically valid gather/broadcast, but each destination needs 32
+        # incoming fragments, exceeding the shuffle address-register budget.
         (
             _view({2: 32}, {2: Mod(_CORE_ID, 32)}, 32),
             _view(
@@ -983,7 +984,7 @@ def test_restickify_lx_read_requires_the_same_physical_owners():
             ),
             32,
             32,
-            True,
+            False,
         ),
         # A larger domain need not replicate slices evenly: each source feeds
         # four cores and each destination core has one source.
