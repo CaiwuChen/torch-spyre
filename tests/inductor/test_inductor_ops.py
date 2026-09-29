@@ -6320,7 +6320,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_x_2d_E4": (
                     torch.cat(
                         [
-                            _grouped_mm_ramp_a(16, 64).unsqueeze(0) * float(e + 1)
+                            (_grouped_mm_ramp_a(16, 64) / 4).unsqueeze(0) * float(e + 1)
                             for e in range(4)
                         ],
                         dim=0,
@@ -9675,7 +9675,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn_3d2d,
             torch.cat(
                 [
-                    _grouped_mm_ramp_a(M, K2).unsqueeze(0) * float(e + 1)
+                    (_grouped_mm_ramp_a(M, K2) / E2).unsqueeze(0) * float(e + 1)
                     for e in range(E2)
                 ],
                 dim=0,
