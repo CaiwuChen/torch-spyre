@@ -397,14 +397,7 @@ def _cached_grouped_mm_offs(num_experts: int, total: int, seed: int = 500123):
 
 @functools.lru_cache(maxsize=None)
 def _grouped_mm_ramp_a(T: int, K: int, dtype=torch.bfloat16):
-    """Return a routing-sensitive mat_a [T, K] with distinguishable row values.
-
-    Each row t has a unique scale (t+1)/T, so any routing error (swapped,
-    dropped, or duplicated rows) produces outputs that differ by at least
-    1/T * sum-of-b-row >> atol.  The values are O(1), not O(1/sqrt(K)) as
-    with Xavier, so the output is O(K) >> 0.005 for K >= 16.
-    """
-    # row t: fill value (t+1)/T so rows are distinct and O(1)
+    """Return mat_a [T, K] where row t is filled with (t+1)/T."""
     scales = torch.arange(1, T + 1, dtype=torch.float32) / T  # [T]
     a = scales.unsqueeze(1).expand(T, K).to(dtype).contiguous()
     return a
@@ -415,6 +408,10 @@ def _grouped_mm_ones_b_scaled(shape, expert_scale: float = 1.0, dtype=torch.bflo
     """Return a mat_b filled with expert_scale/K so each output entry equals
     the input row's mean value.  Combined with _grouped_mm_ramp_a, output[t]
     is exactly (t+1)/T (in exact arithmetic), which is >> 0.005 for T>=2.
+
+    WARNING: every expert gets the same weight matrix, so routing errors
+    (wrong expert selected) go undetected.  Use _grouped_mm_distinct_b when
+    the test must validate expert ownership.
     """
     if len(shape) == 3:
         E, K, N = shape
@@ -423,6 +420,38 @@ def _grouped_mm_ones_b_scaled(shape, expert_scale: float = 1.0, dtype=torch.bflo
         K, N = shape
         val = expert_scale / K
     return torch.full(shape, val, dtype=dtype)
+
+
+@functools.lru_cache(maxsize=None)
+def _grouped_mm_distinct_b(E: int, K: int, N: int, dtype=torch.bfloat16):
+    """Return mat_b [E, K, N] where expert e has weight (e+1)/(K*E) per entry.
+
+    Combined with _grouped_mm_ramp_a(T, K), output[t] = (t+1)/T * (e+1)/E.
+    A wrong-expert assignment shifts the output by at least 1/E (for t > 0).
+    """
+    slabs = [
+        torch.full((1, K, N), float(e + 1) / (K * E), dtype=dtype) for e in range(E)
+    ]
+    return torch.cat(slabs, dim=0)
+
+
+@functools.lru_cache(maxsize=None)
+def _grouped_mm_distinct_b_2d(E: int, K_total: int, N: int, dtype=torch.bfloat16):
+    """Return mat_b [K_total, N] for 2D×2D grouped_mm where expert e's K-block
+    has weight (e+1)/(K_block*E) per entry (K_block = K_total // E).
+
+    Combined with _grouped_mm_ramp_a(M, K_total), output[m, n] = sum_e of
+    (m+1)/M * K_block * (e+1)/(K_block*E) = (m+1)/M * sum_e (e+1)/E.
+    Any K-block routing error (swapped or dropped expert blocks) shifts the
+    output by at least (m+1)/M * 1/E >= 1/(M*E) >> 0.005 for typical M, E.
+    """
+    assert K_total % E == 0, f"K_total={K_total} must be divisible by E={E}"
+    K_block = K_total // E
+    slabs = [
+        torch.full((K_block, N), float(e + 1) / (K_block * E), dtype=dtype)
+        for e in range(E)
+    ]
+    return torch.cat(slabs, dim=0)
 
 
 def _cached_to_dtype_input(shape, src):
@@ -6241,32 +6270,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "model_ops_case1": (
                     _grouped_mm_ramp_a(192, 2816),
-                    _grouped_mm_ones_b_scaled((128, 2816, 1408)),
+                    _grouped_mm_distinct_b(128, 2816, 1408),
                     _cached_grouped_mm_offs(128, 192),
                 ),
                 "model_ops_case2": (
                     _grouped_mm_ramp_a(192, 704),
-                    _grouped_mm_ones_b_scaled((128, 704, 2816)),
+                    _grouped_mm_distinct_b(128, 704, 2816),
                     _cached_grouped_mm_offs(128, 192),
                 ),
                 "large_batch_T4096": (
                     _grouped_mm_ramp_a(4096, 2816),
-                    _grouped_mm_ones_b_scaled((128, 2816, 1408)),
+                    _grouped_mm_distinct_b(128, 2816, 1408),
                     _cached_grouped_mm_offs(128, 4096),
                 ),
                 "large_batch_T8192": (
                     _grouped_mm_ramp_a(8192, 2816),
-                    _grouped_mm_ones_b_scaled((128, 2816, 1408)),
+                    _grouped_mm_distinct_b(128, 2816, 1408),
                     _cached_grouped_mm_offs(128, 8192),
                 ),
                 "small_tokens_T64_E16": (
                     _grouped_mm_ramp_a(64, 512),
-                    _grouped_mm_ones_b_scaled((16, 512, 256)),
+                    _grouped_mm_distinct_b(16, 512, 256),
                     _cached_grouped_mm_offs(16, 64),
                 ),
                 "skewed_dist_T128_E8": (
                     _grouped_mm_ramp_a(128, 256),
-                    _grouped_mm_ones_b_scaled((8, 256, 128)),
+                    _grouped_mm_distinct_b(8, 256, 128),
                     torch.cumsum(
                         torch.tensor([64, 32, 32, 0, 0, 0, 0, 0], dtype=torch.int32),
                         dim=0,
@@ -6275,17 +6304,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "uniform_1tok_per_expert_T32_E32": (
                     _grouped_mm_ramp_a(32, 256),
-                    _grouped_mm_ones_b_scaled((32, 256, 128)),
+                    _grouped_mm_distinct_b(32, 256, 128),
                     torch.arange(1, 33, dtype=torch.int32),
                 ),
                 "boundary_63_65_E3": (
                     _grouped_mm_ramp_a(128, 64),
-                    _grouped_mm_ones_b_scaled((3, 64, 32)),
+                    _grouped_mm_distinct_b(3, 64, 32),
                     torch.tensor([63, 128, 128], dtype=torch.int32),
                 ),
                 "all_tokens_one_expert_T128_E4": (
                     _grouped_mm_ramp_a(128, 64),
-                    _grouped_mm_ones_b_scaled((4, 64, 32)),
+                    _grouped_mm_distinct_b(4, 64, 32),
                     torch.tensor([128, 128, 128, 128], dtype=torch.int32),
                 ),
                 "3d_x_2d_E4": (
@@ -6303,9 +6332,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         dtype=torch.int32,
                     ),
                 ),
+                # 2D×2D: mat_b uses distinct K-block weights so routing errors
+                # (swapped expert K-blocks) shift outputs by >=1/(M*E)>>0.005.
                 "2d_x_2d_E4": (
                     _grouped_mm_ramp_a(16, 64),
-                    _grouped_mm_ones_b_scaled((64, 32)),
+                    _grouped_mm_distinct_b_2d(4, 64, 32),
                     torch.cumsum(
                         torch.tensor([16, 16, 16, 16], dtype=torch.int32),
                         dim=0,
@@ -6314,15 +6345,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "3d_x_3d_no_offs_E8_M32": (
                     torch.stack([_grouped_mm_ramp_a(32, 256) for _ in range(8)]),
-                    _grouped_mm_ones_b_scaled((8, 256, 128)),
+                    _grouped_mm_distinct_b(8, 256, 128),
                     None,
                 ),
                 "3d_x_3d_no_offs_E64_M16": (
                     torch.stack([_grouped_mm_ramp_a(16, 512) for _ in range(64)]),
-                    _grouped_mm_ones_b_scaled((64, 512, 256)),
+                    _grouped_mm_distinct_b(64, 512, 256),
                     None,
                 ),
+                # Overflow case: T=192, E=4 → capacity=128.
+                # offs gives expert 0 exactly 129 tokens (one above capacity).
+                # The compiled path raises RuntimeError from the overflow guard
+                # in compute_grouped_mm_routing_tables, so this case is
+                # expected to fail until multi-tile overflow support is added.
+                "overflow_2d3d_T192_E4": (
+                    _grouped_mm_ramp_a(192, 32),
+                    _grouped_mm_distinct_b(4, 32, 16),
+                    torch.tensor([129, 192, 192, 192], dtype=torch.int32),
+                ),
             },
+            "expect_fail": [
+                # capacity=128 for T=192/E=4; expert 0 has 129 tokens → overflow
+                # guard raises RuntimeError.  Remove once multi-tile is supported.
+                "overflow_2d3d_T192_E4",
+            ],
         },
     }
 
@@ -9447,94 +9493,212 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_grouped_mm_different_offs(self):
-        """Compiled grouped_mm with two different offset tensors.
+        """Single compiled callable with changing offsets crossing multiple distributions.
 
-        t_max is derived from offs values at decomposition time (inside
-        Inductor lowering).  Each distinct t_max requires a separate
-        compilation; compare_with_cpu resets the cache between calls so both
-        routings are verified independently.
+        Compiles fn once and retains the callable across multiple runs without
+        resetting the Dynamo/FX cache:
+          1. offs_dist1 — uniform distribution [32, 64, 96, 128]
+          2. offs_dist2 — highly skewed distribution [65, 96, 112, 128] (expert 0 > 64)
+          3. offs_dist3 — empty expert distribution [64, 128, 128, 128]
+          4. offs_dist4 — another skewed distribution [10, 20, 30, 128]
+
+        Uses _grouped_mm_distinct_b so wrong-expert assignment is detected.
+
+        Capacity is computed purely from the static input shapes T and E, not from
+        the runtime offsets.  For T=128 and E=4, capacity is always 128, so all four
+        distributions land in the same compiled graph with zero recompilation.
+        A capacity change only occurs when T or E changes (i.e., the input tensor
+        shapes change), which triggers standard Dynamo recompilation under
+        dynamic=False — the same as any other shape change.
         """
-        T, E, K, N = 64, 4, 32, 16
+        E, K, N = 4, 32, 16
+        T = 128
+        mat_b = _grouped_mm_distinct_b(E, K, N)
         mat_a = _grouped_mm_ramp_a(T, K)
-        mat_b = _grouped_mm_ones_b_scaled((E, K, N))
 
-        offs_uniform = torch.tensor([16, 32, 48, 64], dtype=torch.int32)
-        offs_skewed = torch.tensor([32, 48, 56, 64], dtype=torch.int32)
+        offs_dist1 = torch.tensor([32, 64, 96, 128], dtype=torch.int32)
+        offs_dist2 = torch.tensor([65, 96, 112, 128], dtype=torch.int32)
+        offs_dist3 = torch.tensor([64, 128, 128, 128], dtype=torch.int32)
+        offs_dist4 = torch.tensor([10, 20, 30, 128], dtype=torch.int32)
 
         def fn(a, b, o):
             return torch._grouped_mm(a, b, offs=o)
 
-        for offs in (offs_uniform, offs_skewed):
-            self.compare_with_cpu(
-                fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
-            )
+        torch._dynamo.reset_code_caches()
+        torch._inductor.codecache.FxGraphCache.clear()
+        torch._dynamo.utils.counters.clear()
+        compiled_fn = torch.compile(fn, backend="inductor", dynamic=False)
+        device = torch.device("spyre")
+
+        for offs in (offs_dist1, offs_dist2, offs_dist3, offs_dist4):
+            cpu_ref = fn(mat_a, mat_b, offs)
+            spyre_out = compiled_fn(
+                mat_a.to(device), mat_b.to(device), offs.to(device)
+            ).cpu()
+            torch.testing.assert_close(spyre_out, cpu_ref, atol=0.005, rtol=0.005)
+
+        # All four distributions share the same T/E/K/N shapes, so capacity is
+        # identical across all calls.  Exactly one unique graph should be compiled.
+        unique_graphs = torch._dynamo.utils.counters["stats"].get("unique_graphs", 0)
+        assert unique_graphs == 1, (
+            f"Expected 1 compiled graph for same-shape offs variations, got {unique_graphs}"
+        )
 
     def test_grouped_mm_routing_invariant(self):
-        """Verify src_indices[dst_indices[t]] == t for every real token.
+        """Verify routing-table invariants using the production custom op directly.
 
-        Directly checks the index tables by reimplementing the routing logic
-        in plain Python (mirroring customops.compute_grouped_mm_routing_tables),
-        then also verifies numerically via the full grouped_mm output.
+        Calls torch.ops.spyre.compute_grouped_mm_routing_tables and checks:
+          1. src_indices[dst_indices[t]] == t for every real token
+          2. Every padding slot points to total_tokens (the zero-row index)
+          3. dst_indices values are in [0, E * capacity)
+          4. src_indices values are in [0, total_tokens]
+
+        Uses uneven groups (counts 30/65/0/33), which includes an empty expert
+        and a segment of 65 tokens crossing the 64-element block boundary.
+        Uses _grouped_mm_distinct_b to catch wrong-expert selection.
         """
-        import math
+        import torch_spyre  # noqa: F401 — registers spyre custom ops
 
+        # uneven: expert 0=30, expert 1=65 (crosses block boundary), 2=empty, 3=33
         T, E, K, N = 128, 4, 64, 32
-        offs = torch.tensor([32, 64, 96, 128], dtype=torch.int32)
+        counts = torch.tensor([30, 65, 0, 33], dtype=torch.int32)
+        offs = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        assert int(offs[-1]) == T
 
-        # --- Direct index-table invariant ---
-        offs_list = offs.tolist()
-        counts = [offs_list[0]] + [offs_list[i] - offs_list[i - 1] for i in range(1, E)]
-        max_count = max(counts)
-        t_max = math.ceil(max_count / 64) * 64
+        tokens_per_expert = (T + E - 1) // E
+        capacity = max(64, min(T, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2)))
 
-        # Reproduce the routing table in plain Python.
-        src = [T] * (E * t_max)  # default: zero-padding row
-        dst = [0] * T
-        start = 0
-        for e, end in enumerate(offs_list):
-            count = end - start
-            for i in range(count):
-                slot = e * t_max + i
-                src[slot] = start + i
-                dst[start + i] = slot
-            start = end
+        # --- call the production custom op ---
+        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+            offs, T, E, capacity
+        )
+        src = src_indices.tolist()
+        dst = dst_indices.tolist()
 
-        # src[dst[t]] == t for every real token
+        assert len(src) == E * capacity, f"src length {len(src)} != {E * capacity}"
+        assert len(dst) == T, f"dst length {len(dst)} != {T}"
+
+        # (1) inverse mapping
         for t in range(T):
-            slot = dst[t]
-            assert src[slot] == t, (
-                f"routing invariant broken at token {t}: "
-                f"dst[{t}]={slot}, src[{slot}]={src[slot]} (expected {t})"
+            assert src[dst[t]] == t, (
+                f"src[dst[{t}]]={src[dst[t]]}, expected {t} (dst[{t}]={dst[t]})"
             )
 
-        # Every padding slot must point to T (the zero row).
+        # (2) padding slots → T
+        counts_list = counts.tolist()
         for e in range(E):
-            for s in range(counts[e], t_max):
-                slot = e * t_max + s
+            for s in range(counts_list[e], capacity):
+                slot = e * capacity + s
                 assert src[slot] == T, (
-                    f"padding slot {slot} (expert {e}, pos {s}) not zero-row: "
-                    f"src[{slot}]={src[slot]}"
+                    f"padding slot {slot} (expert {e} pos {s}) = {src[slot]}, expected dummy index {T}"
                 )
 
-        # --- Numerical invariant via full grouped_mm ---
+        # (3) dst in range
+        for t in range(T):
+            assert 0 <= dst[t] < E * capacity, (
+                f"dst[{t}]={dst[t]} out of [0, {E * capacity})"
+            )
+
+        # (4) src in range [0, T]
+        for i, v in enumerate(src):
+            assert 0 <= v <= T, f"src[{i}]={v} out of [0, {T}]"
+
+        # --- expert-ownership numerical check ---
         mat_a = _grouped_mm_ramp_a(T, K)
-        mat_b = _grouped_mm_ones_b_scaled((E, K, N))
+        mat_b = _grouped_mm_distinct_b(E, K, N)
 
         def fn(a, b, o):
             return torch._grouped_mm(a, b, offs=o)
 
-        ref = fn(mat_a, mat_b, offs)
-        for t in range(T):
-            expected = float(t + 1) / T
-            actual = float(ref[t, 0])
-            assert abs(actual - expected) < 0.005, (
-                f"numerical invariant broken at token {t}: "
-                f"expected {expected:.4f}, got {actual:.4f}"
-            )
+        cpu_ref = fn(mat_a, mat_b, offs)
+        offs_list = offs.tolist()
+        start = 0
+        for e in range(E):
+            end = offs_list[e]
+            for t in range(start, end):
+                expected = float(t + 1) / T * float(e + 1) / E
+                actual = float(cpu_ref[t, 0])
+                assert abs(actual - expected) < 0.005, (
+                    f"expert {e} token {t}: expected {expected:.4f} got {actual:.4f}"
+                )
+            start = end
 
-        # Also run on Spyre compiled path.
         self.compare_with_cpu(
             fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
+        )
+
+    def test_grouped_mm_fullgraph(self):
+        """All three ragged grouped_mm variants compile with fullgraph=True.
+
+        fullgraph=True raises immediately on any graph break, proving that
+        the decomposition is traceable end-to-end without data-dependent
+        .item() calls on offs.  offs is a graph input, not a constant.
+        """
+        device = torch.device("spyre")
+
+        def _run(fn, *cpu_args):
+            torch._dynamo.reset_code_caches()
+            torch._inductor.codecache.FxGraphCache.clear()
+            compiled = torch.compile(
+                fn, backend="inductor", dynamic=False, fullgraph=True
+            )
+            dev_args = [
+                a.to(device) if isinstance(a, torch.Tensor) else a for a in cpu_args
+            ]
+            spyre_out = compiled(*dev_args).cpu()
+            torch.testing.assert_close(fn(*cpu_args), spyre_out, atol=0.005, rtol=0.005)
+
+        # 2D×3D
+        T, E, K, N = 64, 4, 32, 16
+        offs_2d3d = torch.tensor([16, 32, 48, 64], dtype=torch.int32)
+
+        def fn_2d3d(a, b, o):
+            return torch._grouped_mm(a, b, offs=o)
+
+        _run(
+            fn_2d3d,
+            _grouped_mm_ramp_a(T, K),
+            _grouped_mm_distinct_b(E, K, N),
+            offs_2d3d,
+        )
+
+        # 3D×2D
+        E2, M, K2, T2 = 4, 8, 32, 32
+        offs_3d2d = torch.cumsum(
+            torch.tensor([8, 8, 8, 8], dtype=torch.int32), dim=0, dtype=torch.int32
+        )
+
+        def fn_3d2d(a, b, o):
+            return torch._grouped_mm(a, b, offs=o)
+
+        _run(
+            fn_3d2d,
+            torch.cat(
+                [
+                    _grouped_mm_ramp_a(M, K2).unsqueeze(0) * float(e + 1)
+                    for e in range(E2)
+                ],
+                dim=0,
+            ),
+            _grouped_mm_ones_b_scaled((K2, T2)),
+            offs_3d2d,
+        )
+
+        # 2D×2D: use distinct K-block weights so any K-block routing error
+        # (swapped expert slices) is detectable (shifts output by >=1/(M*E)).
+        M2, K_total, N2, E3 = 8, 64, 16, 4
+        offs_2d2d = torch.cumsum(
+            torch.tensor([16, 16, 16, 16], dtype=torch.int32), dim=0, dtype=torch.int32
+        )
+
+        def fn_2d2d(a, b, o):
+            return torch._grouped_mm(a, b, offs=o)
+
+        _run(
+            fn_2d2d,
+            _grouped_mm_ramp_a(M2, K_total),
+            _grouped_mm_distinct_b_2d(E3, K_total, N2),
+            offs_2d2d,
         )
 
 

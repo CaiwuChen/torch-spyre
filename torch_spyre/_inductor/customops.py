@@ -1351,44 +1351,50 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::compute_grouped_mm_routing_tables",
     mutates_args=(),
-    device_types="spyre",
 )
 def compute_grouped_mm_routing_tables(
     offs: torch.Tensor,
     total_tokens: int,
     num_experts: int,
-    t_max: int,
+    capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute lightweight index tables on CPU for on-device direct bmm grouped_mm.
+    """Compute index tables on CPU for the on-device pack/BMM/unpack grouped_mm path.
 
-    t_max must be >= the longest expert segment in offs; the caller
-    (decompositions._grouped_mm_t_max) is responsible for computing it and
-    passing it here.  Every row/reduction term is mapped; no segment is
-    truncated.
+    capacity is passed in by the decomposition (computed from static input shapes),
+    so the real kernel and register_fake always agree on output shapes without any
+    data-dependent computation here.
 
     Returns:
-      src_indices: [num_experts * t_max], int32 — maps each slot in padded_a
-                   [E, t_max, K] to a row in mat_a, or to total_tokens for
-                   zero-padding slots.
-      dst_indices: [total_tokens], int32 — maps each output token to its row
-                   in flat padded_out [E * t_max, ...].
+      src_indices: [num_experts * capacity], int32 — maps each slot in padded_a
+                   [num_experts, capacity, K] to a row in mat_a, or to total_tokens
+                   (the appended zero-row) for padding slots.
+      dst_indices: [total_tokens], int32 — maps each output token to its position
+                   in flat padded_out [num_experts * capacity, N].
     """
-    offs_cpu = offs.to("cpu", dtype=torch.int32).tolist()
-    dummy_zero_row = total_tokens
+    offs_cpu = offs.to("cpu", dtype=torch.int32)
+    offs_list = offs_cpu.tolist()
 
-    src_indices = torch.full((num_experts * t_max,), dummy_zero_row, dtype=torch.int32)
+    src_indices = torch.full((num_experts * capacity,), total_tokens, dtype=torch.int32)
     dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
 
     start = 0
     for e in range(num_experts):
-        end = offs_cpu[e]
+        end = offs_list[e]
         count = end - start
-        if count > 0:
-            slot_start = e * t_max
-            src_indices[slot_start : slot_start + count] = torch.arange(
-                start, end, dtype=torch.int32
+        if count > capacity:
+            # TODO: support overflow via multiple tiles per expert so that
+            # arbitrarily skewed distributions work without raising here.
+            raise RuntimeError(
+                f"compute_grouped_mm_routing_tables: expert {e} has {count} tokens "
+                f"but capacity={capacity}.  "
+                f"(total_tokens={total_tokens}, num_experts={num_experts})"
             )
-            dst_indices[start:end] = torch.arange(
+        if count > 0:
+            slot_start = e * capacity
+            src_indices[slot_start : slot_start + count] = torch.arange(
+                start, start + count, dtype=torch.int32
+            )
+            dst_indices[start : start + count] = torch.arange(
                 slot_start, slot_start + count, dtype=torch.int32
             )
         start = end
@@ -1404,10 +1410,10 @@ def _(
     offs: torch.Tensor,
     total_tokens: int,
     num_experts: int,
-    t_max: int,
+    capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return (
-        torch.empty(num_experts * t_max, dtype=torch.int32, device=offs.device),
+        torch.empty(num_experts * capacity, dtype=torch.int32, device=offs.device),
         torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
     )
 
