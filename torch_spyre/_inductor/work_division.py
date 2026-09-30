@@ -1032,8 +1032,21 @@ def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
     return dim_to_split
 
 
-def _has_work_div_hint(op: ComputedBuffer) -> bool:
+def has_work_div_hint(op: ComputedBuffer) -> bool:
     return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
+
+
+def has_resolved_work_div_hint(op: ComputedBuffer) -> bool:
+    """Whether ``work_distribution_pass`` commits ``op``'s division from its hint.
+
+    ``spyre_hint`` annotates every node in its scope, so an op can carry a
+    ``work_div`` hint naming none of its dims; that op gets a default split.
+    """
+    return (
+        isinstance(op.data, (Pointwise, Reduction))
+        and has_work_div_hint(op)
+        and _resolve_work_div_hint(op, iteration_space_from_op(op)) is not None
+    )
 
 
 def _resolve_work_div_hint(
@@ -1429,22 +1442,33 @@ def work_distribution_pass(
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
+def _minmax(sympy_fn, builtin_fn, args, kwargs):
+    """Shared body of :func:`max` / :func:`min`.
+
+    Accepts both the variadic (``max(a, b)``) and single-iterable
+    (``max([a, b])``) forms. Dispatches to ``sympy_fn`` when any value is a
+    sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
+    otherwise defers to ``builtin_fn``, which also handles ``default``."""
+    if len(args) == 1:
+        values = args[0]
+    else:
+        values = args
+    if "key" not in kwargs and any(isinstance(a, sympy.Basic) for a in values):
+        return sympy_fn(*values)
+    return builtin_fn(*args, **kwargs)
+
+
 def max(*args, **kwargs):
     """``max``, but symbolic-aware: dispatches to ``sympy.Max`` when an arg is
     a sympy expression (whose truth-valued comparisons the builtin can't
     resolve), otherwise defers to the builtin -- including its ``key``/
-    ``default`` kwargs and single-iterable form, neither of which ``sympy.Max``
-    supports."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Max(*args)
-    return builtins.max(*args, **kwargs)
+    ``default`` kwargs. Both ``max(a, b)`` and ``max([a, b])`` are supported."""
+    return _minmax(sympy.Max, builtins.max, args, kwargs)
 
 
 def min(*args, **kwargs):
     """``min`` counterpart of :func:`max`; see its docstring."""
-    if any(isinstance(a, sympy.Basic) for a in args):
-        return sympy.Min(*args)
-    return builtins.min(*args, **kwargs)
+    return _minmax(sympy.Min, builtins.min, args, kwargs)
 
 
 def log2(arg):
@@ -1471,10 +1495,20 @@ def piecewise(*args):
     raise ValueError("piecewise(...) requires a catch-all True branch")
 
 
+def isinf(value) -> bool:
+    """``math.isinf``, symbolic-aware: ``True`` for a float infinity
+    or a sympy expression sympy can *decide* is infinite (``oo``, ``zoo``),
+    ``False`` for a finite value or an expression whose finiteness is
+    undecidable (``is_infinite`` is ``None``, e.g. a cost over symbolic splits)."""
+    if isinstance(value, sympy.Basic):
+        return value.is_infinite is True
+    return math.isinf(value)
+
+
 _PT_ROWS = 8  # PT block rows per corelet
 
-# Constants for the matmul cost model (_matmul_split_cost). Each is either an
-# AIU hardware limit or a coefficient fit to measured device kernel times.
+# Constants shared by the execution estimate and standalone split ranking.
+# Additive ranking preferences below are not whole-program operation latencies.
 _TARGET_PT_PASSES = 5  # per-core M that keeps the PT pipeline full = this * _PT_ROWS
 _TARGET_M_TIE_PASSES = 4  # enough M lanes to keep the stationary weights fed
 _PT_EFFICIENCY_EXPONENT = 0.25
@@ -1482,6 +1516,7 @@ _M_MIN = _PT_ROWS // 2  # below half a PT pass an m-split buys nothing
 _PEAK_MACS_US_CORE = (98.304e12 / 2 / 32) / 1e6  # DL16 peak / 32 cores, MACs/us/core
 _HBM_BW_GBS = 204.8  # LPDDR5 aggregate peak bandwidth
 _DTYPE_BYTES = 2  # fp16
+_STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
 _PSUM_PER_CORE_ELEM_US = 1.0e-3
 _BMM_PSUM_PER_CORE_ELEM_US = 1.0e-4
 _COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
@@ -1501,7 +1536,28 @@ _SHARED_NARROW_OUTPUT_REF = _TARGET_N_TILE_ELEMS * _COHORT_LIMIT
 _SHARED_N_TILE_TARGET = _TARGET_N_TILE_ELEMS // 4
 
 
-def _matmul_split_cost(
+def _matmul_multicast_penalty(consumers):
+    """Existing bandwidth derate for cores sharing one operand load.
+
+    Symbolic degrees are integer products bounded by the configured core
+    budget. Tabulate that finite domain: fractional symbolic powers cannot
+    be passed directly to CP-SAT. Numeric callers use the same formula.
+    """
+    if isinstance(consumers, sympy.Basic) and consumers.free_symbols:
+        return sympy.Piecewise(
+            *(
+                (
+                    (degree / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT,
+                    sympy.Eq(consumers, degree),
+                )
+                for degree in range(_COHORT_LIMIT + 1, config.sencores + 1)
+            ),
+            (1.0, True),
+        )
+    return max(1.0, (consumers / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT)
+
+
+def _matmul_execution_cost(
     b_axis: tuple[int, int],
     m_axis: tuple[int, int],
     n_axis: tuple[int, int],
@@ -1509,6 +1565,8 @@ def _matmul_split_cost(
     max_cores: int,
     shared_weight: bool = False,
     include_hbm: bool = True,
+    operand_bytes: float = _DTYPE_BYTES,
+    output_bytes: float = _DTYPE_BYTES,
 ) -> float:
     """Estimated kernel time in microseconds for ``[B,M,K]@[B,K,N]`` run with
     the given core split. Each axis is a ``(size, split)`` pair so a dim's size
@@ -1517,16 +1575,20 @@ def _matmul_split_cost(
     ``include_hbm=False`` drops the operand/output HBM-traffic term for a caller
     that charges that traffic itself (``cost_model._matmul_ns_upstream``, whose
     bundle memory term counts the same bytes and knows about LX residency). The
-    cohort bandwidth penalty scales only that term, so it drops out with it.
+    sharing penalty drops out of this function with that term. ``predict_ops``
+    charges shared-input delivery separately, using each operand's consumers.
+
+    Array underfill remains an efficiency factor on computation. Standalone
+    split-ranking preferences belong to ``_matmul_split_cost``, not this estimate.
+
+    ``operand_bytes``/``output_bytes`` are bytes-per-element, derived by the
+    caller from the real tensors' own ``elems_per_stick()``. Default to
+    ``_DTYPE_BYTES`` (fp16) when unset (issue #4465).
     """
     (B, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
     cores_used = b * m * n * k
-    # SYMBOLIC SPLITS SKIP THE BUDGET CHECK (`isinstance` is False for a sympy
-    # expression), and the fall-through cost is not merely mispriced but NEGATIVE
-    # outside the budget -- what a minimizing objective seeks. Valid only within
-    # `max_cores`, therefore, and it is the CALLER that has to hold that: the symbolic
-    # expression is built over one enumerated CoreDivision per op, which
-    # `CoOptimizingAllocator._division_map` asserts is within budget (issue #4387).
+    # Symbolic splits rely on the caller's enumerated candidate menu to enforce
+    # the core budget; a symbolic expression cannot take this Python branch.
     if cores_used == 0 or (isinstance(cores_used, int) and cores_used > max_cores):
         return math.inf
 
@@ -1544,18 +1606,24 @@ def _matmul_split_cost(
             True,
         ),
     )
+    # The peak includes both corelets. DXP's doCoreletSplitSdsc leaves an op
+    # requiring cross-core reduction on one corelet, so a K-split has half
+    # that compute throughput. This is separate from moving the partial sums.
+    # Keep the existing unsplit estimate; small/unaligned output tiles may
+    # also prevent the backend from using both corelets.
     compute_us = pt_eff_inv * (num_elems / cores_used) / _PEAK_MACS_US_CORE
+    compute_us = piecewise((2 * compute_us, k > 1), (compute_us, True))
 
     # HBM: every input operand is broadcast to the cohort of cores splitting the
     # orthogonal dim. Past _COHORT_LIMIT the broadcasts contend for the shared
     # link, so effective bandwidth falls off linearly with cohort size.
     if include_hbm:
         weight_batches = 1 if shared_weight else B
-        bytes_total = (B * M * K + weight_batches * K * N + B * M * N) * _DTYPE_BYTES
+        bytes_total = (
+            B * M * K + weight_batches * K * N
+        ) * operand_bytes + B * M * N * output_bytes
         fanout_split = max(m, n) if shared_weight else n
-        cohort_penalty = max(
-            1.0, (fanout_split / _COHORT_LIMIT) ** _COHORT_PENALTY_EXPONENT
-        )
+        cohort_penalty = _matmul_multicast_penalty(fanout_split)
         hbm_us = bytes_total / (_HBM_BW_GBS * 1000) * cohort_penalty
     else:
         hbm_us = 0.0
@@ -1567,8 +1635,47 @@ def _matmul_split_cost(
     output_elems_per_core = (B * M * N) / (b * m * n)
     psum_us = max(0, k - 1) * output_elems_per_core * psum_coeff
 
+    return compute_us + hbm_us + psum_us
+
+
+def _matmul_split_cost(
+    b_axis: tuple[int, int],
+    m_axis: tuple[int, int],
+    n_axis: tuple[int, int],
+    k_axis: tuple[int, int],
+    max_cores: int,
+    shared_weight: bool = False,
+    include_hbm: bool = True,
+    operand_bytes: float = _DTYPE_BYTES,
+    output_bytes: float = _DTYPE_BYTES,
+) -> float:
+    """Standalone split-ranking score: execution estimate plus preferences.
+
+    The additive preferences preserve this chooser's existing behavior. They
+    are not operation latencies for a whole-program optimizer to sum.
+
+    ``operand_bytes``/``output_bytes`` pass straight through to
+    ``_matmul_execution_cost`` (issue #4465).
+    """
+    execution_us = _matmul_execution_cost(
+        b_axis,
+        m_axis,
+        n_axis,
+        k_axis,
+        max_cores,
+        shared_weight,
+        include_hbm,
+        operand_bytes,
+        output_bytes,
+    )
+    if isinf(execution_us):
+        return execution_us
+    (_, b), (M, m), (N, n), (K, k) = b_axis, m_axis, n_axis, k_axis
+    cores_used = b * m * n * k
+    m_t = M // m if m else 1
+
     # Tie-break: among compute-equivalent splits prefer exposing enough M lanes
-    # to stream work over the stationary weight tile. PT efficiency above handles
+    # to stream work over the stationary weight tile. The execution estimate handles
     # the opposite case where an M split makes each per-core tile too short.
     target_m = max(
         _M_MIN,
@@ -1634,9 +1741,7 @@ def _matmul_split_cost(
     batch_split_us = 0.0 if shared_weight else log2(b) * _BMM_BATCH_SPLIT_PENALTY_US
 
     return (
-        compute_us
-        + hbm_us
-        + psum_us
+        execution_us
         + m_lane_underuse_us
         + m_tile_underfill_us
         + wide_n_us
@@ -1753,8 +1858,19 @@ def _cost_model_matmul_planner(
     k_dim = reduction[0]
 
     # The iteration space measures N and K in sticks; the cost model wants real
-    # elements so its byte and MAC counts are physical.
-    elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
+    # elements so its byte and MAC counts are physical. BATCH_MATMUL_FP8_OP's
+    # output is FP16 (64 elems/stick) while N/K count FP8 sticks (128), so
+    # source elems_per_stick from the QFP8WT weight input instead (issue #4466).
+    if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
+        fp8_weight_td = next(
+            td
+            for td in input_tds
+            if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+        )
+        fp8_device_dtype = fp8_weight_td.layout.device_layout.device_dtype
+        elems_per_stick = fp8_device_dtype.elems_per_stick()
+    else:
+        elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
     M_e = concretize_expr(it_space_adjusted[m_dim])
     n_sticks = concretize_expr(it_space_adjusted[n_dim])
     k_sticks = concretize_expr(it_space_adjusted[k_dim])
@@ -1786,6 +1902,16 @@ def _cost_model_matmul_planner(
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
+    # Bytes-per-element for the HBM term, derived from the real operand/output
+    # tensors via elems_per_stick() and the fixed 128-byte HW stick size,
+    # rather than assumed as one flat constant (issue #4465).
+    operand_bytes = (
+        _STICK_BYTES / input_tds[0].layout.device_layout.device_dtype.elems_per_stick()
+    )
+    output_bytes = (
+        _STICK_BYTES / output_td.layout.device_layout.device_dtype.elems_per_stick()
+    )
+
     best = None
     best_cost = math.inf
     for b_combo in b_combos:
@@ -1802,6 +1928,8 @@ def _cost_model_matmul_planner(
                         (K_e, kk),
                         max_cores,
                         shared_weight=rhs_loaded_once,
+                        operand_bytes=operand_bytes,
+                        output_bytes=output_bytes,
                     )
                     if c < best_cost:
                         best_cost = c
@@ -1822,12 +1950,18 @@ def _cost_model_matmul_planner(
     if math.prod(new_splits.values()) < math.prod(splits.values()):
         if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
-        # For QFP8WT, force k_dim = 1 regardless of core count
+        # For QFP8WT, force k_dim = 1 regardless of core count.
+        # n_dim is left as the cost model's chosen n_s; any legal divisor of
+        # n_sticks is safe because N is always a multiple of 128 (one FP8
+        # stick), so size = N // n_split = 128 * (n_sticks // n_split) is
+        # always a multiple of 64 — satisfying the hardware alignment
+        # requirement enforced at codegen time.
         new_splits[k_dim] = 1
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
-        f"b={b_combo} m={m_s} n={n_s} k={k_s} rhs_loaded_once={rhs_loaded_once} "
+        f"b={b_combo} m={m_s} n={new_splits[n_dim]} k={new_splits[k_dim]} "
+        f"rhs_loaded_once={rhs_loaded_once} "
         f"cost={best_cost:.1f}us "
         f"[B={B_total} M={M_e} K={K_e} N={N_e}]"
     )
@@ -1965,9 +2099,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
-    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+    if not config.ignore_work_division_hints and has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.
         return False
 
