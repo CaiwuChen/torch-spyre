@@ -575,7 +575,8 @@ class ParameterizedTestMeta(type):
                     if test_case in skip_list:
                         namespace[test_name] = pytest.mark.skip(
                             reason=f"Skipped for {test_case}"
-                    if test_case in device_fault:
+                        )(namespace[test_name])
+                    elif test_case in device_fault:
                         namespace[test_name] = pytest.mark.skip(
                             reason=f"Faults the device: {device_fault[test_case]}"
                         )(namespace[test_name])
