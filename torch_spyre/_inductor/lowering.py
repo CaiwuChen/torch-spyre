@@ -1994,6 +1994,23 @@ def _lower_cmp_impl(x, y, pointwise_fn):
     _cmp_operand_dtype deliberately does not -- see its docstring.
     """
     tensors = [v for v in (x, y) if hasattr(v, "get_dtype")]
+
+    # A 0-dim integer predicate compared against a Python int (e.g. a
+    # while_loop / for_each_tile cond ``iter < N``) keeps Inductor's stock
+    # form unchanged.  Such a predicate is pattern-matched by the WhileLoop
+    # lowering (_extract_trip_count in wsr/for_each_tile_lowering.py), which
+    # expects exactly one ``load(iter) < constant(int N)`` op in the cond
+    # graph.  The int -> float cast below would insert a second op and coerce
+    # N to float, breaking both checks and causing silently wrong loop counts.
+    dtypes = {t.get_dtype() for t in tensors}
+    if (
+        len(dtypes) == 1
+        and not next(iter(dtypes)).is_floating_point
+        and all(len(t.get_size()) == 0 for t in tensors)
+        and all(isinstance(v, int) for v in (x, y) if not hasattr(v, "get_dtype"))
+    ):
+        return pointwise_fn(x, y)
+
     operand_dtype = _cmp_operand_dtype(tensors)
 
     def convert(v):
