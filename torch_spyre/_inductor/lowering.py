@@ -25,6 +25,7 @@ import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -1110,22 +1111,55 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    operands = [torch.empty(0, dtype=x.get_dtype())]
+    if min is not None:
+        operands.append(
+            torch.empty(0, dtype=min.get_dtype()) if hasattr(min, "get_dtype") else min
+        )
+    if max is not None:
+        operands.append(
+            torch.empty(0, dtype=max.get_dtype()) if hasattr(max, "get_dtype") else max
+        )
+
+    result_dtype, _ = elementwise_dtypes(
+        *operands,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.NO_OPMATH,
+    )
+
+    _, val_dtype = elementwise_dtypes(
+        *operands,
+        type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    )
+
+    converted_x = x if x.get_dtype() == val_dtype else to_dtype(x, val_dtype)
+
     if min is None:
-        min = torch.finfo(torch.float16).min
+        min_val = torch.finfo(val_dtype).min
+    else:
+        min_val = float(min)
+
     if max is None:
-        max = torch.finfo(torch.float16).max
+        max_val = torch.finfo(val_dtype).max
+    else:
+        max_val = float(max)
+
     pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
+        device=converted_x.get_device(),
+        dtype=val_dtype,
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
-            x.make_loader()(index), min, max
+            converted_x.make_loader()(index), min_val, max_val
         ),
-        ranges=x.get_size(),
+        ranges=converted_x.get_size(),
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
     )
     pw.realize()
-    return pw
+
+    result = pw
+    if result_dtype != val_dtype:
+        result = to_dtype(result, result_dtype)
+
+    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.keep_by_index)

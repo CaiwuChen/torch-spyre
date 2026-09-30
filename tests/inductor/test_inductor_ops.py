@@ -533,6 +533,48 @@ SCALED_MM_TESTS = {
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
+CLAMP_DTYPES = [torch.float16, torch.float32, torch.int32, torch.int64]
+
+
+def _make_clamp_param_set(in_dt, min_dt, max_dt):
+    shape = (16, 64)
+    # Generate input tensor
+    if in_dt.is_floating_point:
+        x = cached_randn(shape, dtype=in_dt, scale=10.0)
+    else:
+        x = _cached_randint(shape, in_dt)
+
+    # Generate min/max values or scalars based on dtype
+    if min_dt.is_floating_point:
+        min_val = -2.0 if in_dt.is_floating_point else 10.0
+    else:
+        min_val = 10
+
+    if max_dt.is_floating_point:
+        max_val = 2.0 if in_dt.is_floating_point else 100.0
+    else:
+        max_val = 100
+
+    # Determine eps based on floating precision
+    if in_dt == torch.float16 or min_dt == torch.float16 or max_dt == torch.float16:
+        err = FP16_EPS
+    elif in_dt == torch.float32 or min_dt == torch.float32 or max_dt == torch.float32:
+        err = FP32_EPS
+    else:
+        err = 0.0
+
+    return (x, min_val, max_val, err)
+
+
+CLAMP_64_PARAM_SETS = {
+    f"{_dtype_name(in_dt)}_{_dtype_name(min_dt)}_{_dtype_name(max_dt)}": _make_clamp_param_set(
+        in_dt, min_dt, max_dt
+    )
+    for in_dt in CLAMP_DTYPES
+    for min_dt in CLAMP_DTYPES
+    for max_dt in CLAMP_DTYPES
+}
+
 # DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
 # finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)  # 0x7FFE, ~8.573e9
@@ -2150,14 +2192,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "ops_dict": {
                 "clamp": torch.clamp,
             },
-            "param_sets": {
-                "fp16": (
-                    cached_randn((128, 256), dtype=torch.float16),
-                    0.1,
-                    0.9,
-                    FP16_EPS,
-                ),
-            },
+            "param_sets": CLAMP_64_PARAM_SETS,
         },
         (
             "test_activation_cls",
