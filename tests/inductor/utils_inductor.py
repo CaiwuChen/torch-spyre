@@ -504,6 +504,8 @@ class ParameterizedTestMeta(type):
             param_sets = cases["param_sets"]
             expect_fail = cases.get("expect_fail", [])
             skip_list = cases.get("skip", [])
+            # {case: reason}: an xfail still runs on the card, so a case that faults it is skipped.
+            device_fault = cases.get("device_fault", {})
 
             for test_case, params in param_sets.items():
                 if ops_dict:
@@ -573,6 +575,9 @@ class ParameterizedTestMeta(type):
                     if test_case in skip_list:
                         namespace[test_name] = pytest.mark.skip(
                             reason=f"Skipped for {test_case}"
+                    if test_case in device_fault:
+                        namespace[test_name] = pytest.mark.skip(
+                            reason=f"Faults the device: {device_fault[test_case]}"
                         )(namespace[test_name])
                     elif test_case in expect_fail:
                         namespace[test_name] = pytest.mark.xfail(
