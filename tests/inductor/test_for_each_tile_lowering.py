@@ -700,6 +700,8 @@ def _find_while_loop_ir_op_with_spyre_cmp_lowerings(fn, args):
     while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
     assert len(while_ops) == 1, f"expected exactly one WhileLoop, got {len(while_ops)}"
     return while_ops[0]
+
+
 class TestCarryRealInputOwnership(unittest.TestCase):
     """The in-place-guard predicate on real IR buffers (no device)."""
 
