@@ -25,7 +25,6 @@ import torch
 import torch._inductor.ir as ir
 import torch._inductor.lowering as lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND, elementwise_dtypes
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -204,16 +203,6 @@ def enable_spyre_lowerings():
                     ]
                 lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
 
-            # Build adapters that call your Spyre lowering
-            def _impl_lower_aten_clamp(x, min=None, max=None):
-                return lower_clamp(x, min=min, max=max)
-
-            def _impl_lower_aten_clamp_min(x, min):
-                return lower_clamp(x, min=min, max=None)
-
-            def _impl_lower_aten_clamp_max(x, max):
-                return lower_clamp(x, min=None, max=max)
-
             # Collect overload handles
             clamp_ovs = [
                 getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
@@ -224,16 +213,50 @@ def enable_spyre_lowerings():
             # Save originals and patch — keep references in function attribute
             saved = {}
 
-            def _save_set(ov, fn):
-                if ov is None:
-                    return
+            # Capture stock Inductor lowerings before overwriting them, so the
+            # adapters below can fall back to them for host-side (CPU) tensors.
+            # (Same pattern as _register_cmp_lowerings captures stock_tensor /
+            # stock_scalar before enable_spyre_lowerings() installs its overlay.)
+            all_clamp_ovs = [
+                ov for ov in clamp_ovs + [clamp_min_ov, clamp_max_ov] if ov is not None
+            ]
+            for ov in all_clamp_ovs:
                 saved[ov] = lowering.lowerings.get(ov)
-                lowering.lowerings[ov] = fn
+
+            def _make_clamp_adapter(stock_key, spyre_fn):
+                """Route to stock Inductor for CPU tensors, Spyre lowering otherwise."""
+
+                def _adapter(*args, **kwargs):
+                    x = args[0] if args else kwargs.get("x")
+                    if x is not None and hasattr(x, "get_device"):
+                        if x.get_device().type != DEVICE_NAME:
+                            stock = saved.get(stock_key)
+                            if stock is not None:
+                                return stock(*args, **kwargs)
+                    return spyre_fn(*args, **kwargs)
+
+                return _adapter
+
+            def _spyre_clamp(x, min=None, max=None):
+                return lower_clamp(x, min=min, max=max)
+
+            def _spyre_clamp_min(x, min):
+                return lower_clamp(x, min=min, max=None)
+
+            def _spyre_clamp_max(x, max):
+                return lower_clamp(x, min=None, max=max)
 
             for ov in clamp_ovs:
-                _save_set(ov, _impl_lower_aten_clamp)
-            _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
-            _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
+                if ov is not None:
+                    lowering.lowerings[ov] = _make_clamp_adapter(ov, _spyre_clamp)
+            if clamp_min_ov is not None:
+                lowering.lowerings[clamp_min_ov] = _make_clamp_adapter(
+                    clamp_min_ov, _spyre_clamp_min
+                )
+            if clamp_max_ov is not None:
+                lowering.lowerings[clamp_max_ov] = _make_clamp_adapter(
+                    clamp_max_ov, _spyre_clamp_max
+                )
 
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
@@ -1824,6 +1847,14 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
 
     if src_dtype == dst_dtype:
         return lowering.clone(x)
+
+    # Host-side (CPU) tensors must use the stock Inductor to_dtype regardless
+    # of DtypeOpTable: spyre::to_dtype_cpu is registered with device_types="spyre"
+    # and dispatching it on a CPU tensor raises NotImplementedError.
+    if hasattr(x, "get_device") and x.get_device().type != DEVICE_NAME:
+        return lowering.to_dtype(
+            x, dst_dtype, copy=True, use_compute_types=use_compute_types
+        )
 
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
