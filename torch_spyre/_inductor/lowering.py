@@ -1848,14 +1848,6 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
     if src_dtype == dst_dtype:
         return lowering.clone(x)
 
-    # Host-side (CPU) tensors must use the stock Inductor to_dtype regardless
-    # of DtypeOpTable: spyre::to_dtype_cpu is registered with device_types="spyre"
-    # and dispatching it on a CPU tensor raises NotImplementedError.
-    if hasattr(x, "get_device") and x.get_device().type != DEVICE_NAME:
-        return lowering.to_dtype(
-            x, dst_dtype, copy=True, use_compute_types=use_compute_types
-        )
-
     # Check if conversion is supported by backend
     if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
