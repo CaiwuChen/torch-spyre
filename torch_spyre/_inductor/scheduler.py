@@ -533,6 +533,17 @@ def verify_carried_reduction_ownership(
 
 
 class SuperDSCScheduling(BaseScheduling):
+    """Inductor scheduling backend for Spyre.
+
+    Inductor's own node-pairwise fusion (`can_fuse_vertical`/
+    `can_fuse_horizontal` below) is permanently disabled, not merely
+    unimplemented. Spyre does its own op-to-kernel grouping in a later,
+    separate stage: `spyre_fuse_nodes` in `fusion.py` bundles
+    `BaseSchedulerNode`s into `SuperDSCBundle`s, and each bundle maps
+    one-to-one to a `SpyreKernel` device launch. See
+    `docs/source/compiler/inductor_frontend.md` for the full pipeline.
+    """
+
     def group_fn(self, sizes):
         """
         Process the iteration sizes in case a transformation needs to be applied.
@@ -559,18 +570,20 @@ class SuperDSCScheduling(BaseScheduling):
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be vertically fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def can_fuse_horizontal(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         """
-        Check whether node1 and node2 can be horizontally fused or not.
+        Always False: Inductor-level fusion is disabled by design. Spyre's
+        real op-to-kernel grouping happens later, in `spyre_fuse_nodes`
+        (see the class docstring above).
         """
-        # TODO: Revisit this as part of https://github.com/torch-spyre/torch-spyre/issues/826
         return False
 
     def generate_node_schedule(self, nodes: Sequence[BaseSchedulerNode]):
@@ -628,8 +641,14 @@ class SuperDSCScheduling(BaseScheduling):
         ``kernel.failed_node`` names the operation whose description could not
         be finalized; the kernel itself is not usable afterwards.
         """
+        nodes = self._live_nodes(node)
+        # Before any spec is built, which is what this method goes on to do:
+        # create_tensor_arg reads this to decide whether a buffer is kernel-local.
+        # _codegen_into_kernel may reach further inner nodes, so the set can be a
+        # subset -- which errs towards declining.
+        kernel.fused_node_names = OrderedSet(n.get_name() for n in nodes)
         with kernel:
-            self._codegen_into_kernel(self._live_nodes(node), kernel)
+            self._codegen_into_kernel(nodes, kernel)
         if isinstance(node, CountedLoopSchedulerNode):
             kernel.wrap_op_specs_in_loop(node.loop_count)
         kernel.check_op_specs()
@@ -659,6 +678,7 @@ class SuperDSCScheduling(BaseScheduling):
         all_schedule_nodes = kernel.scheduled_nodes
 
         kernel.pool_size = getattr(V.graph, "hbm_pool_sizes", {}).get(name, 0)
+
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
         kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)

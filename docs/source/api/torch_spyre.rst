@@ -407,7 +407,7 @@ transpose. For ``nn.Embedding`` layers, tables get a gather-optimal
 "indirect access" layout (vocab dim outermost) because they are read as a
 gather rather than a matmul.
 
-.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
+.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None, use_fp8_weights=False)
 
    Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
    weights use a dimension-swapped layout (``dim_order=[1, 0]``);
@@ -416,11 +416,22 @@ gather rather than a matmul.
    use the default layout. Idempotent: parameters already on Spyre are
    skipped.
 
+   When *use_fp8_weights* is ``True``, ``nn.Linear`` weights that are already
+   ``torch.float8_e4m3fn`` are loaded directly into KERNEL layout with 2D stick
+   ``[2, 64]`` and ``ElementArrangement.QFP8WT``, bypassing any runtime
+   quantization step. Non-FP8 parameters are transferred with their normal
+   optimal layouts regardless of this flag.
+
    :param model: The model to transfer.
    :type model: torch.nn.Module
-   :param dtype: Target dtype on Spyre (default: the parameter's existing
-       dtype).
+   :param dtype: Target dtype for non-FP8 weight conversion (default: the
+       parameter's existing dtype). Ignored for FP8 weights when
+       *use_fp8_weights* is ``True``.
    :type dtype: torch.dtype or None
+   :param use_fp8_weights: If ``True``, ``torch.float8_e4m3fn`` Linear weights
+       are loaded with KERNEL layout and ``QFP8WT`` arrangement. Use this for
+       pre-quantized FP8 model checkpoints.
+   :type use_fp8_weights: bool
    :returns: The model with all parameters on Spyre.
    :rtype: torch.nn.Module
 
@@ -432,6 +443,33 @@ gather rather than a matmul.
 
       model = MyModel()
       load_model_to_spyre(model)
+      compiled = torch.compile(model)
+
+.. function:: torch_spyre.model_utils.load_fp8_model_to_spyre(model)
+
+   Convenience wrapper around :func:`load_model_to_spyre` for models whose
+   ``nn.Linear`` weights are already quantized to ``torch.float8_e4m3fn``.
+   Each FP8 weight is DMA'd directly into KERNEL layout with 2D stick ``[2, 64]``
+   and ``ElementArrangement.QFP8WT``, so ``_scaled_mm`` can consume it without
+   any runtime quantization overhead.
+
+   Non-FP8 parameters (biases, layer norms, embeddings) are transferred with
+   their normal optimal layouts.
+
+   :param model: The pre-quantized FP8 model to transfer.
+   :type model: torch.nn.Module
+   :returns: The model with all parameters on Spyre.
+   :rtype: torch.nn.Module
+
+   Example:
+
+   .. code-block:: python
+
+      from transformers import AutoModelForCausalLM
+      from torch_spyre.model_utils import load_fp8_model_to_spyre
+
+      model = AutoModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-8b-instruct-fp8")
+      model = load_fp8_model_to_spyre(model)
       compiled = torch.compile(model)
 
 .. function:: torch_spyre.model_utils.patch_module_to_for_spyre()
@@ -674,8 +712,18 @@ Environment Variables
    * - ``LX_PLANNING``
      - Enable LX scratchpad planning (default ``1``; set ``0`` to skip the
        ``scratchpad_planning`` pass)
+   * - ``SPYRE_LX_PLANNER_RELAYOUT``
+     - Enable certified LX-to-LX movement, exact fused-axis views,
+       consumer-compatible producer ordering and same-core restickify
+       residency (default ``1``). Set ``0`` to disable these optional
+       optimizations; ownership and capacity checks remain active. Allocator
+       selection and the LX budget are unchanged. Unsupported ownership or
+       insufficient space still uses HBM.
    * - ``CO_OPTIMIZING_LX_PLANNING``
-     - Use the co-optimizing LX allocator strategy (default ``0``)
+     - Use the co-optimizing LX allocator strategy (default ``1``)
+   * - ``CPSAT_TIME_LIMIT_SECONDS``
+     - Wall-clock budget for one CP-SAT solve (default ``30``; ``0``
+       disables the limit)
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
@@ -691,16 +739,36 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
+   * - ``TORCHINDUCTOR_COMPILE_THREADS``
+     - Number of Inductor compile workers. Independent backend kernels compile in
+       parallel when this is greater than ``1``; a value of ``1`` executes
+       compilation inline
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``cpsat`` (default),
        ``greedy``, ``bestfit``, ``firstfit``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
+   * - ``ALLOW_EXHAUSTIVE_SEARCH``
+     - Allow ``CO_OPTIMIZING_LX_PLANNING`` to fall back to
+       ``ExhaustiveSearchSolver`` (an expensive DFS over core-division
+       candidates) when ``LAYOUT_SOLVER`` names a solver that is not
+       natively core-division-capable -- ``greedy``, ``bestfit``,
+       ``firstfit``, or ``cpsat`` without ``ortools`` installed (default
+       ``0``; without this set, that combination raises ``ValueError``
+       instead). See :doc:`/compiler/scratchpad_planning`
    * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
      - Enable reduction tiling in the pre-scheduling pipeline (default
        ``1``)
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``TORCH_SPYRE_TIMING``
+     - Record structured per-compile frontend timings: one JSON event per
+       pass pipeline and per pass, with input/output graph sizes
+       (default ``0``)
+   * - ``TORCH_SPYRE_TIMING_OUT``
+     - Destination for the ``TORCH_SPYRE_TIMING`` record. The pid is
+       inserted before the suffix, so ``rec.json`` is written as
+       ``rec.<pid>.json``. Empty writes nothing (default empty)
    * - ``SPYRE_DUMP_COST``
      - Print the predicted-runtime report after pre-scheduling: one total
        plus a per-kernel breakdown (default ``0``).
@@ -747,6 +815,34 @@ Environment Variables
    * - ``KTIR_DEVICE_MLIR``
      - Path to a ``.mlir`` file declaring the target device for the KTIR
        execution path (default empty)
+   * - ``ENABLE_LX_CONTEXT_SWITCHING``
+     - Bracket opaque ``FallbackKernel`` calls that have no native Spyre
+       lowering with per-buffer LX dump and restore clones, so LX-resident
+       buffers survive the call (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE``
+     - Number of destination views the CP-SAT relayout enumeration keeps per
+       (source, consumer) edge, cheapest first (default ``4``; ``0`` keeps
+       every view)
+   * - ``SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES``
+     - For unpriced CP-SAT solves, skip presolve above this many relayout
+       copies (default ``0``, which disables the threshold)
+   * - ``SPYRE_READ_COPY_ELISION``
+     - Remove a proven-redundant read copy after LX planning; a failed proof
+       leaves the graph unchanged (default ``1``; set ``0`` to disable)
+   * - ``SPYRE_DUMP_COST_EXPR_FILE``
+     - Append one JSON record per co-optimized graph with the symbolic cost
+       objective the solver minimizes, the chosen symbol values, and each
+       term evaluated under them (default empty)
+   * - ``SPYRE_DUMP_COST_FILE``
+     - Destination file for the ``SPYRE_DUMP_COST`` output. Empty writes to
+       stderr (default empty)
+   * - ``SPYRE_KERNEL_CACHE``
+     - Cache compiled Spyre kernels on disk and reuse them across
+       invocations (default ``0``; set ``1`` to enable)
+   * - ``SPYRE_NUM_CPUS``
+     - Override the CPU count CP-SAT uses to size its search worker pool.
+       When unset the count is derived from the cgroup v2 quota, then
+       ``psutil``, then ``os.cpu_count()``
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

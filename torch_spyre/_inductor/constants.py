@@ -125,19 +125,19 @@ SEGMENT_OFFSETS = [
 ]
 
 INTERMEDIATES_SEGMENT = 0x0
-SEGMENT_SIZE = 0x400000000
+MAX_REGION_SIZE = 0x400000000
 
 # The intermediates pool must leave headroom below the full segment size --
 # 2 GiB is reserved for other segment-7 consumers (e.g. kernel-address/dim
 # symbol bookkeeping), so the pool itself may never grow to claim the whole
 # segment.
-MAX_POOL_SIZE_BYTES = SEGMENT_SIZE - 2 * 1024**3
+MAX_POOL_SIZE_BYTES = MAX_REGION_SIZE - 2 * 1024**3
 
 SPYRE_FP32_OPS = [
     "add",
     "sub",
     "mul",
-    "where",
+    "where3",
     "realdiv",
     "relufwd",
     "reciprocal",
@@ -209,6 +209,12 @@ SPYRE_FP8_OPS = {
     "batchmatmulfp8",  # FP8 bmm (inputs: FP8)
     "qfp8wt",  # FP8 quantization (output: FP8)
 }
+
+# Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
+# Used consistently in both compute_ops._layout_info_for_tensor and
+# superdsc._create_sdsc_tensors to gate device-size flattening and
+# 2D-stick metadata restoration.
+FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 
 TOPK_OPS = {"topkvalue", "topkindex"}
 _MAX_K_PER_CORE = 4

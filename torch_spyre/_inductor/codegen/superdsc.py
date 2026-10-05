@@ -152,6 +152,7 @@ class SDSCSpec:
     input_coord_padding: dict = dataclasses.field(default_factory=dict)
     input_coord_sizes: dict = dataclasses.field(default_factory=dict)
     emit_memorg_padding: bool = False
+    completed_producer_cores: tuple[int, ...] = ()
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -286,7 +287,29 @@ def _get_coordinate_mask(
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
-    mask_pointwise = op in _POINTWISE_PADDING_MASK_VALUE
+    #
+    # SAMV coordinate masking is limited to <=16-bit element types by the
+    # backend compiler ("Coordinate masking is supported only up to 16bit
+    # element types"), so the pointwise padding mask cannot be emitted for FP32.
+    # Skipping it is what lets unaligned FP32 `exp` compile at all.
+    #
+    # Risk: the padded lanes of an unaligned FP32 `exp` output hold
+    # `exp(uninitialized)`, so any consumer that ITERATES the padded extent may
+    # produce unexpected results -- a contraction does, since it reads the whole
+    # stick as an operand. Note a restickify also iterates the padded extent and
+    # emits no mask, so the values are relocated rather than dropped; they stay
+    # harmless only as long as the eventual consumer iterates the logical extent.
+    # Known use cases do not hit this limitation:
+    #   * SDPA (softmax -> matmul, the consumer the mask was added for, #3248)
+    #     runs in fp16, where the mask is still applied.
+    #   * The Gemma-4 MoE router (softmax with dtype=torch.float32 -> topk) uses
+    #     stick-aligned tensors, so there are no padded lanes to begin with.
+    # Revisit if either assumption changes. See #3799 (SAMV masking for exp) and
+    # #3290 (padded-stick-state layout enum, the principled replacement for this
+    # bandage).
+    mask_pointwise = (
+        op in _POINTWISE_PADDING_MASK_VALUE and arg.data_format != DataFormats.IEEE_FP32
+    )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
@@ -308,10 +331,10 @@ def _unambiguous_physical_axis(
     Coarse tiling can leave a constant physical axis in ``device_size`` after
     its loop role has moved to a ``LoopSpec``. Positional alignment between
     the remaining logical dimensions and physical axes is then invalid. A
-    non-stick dimension with one coordinate dependency still has an
-    unambiguous physical axis, which is authoritative for its extent and
-    stride. Factorized dimensions intentionally return ``None`` here and keep
-    the established positional handling.
+    dimension carried by one non-lane coordinate still has an unambiguous
+    physical axis, which is authoritative for its extent and stride.
+    Dimensions factorized across multiple non-lane coordinates return
+    ``None`` here and keep the established positional handling.
     """
     positions = [
         index
@@ -819,8 +842,9 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
     # which the pipeline squeezes out (so its label was already dropped by
     # _align_pool_dim_labels).  Such an axis is a plain pass-through: emitting a
     # paddingSizes_/windowDim_ entry for it would reference a dim the SDSC no
-    # longer has, and dxp_standalone aborts with "Missing window size for padded
-    # size calculation".  So skip any axis whose window dim is absent.
+    # longer has, which the backend rejects -- dxp_standalone aborted with
+    # "Missing window size for padded size calculation".  So skip any axis whose
+    # window dim is absent.
     axes = [
         ("i", "ki", kH, sH, pH),
         ("j", "kj", kW, sW, pW),
@@ -1208,8 +1232,6 @@ def _create_sdsc_tensors(
     matmul_n_dim = injected_dims.get("matmul_n_dim")
 
     for i, arg in enumerate(op_spec.args):
-        is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
-
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1308,11 +1330,12 @@ def _create_sdsc_tensors(
             # appear in x's layout with scale=-1 (reduced_dim).
             #
             # M=1 (coarse-tiling GEMV): N leaks into x's physical dep index,
-            # so x_dim_order already contains y_stick (N).  DXP computes x's
-            # reuse dim by set-subtraction (KERNEL - INPUT); if N is in both,
-            # the result is empty and DXP asserts inp0_reuse_dim.size() == 1.
-            # Strip N from x's layout so INPUT stays K-only and DXP correctly
-            # identifies N as x's broadcast dim.
+            # so x_dim_order already contains y_stick (N).  The backend
+            # computes x's reuse dim by set-subtraction (KERNEL - INPUT); if N is
+            # in both, the result is empty and the backend asserts
+            # inp0_reuse_dim.size() == 1.  Strip N from x's layout so INPUT stays
+            # K-only and the backend correctly identifies N as x's broadcast
+            # dim.
             # Partition matmul_x_reuse_dims into two mutually exclusive,
             # exhaustive subsets based on membership in x's current dim_order.
             x_dim_order_set = set(dim_order)
@@ -1347,13 +1370,16 @@ def _create_sdsc_tensors(
 
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
-            if dim is not stick_dim:
-                # A tiled-away loop role may survive as a constant physical
-                # axis. Locate every other role by coordinate identity so the
-                # constant slot cannot shift an outer role onto the wrong
-                # device extent (notably Hkv in native GQA with D=128).
-                physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
-            else:
+            # A tiled-away loop role may survive as a constant physical axis.
+            # Locate live roles by coordinate identity so that slot cannot
+            # shift an outer role onto the wrong device extent.
+            physical_axis = _unambiguous_physical_axis(arg, dim, symbol_mapping)
+            if dim is stick_dim and physical_axis not in gap_factor_by_inner_axis:
+                # Keep the positional handling for ordinary stick dimensions.
+                # When a tiled-away axis precedes the stick's block axis,
+                # however, include its gap just as for a non-stick dimension:
+                # [Hkv, G, D/64, D%64] with G tiled to one still has a G*D
+                # stride between heads, even if one core handles several heads.
                 physical_axis = None
 
             if has_indirect_access and (
@@ -1537,10 +1563,16 @@ def _create_sdsc_tensors(
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for FP8 matmul KERNEL tensor
+        # Special handling for QFP8WT KERNEL tensors.
+        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
+        # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
+        # tensor as input but uses a 1D flat FP8 input.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if is_fp8_mm_kernel_arg:
+        if arg.element_arrangement == ElementArrangement.QFP8WT and op_spec.op in (
+            "batchmatmulfp8",
+            "qfp8wt",
+        ):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # Use the last two dimensions from dim_order for 2D stick
@@ -1870,6 +1902,7 @@ def _finalize_tensor_work_divisions(
     core_map: dict[Symbol, Expr],
     num_cores: int,
     is_lx_relayout: bool,
+    completed_producer_cores: tuple[int, ...],
 ) -> None:
     """Give every tensor one effective ownership after SDSC normalization."""
 
@@ -1881,7 +1914,7 @@ def _finalize_tensor_work_divisions(
     assert is_lx_relayout or all(arg.work_division is None for arg in args), (
         "per-tensor ownership is supported only for LX relayout identities"
     )
-    for arg in args:
+    for index, arg in enumerate(args):
         override = arg.work_division
         # A relayout tensor can override the operation-wide split on selected
         # dimensions; unsplit dimensions inherit one slice owned by core zero.
@@ -1897,12 +1930,19 @@ def _finalize_tensor_work_divisions(
                 num_cores=override.num_cores or num_cores,
             )
         )
+        active_core_ids = (
+            completed_producer_cores
+            if completed_producer_cores and index == 0
+            else None
+        )
         tensor_cores = effective.num_cores or num_cores
         tensor_owners = math.prod(effective.work_slices.values())
         valid = (
             tensor_cores == num_cores == tensor_owners
             if not is_lx_relayout
-            else num_cores % tensor_cores == 0 and tensor_cores % tensor_owners == 0
+            else num_cores % tensor_cores == 0
+            and tensor_cores % tensor_owners == 0
+            and (active_core_ids is None or tensor_owners == len(active_core_ids))
         )
         if not valid:
             raise ValueError(
@@ -2429,6 +2469,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         core_id_to_work_slice,
         num_cores,
         is_relayout,
+        op_spec.completed_producer_cores,
     )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
@@ -2476,6 +2517,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
+            completed_producer_cores=op_spec.completed_producer_cores,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.
