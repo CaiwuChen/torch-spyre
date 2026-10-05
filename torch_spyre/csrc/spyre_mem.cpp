@@ -384,70 +384,79 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * SpyreTensorLayout.
  *
  * DL16_TO_FP32 (device fp32, stick = 32 elems, sticks come in pairs):
- *   host col = blk * 64 + 2 * e + a      with device stick j = 2 * blk + a
- * FP32_TO_DL16 (device fp16, stick = 64 elems):
- *   host col (within stick) = a * 32 + i    with device position p = 2 * i + a
+ *   host col = blk * 64 + q * 8 + a * 4 + r
+ *   device stick j = 2 * blk + a, position e = q * 4 + r      (r < 4, q < 8)
+ * FP32_TO_DL16 (device fp16, stick = 64 elems), by symmetry (UNVERIFIED):
+ *   host col (in stick) = a * 32 + q * 4 + r
+ *   device position p = q * 8 + a * 4 + r                     (r < 4, a < 2)
  */
 void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
                 const SpyreTensorLayout& stl) {
+  constexpr int kGroup = 4;
   const ElementArrangement ea = stl.element_arrangement;
   TORCH_CHECK(
       ea == ElementArrangement::DL16_TO_FP32 ||
           ea == ElementArrangement::FP32_TO_DL16,
       "Not a staggered element arrangement: ", elementArrangementToString(ea));
-  const int64_t eps = stl.elems_per_stick();
-  TORCH_CHECK(eps > 0 && eps % 2 == 0, "Unsupported stick size ", eps,
-              " for element arrangement ", elementArrangementToString(ea));
-  const int64_t half = eps / 2;
+  const int eps = stl.elems_per_stick();
+  TORCH_CHECK(eps > 0 && eps % (2 * kGroup) == 0, "Unsupported stick size ",
+              eps, " for element arrangement ", elementArrangementToString(ea));
 
   for (auto& d : dcsis) {
     TORCH_CHECK(d.size_.size() == stl.stride_map.size(),
                 "Unexpected DCI rank for element arrangement restoration");
-    // Dimension 0 is the element-within-stick dimension (innermost first).
-    const int64_t src_e = d.stride_src_[0];
-    const int64_t dst_e = d.stride_dst_[0];
     TORCH_CHECK(d.size_[0] == eps, elementArrangementToString(ea),
                 " D2H requires full sticks (", eps,
                 " elements), got a partial stick of ", d.size_[0]);
+    // Dimension 0 is the element-within-stick dimension (innermost first).
+    const int src_e = d.stride_src_[0];
+    const int dst_e = d.stride_dst_[0];
 
-    if (ea == ElementArrangement::FP32_TO_DL16) {
-      // e (64) -> i (32, src stride 2, dst stride dst_e)
-      //         x a (2,  src stride 1, dst stride 32 * dst_e)
-      d.size_[0] = half;
-      d.stride_src_[0] = 2 * src_e;
-      d.stride_dst_[0] = dst_e;
-      d.size_.insert(d.size_.begin() + 1, 2);
-      d.stride_src_.insert(d.stride_src_.begin() + 1, src_e);
-      d.stride_dst_.insert(d.stride_dst_.begin() + 1, half * dst_e);
-    } else {
-      // Locate the stick-index dimension: the non-trivial device dimension
-      // whose host stride is one stick of the element dimension.
-      int found = -1;
+    // Locate the stick-index dimension (DL16_TO_FP32 only): the non-trivial
+    // device dimension whose host stride is one stick of the element dim.
+    int stick_dim = -1;
+    if (ea == ElementArrangement::DL16_TO_FP32) {
       for (size_t k = 1; k < d.size_.size(); k++) {
         if (d.size_[k] > 1 && d.stride_dst_[k] == eps * dst_e) {
-          TORCH_CHECK(found < 0,
+          TORCH_CHECK(stick_dim < 0,
                       "Ambiguous stick dimension for DL16_TO_FP32 D2H");
-          found = static_cast<int>(k);
+          stick_dim = static_cast<int>(k);
         }
       }
-      TORCH_CHECK(found > 0 && d.size_[found] % 2 == 0,
+      TORCH_CHECK(stick_dim > 0 && d.size_[stick_dim] % 2 == 0,
                   "DL16_TO_FP32 D2H requires an even number of sticks along "
                   "the stick dimension");
-      const size_t k = static_cast<size_t>(found);
-      const int64_t sticks = d.size_[k];
-      const int64_t src_s = d.stride_src_[k];
-
-      // e: host stride doubles
-      d.stride_dst_[0] = 2 * dst_e;
-      // stick s -> blk (sticks / 2, src 2 * src_s, dst 2 * eps * dst_e)
-      //            x a (2, src src_s, dst dst_e)
-      d.size_[k] = sticks / 2;
-      d.stride_src_[k] = 2 * src_s;
-      d.stride_dst_[k] = 2 * eps * dst_e;
-      d.size_.insert(d.size_.begin() + k, 2);
-      d.stride_src_.insert(d.stride_src_.begin() + k, src_s);
-      d.stride_dst_.insert(d.stride_dst_.begin() + k, dst_e);
     }
+
+    std::vector<int64_t> size, src, dst;
+    auto emit = [&](int64_t sz, int64_t ss, int64_t sd) {
+      size.push_back(sz);
+      src.push_back(ss);
+      dst.push_back(sd);
+    };
+
+    for (size_t k = 0; k < d.size_.size(); k++) {
+      if (k == 0) {
+        if (ea == ElementArrangement::DL16_TO_FP32) {
+          emit(kGroup, src_e, dst_e);                              // r
+          emit(eps / kGroup, kGroup * src_e, 2 * kGroup * dst_e);  // q
+        } else {
+          emit(kGroup, src_e, dst_e);                  // r
+          emit(2, kGroup * src_e, (eps / 2) * dst_e);  // a
+          emit(eps / (2 * kGroup), 2 * kGroup * src_e,
+               kGroup * dst_e);  // q
+        }
+      } else if (static_cast<int>(k) == stick_dim) {
+        const int64_t src_s = d.stride_src_[k];
+        emit(2, src_s, kGroup * dst_e);                    // a
+        emit(d.size_[k] / 2, 2 * src_s, 2 * eps * dst_e);  // blk
+      } else {
+        emit(d.size_[k], d.stride_src_[k], d.stride_dst_[k]);
+      }
+    }
+    d.size_ = std::move(size);
+    d.stride_src_ = std::move(src);
+    d.stride_dst_ = std::move(dst);
   }
 }
 
