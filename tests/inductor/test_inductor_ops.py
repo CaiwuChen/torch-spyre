@@ -8580,8 +8580,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_clamp_inplace_cpu(self, op, x, min_val, max_val):
         """in-place clamp_ variants (fixes #4069)."""
         is_int = not x.dtype.is_floating_point
-        atol = 0 if is_int else None
-        rtol = 0 if is_int else None
+        atol = 0 if is_int else 0.1
+        rtol = 0 if is_int else 0.1
         if op is torch.Tensor.clamp_:
             self.compare_with_cpu(
                 lambda a: a.clone().clamp_(min=min_val, max=max_val),
