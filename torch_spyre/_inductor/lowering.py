@@ -165,8 +165,8 @@ def register_fallback_over_decomp(fallback_ops):
     return added
 
 
-# Overload names for aten.clamp
-_CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
+# Note: aten.clamp decomposes upstream into clamp_min + clamp_max,
+# so only clamp_min and clamp_max reach lowering.
 
 
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
@@ -204,9 +204,6 @@ def enable_spyre_lowerings():
                 lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
 
             # Collect overload handles
-            clamp_ovs = [
-                getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
-            ]
             clamp_min_ov = getattr(torch.ops.aten.clamp_min, "default", None)
             clamp_max_ov = getattr(torch.ops.aten.clamp_max, "default", None)
 
@@ -218,7 +215,7 @@ def enable_spyre_lowerings():
             # (Same pattern as _register_cmp_lowerings captures stock_tensor /
             # stock_scalar before enable_spyre_lowerings() installs its overlay.)
             all_clamp_ovs = [
-                ov for ov in clamp_ovs + [clamp_min_ov, clamp_max_ov] if ov is not None
+                ov for ov in [clamp_min_ov, clamp_max_ov] if ov is not None
             ]
             for ov in all_clamp_ovs:
                 saved[ov] = lowering.lowerings.get(ov)
@@ -227,7 +224,8 @@ def enable_spyre_lowerings():
                 """Route to stock Inductor for CPU tensors, Spyre lowering otherwise."""
 
                 def _adapter(*args, **kwargs):
-                    x = args[0] if args else kwargs.get("x")
+                    # ATen uses "self" as the first positional argument name.
+                    x = args[0] if args else kwargs.get("self")
                     if x is not None and hasattr(x, "get_device"):
                         if x.get_device().type != DEVICE_NAME:
                             stock = saved.get(stock_key)
@@ -237,18 +235,12 @@ def enable_spyre_lowerings():
 
                 return _adapter
 
-            def _spyre_clamp(x, min=None, max=None):
-                return lower_clamp(x, min=min, max=max)
-
             def _spyre_clamp_min(x, min):
                 return lower_clamp(x, min=min, max=None)
 
             def _spyre_clamp_max(x, max):
                 return lower_clamp(x, min=None, max=max)
 
-            for ov in clamp_ovs:
-                if ov is not None:
-                    lowering.lowerings[ov] = _make_clamp_adapter(ov, _spyre_clamp)
             if clamp_min_ov is not None:
                 lowering.lowerings[clamp_min_ov] = _make_clamp_adapter(
                     clamp_min_ov, _spyre_clamp_min

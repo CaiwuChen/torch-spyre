@@ -533,7 +533,6 @@ SCALED_MM_TESTS = {
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
-
 # DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
 # finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
 DLFLOAT16_MAX = (1.0 + 510.0 / 512.0) * float(2**32)  # 0x7FFE, ~8.573e9
@@ -2929,6 +2928,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int64),
                     2000000000,
                     2000000001,
+                ),
+            },
+        },
+        ("test_clamp_inplace", "test_clamp_inplace_cpu"): {
+            "ops_dict": {
+                "clamp_": torch.Tensor.clamp_,
+                "clamp_min_": torch.Tensor.clamp_min_,
+                "clamp_max_": torch.Tensor.clamp_max_,
+            },
+            "param_sets": {
+                # fp32 in-place: basic device correctness
+                "fp32_256": (
+                    torch.randn(256, dtype=torch.float32) * 100.0,
+                    -10,
+                    10,
+                ),
+                # int32 in-place: stick-aligned
+                "int32_64": (
+                    torch.randint(0, 1000, (64,), dtype=torch.int32),
+                    0,
+                    127,
+                ),
+                # int64 in-place: Gemma MoE pattern (192 elements, int64)
+                "int64_192": (
+                    torch.randint(0, 1000, (192,), dtype=torch.int64),
+                    0,
+                    127,
                 ),
             },
         },
@@ -8396,58 +8422,95 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x, y: torch.where(cond_op(x, y), x, y), x, y, run_eager=False
         )
 
+    def _run_clamp_cpu(self, op, x, min_val, max_val, **kwargs):
+        """Shared body for all integer-clamp tests.
+
+        Integer results must be compared exactly (atol=0, rtol=0); the default
+        tolerance of 0.1 is far too loose — a clamp to 127 that returned 139
+        would still pass with 10% relative tolerance.
+        """
+        if op is torch.clamp:
+            self.compare_with_cpu(
+                lambda a: op(a, min=min_val, max=max_val),
+                x,
+                run_eager=False,
+                **kwargs,
+            )
+        elif op is torch.clamp_min:
+            self.compare_with_cpu(
+                lambda a: op(a, min=min_val), x, run_eager=False, **kwargs
+            )
+        elif op is torch.clamp_max:
+            self.compare_with_cpu(
+                lambda a: op(a, max=max_val), x, run_eager=False, **kwargs
+            )
+
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
     )
     def test_clamp_int64_cpu(self, op, x, min_val, max_val):
         """int64 clamp (int64->fp32 cast fallback, clamp compiled on device)."""
-        if op is torch.clamp:
-            self.compare_with_cpu(
-                lambda a: op(a, min=min_val, max=max_val), x, run_eager=False
-            )
-        elif op is torch.clamp_min:
-            self.compare_with_cpu(lambda a: op(a, min=min_val), x, run_eager=False)
-        elif op is torch.clamp_max:
-            self.compare_with_cpu(lambda a: op(a, max=max_val), x, run_eager=False)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
 
     def test_clamp_int32_cpu(self, op, x, min_val, max_val):
         """int32 clamp (int32->fp32 promotion inside lowering, fully on device)."""
-        if op is torch.clamp:
-            self.compare_with_cpu(
-                lambda a: op(a, min=min_val, max=max_val), x, run_eager=False
-            )
-        elif op is torch.clamp_min:
-            self.compare_with_cpu(lambda a: op(a, min=min_val), x, run_eager=False)
-        elif op is torch.clamp_max:
-            self.compare_with_cpu(lambda a: op(a, max=max_val), x, run_eager=False)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
     )
     def test_clamp_mixed_dtype_cpu(self, op, x, min_val, max_val):
-        """clamp with mixed dtype operands (tensor vs float/int scalars)."""
-        if op is torch.clamp:
-            self.compare_with_cpu(
-                lambda a: op(a, min=min_val, max=max_val), x, run_eager=False
-            )
-        elif op is torch.clamp_min:
-            self.compare_with_cpu(lambda a: op(a, min=min_val), x, run_eager=False)
-        elif op is torch.clamp_max:
-            self.compare_with_cpu(lambda a: op(a, max=max_val), x, run_eager=False)
+        """clamp with mixed dtype operands (tensor vs float/int scalars).
+
+        Integer-tensor cases (int32/int64) use exact tolerance; float-tensor
+        cases tolerate the fp16/fp32 rounding that happens on device.
+        """
+        if x.dtype.is_floating_point:
+            self._run_clamp_cpu(op, x, min_val, max_val)
+        else:
+            self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
     )
     def test_clamp_bigint_cpu(self, op, x, min_val, max_val):
-        """clamp on large integers around 2**24 float32 precision limits."""
-        if op is torch.clamp:
+        """clamp on large integers around 2**24 float32 precision limits.
+
+        Uses exact tolerance (atol=0, rtol=0) so that int→fp32 precision loss
+        is actually detected.  The *_2e9 param-sets are marked xfail because
+        the device really does collapse 2e9+1 → 2e9 after the cast.
+        """
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    def test_clamp_inplace_cpu(self, op, x, min_val, max_val):
+        """in-place clamp_ variants (fixes #4069)."""
+        is_int = not x.dtype.is_floating_point
+        atol = 0 if is_int else None
+        rtol = 0 if is_int else None
+        if op is torch.Tensor.clamp_:
             self.compare_with_cpu(
-                lambda a: op(a, min=min_val, max=max_val), x, run_eager=False
+                lambda a: a.clone().clamp_(min=min_val, max=max_val),
+                x,
+                run_eager=False,
+                atol=atol,
+                rtol=rtol,
             )
-        elif op is torch.clamp_min:
-            self.compare_with_cpu(lambda a: op(a, min=min_val), x, run_eager=False)
-        elif op is torch.clamp_max:
-            self.compare_with_cpu(lambda a: op(a, max=max_val), x, run_eager=False)
+        elif op is torch.Tensor.clamp_min_:
+            self.compare_with_cpu(
+                lambda a: a.clone().clamp_min_(min_val),
+                x,
+                run_eager=False,
+                atol=atol,
+                rtol=rtol,
+            )
+        elif op is torch.Tensor.clamp_max_:
+            self.compare_with_cpu(
+                lambda a: a.clone().clamp_max_(max_val),
+                x,
+                run_eager=False,
+                atol=atol,
+                rtol=rtol,
+            )
 
     def test_activation_cls(self, op, input, kwargs, err):
         # Spyre activation custom ops (e.g. spyre::gelu) have a pass-through
