@@ -2908,6 +2908,80 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # -----------------------------------------------------------------------
+        # fp16 / fp32 clamp: native float clamp across 1D/2D/3D/4D shapes.
+        # fp16 sticks are 64 elements wide; fp32 sticks are 32 elements wide.
+        # Shapes cover stick-aligned, non-aligned, and ragged inner dims.
+        # -----------------------------------------------------------------------
+        ("test_clamp_fp16_fp32", "test_clamp_fp16_fp32_cpu"): {
+            "ops_dict": {
+                "clamp": torch.clamp,
+                "clamp_min": torch.clamp_min,
+                "clamp_max": torch.clamp_max,
+            },
+            "param_sets": {
+                "fp16_1d_256": (
+                    cached_randn((256,), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_1d_44": (
+                    cached_randn((44,), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_2d_128x256": (
+                    cached_randn((128, 256), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_2d_7x44": (
+                    cached_randn((7, 44), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_3d_2x4x64": (
+                    cached_randn((2, 4, 64), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp16_4d_2x3x4x64": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float16),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_1d_256": (
+                    cached_randn((256,), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_1d_44": (
+                    cached_randn((44,), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_2d_128x256": (
+                    cached_randn((128, 256), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_2d_7x44": (
+                    cached_randn((7, 44), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_3d_2x4x64": (
+                    cached_randn((2, 4, 64), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+                "fp32_4d_2x3x4x64": (
+                    cached_randn((2, 3, 4, 64), dtype=torch.float32),
+                    0.1,
+                    0.9,
+                ),
+            },
+        },
+        # -----------------------------------------------------------------------
         # clamp bigint: large integers where int -> fp32 promotion may lose precision.
         # Below 2**24 (16.7M) every integer is exact in fp32.
         # Above 2**24, gaps between consecutive integers occur.
@@ -8486,6 +8560,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self._run_clamp_cpu(op, x, min_val, max_val)
         else:
             self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+
+    def test_clamp_fp16_fp32_cpu(self, op, x, min_val, max_val):
+        """fp16 and fp32 clamp across 1D/2D/3D/4D shapes (native float path)."""
+        self._run_clamp_cpu(op, x, min_val, max_val)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
