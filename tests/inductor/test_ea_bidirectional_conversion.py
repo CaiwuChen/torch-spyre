@@ -29,6 +29,14 @@ import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import DEVICE_NAME
+from utils_inductor import (
+    cached_randn,
+    shapes2key,
+)
+
+
+def _dtype_name(dt):
+    return str(dt).split(".")[-1]
 
 
 def _run(fn, *args, mode="compile"):
@@ -523,6 +531,94 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
 
     z32 = eager_to(y16, src_dev, torch.float32)
     assert_ea(z32, ea_of(src_dev))
+
+
+# ---------------------------------------------------------------------------
+# D2H EA restore
+# ---------------------------------------------------------------------------
+def _build_ea_d2h_tests():
+    stick_aligned_shapes = [
+        # 1D: stick-aligned
+        (64,),
+        (128,),
+        # 2D: stick-aligned
+        (4, 64),
+        (7, 128),
+        # 3D: stick-aligned
+        (2, 4, 64),
+        (3, 5, 128),
+        (4, 8, 128),
+        # 4D: stick-aligned
+        (2, 3, 4, 64),
+        (2, 3, 4, 128),
+        (2, 4, 8, 64),
+    ]
+
+    stick_unaligned_shapes = [
+        # 1D: non-stick-aligned
+        (44,),
+        (68,),
+        # 2D: non-stick-aligned / padded
+        (4, 16),
+        (4, 32),
+        (4, 68),
+        (7, 44),
+        # 3D: non-stick-aligned / padded
+        (2, 4, 44),
+        # 4D: non-stick-aligned / padded
+        (2, 3, 4, 44),
+    ]
+
+    params = {}
+
+    for fp16 in DtypeOpTable.fp16_types():
+        dt_name = _dtype_name(fp16)
+
+        # 1. Stick-aligned shapes (expected to pass)
+        for shape in stick_aligned_shapes:
+            key = f"{dt_name}_{shapes2key((shape,))}"
+            params[key] = (fp16, shape)
+
+        # 2. Non-stick-aligned shapes (marked as xfail)
+        for shape in stick_unaligned_shapes:
+            key = f"{dt_name}_{shapes2key((shape,))}"
+            params[key] = pytest.param(
+                fp16,
+                shape,
+                marks=pytest.mark.xfail(
+                    reason="D2H ea_restore requires full stick-aligned tensor dimensions",
+                    strict=True,
+                ),
+            )
+
+    return params
+
+
+EA_D2H_TEST_PARAMS = _build_ea_d2h_tests()
+
+
+@pytest.mark.parametrize(
+    "fp16, shape",
+    EA_D2H_TEST_PARAMS.values(),
+    ids=EA_D2H_TEST_PARAMS.keys(),
+)
+def test_ea_restore_d2h(fp16, shape):
+    # Scale and ceiling values to small integer steps to eliminate float rounding noise
+    raw_tensor = cached_randn(shape, dtype=torch.float32)
+    x16 = torch.ceil(raw_tensor * 5).to(dtype=fp16)
+    x = x16.to(DEVICE_NAME)
+
+    y = _run(lambda a: a.float(), x)
+    assert_ea(y, ElementArrangement.DL16_TO_FP32)
+
+    got = y.cpu()  # D2H -> ea_restore
+    ref = x16.float()
+
+    assert got.shape == ref.shape
+    assert torch.equal(got, ref)
+    assert torch.equal(
+        torch.sort(got.flatten()).values, torch.sort(ref.flatten()).values
+    )
 
 
 # Made with Bob

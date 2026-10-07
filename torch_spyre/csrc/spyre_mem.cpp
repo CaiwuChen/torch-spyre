@@ -899,9 +899,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device);
 
-    // A staggered element arrangement means the device elements are not in
-    // sequential order. On readback restore STANDARD order so the host sees
-    // the logical tensor, not a permutation (issue #4393).
+    // On D2H readback restore EA to STANDARD see issue #4393.
     if (!host2device &&
         (stl.element_arrangement == ElementArrangement::DL16_TO_FP32 ||
          stl.element_arrangement == ElementArrangement::FP32_TO_DL16)) {
