@@ -421,18 +421,19 @@ void check_dcsi_shape(const DataConversionStrideInfo& dcsi,
 // contiguous dimension: a non-trivial loop whose host stride is exactly one
 // stick of host elements.  Exactly one such loop must exist.
 size_t find_stick_dim(const DataConversionStrideInfo& dcsi,
-                      int64_t elems_per_stick) {
+                      int64_t elems_per_stick, const std::string& ea_name) {
   const int64_t host_stick_stride = elems_per_stick * dcsi.stride_dst_[0];
   int64_t stick_dim = -1;
   for (size_t k = 1; k < dcsi.size_.size(); k++) {
     if (dcsi.size_[k] > 1 && dcsi.stride_dst_[k] == host_stick_stride) {
-      TORCH_CHECK(stick_dim < 0,
-                  "Ambiguous stick dimension for DL16_TO_FP32 D2H");
+      TORCH_CHECK(stick_dim < 0, "Ambiguous stick dimension for ", ea_name,
+                  " D2H");
       stick_dim = static_cast<int64_t>(k);
     }
   }
   TORCH_CHECK(stick_dim > 0 && dcsi.size_[stick_dim] % kSticksPerPair == 0,
-              "DL16_TO_FP32 D2H requires an even number of sticks along "
+              ea_name,
+              " D2H requires an even number of sticks along "
               "the stick dimension");
   return static_cast<size_t>(stick_dim);
 }
@@ -441,12 +442,14 @@ StickLoopInfo analyze_dcsi(const DataConversionStrideInfo& dcsi,
                            const SpyreTensorLayout& stl) {
   const int64_t eps = stl.elems_per_stick();
   check_dcsi_shape(dcsi, stl, eps);
+  const std::string ea_name =
+      elementArrangementToString(stl.element_arrangement);
 
   StickLoopInfo g;
   g.elems_per_stick = eps;
   g.src_elem_stride = dcsi.stride_src_[0];
   g.dst_elem_stride = dcsi.stride_dst_[0];
-  g.stick_dim = find_stick_dim(dcsi, eps);
+  g.stick_dim = find_stick_dim(dcsi, eps, ea_name);
   g.num_sticks = dcsi.size_[g.stick_dim];
   g.src_stick_stride = dcsi.stride_src_[g.stick_dim];
   return g;
@@ -495,19 +498,103 @@ void ea_restore_fp16tofp32(DataConversionStrideInfo& dcsi,
 }
 
 /*
+ * Restore STANDARD element arrangement for FP32_TO_DL16 D2H.
+ *
+ * FP32_TO_DL16 (device fp16/bf16, stick = 64 elems):
+ *
+ *   Physical position within a stick: phys = k*8 + w_hi*4 + w_lo
+ *     k    = phys // 8          (range 0..7, device stride 8)
+ *     w_hi = (phys % 8) // 4    (range 0..1, device stride 4)
+ *     w_lo = phys % 4           (range 0..3, device stride 1)
+ *
+ *   Logical position: logical = k*4 + w_lo + w_hi*32
+ *     w_lo: size 4, device_step 1,  host_step 1
+ *     k:    size 8, device_step 8,  host_step 4
+ *     w_hi: size 2, device_step 4,  host_step 32
+ *
+ * find_stick_dim_fp32todl16 locates the loop over sticks (host stride ==
+ * 64 * elem_step).  Sticks are sequentially ordered; no interleave at the
+ * stick level, so the stick loop is passed through unchanged.
+ */
+// Finds the stick dimension for FP32_TO_DL16 D2H: the loop whose host stride
+// equals one full fp16 stick (elems_per_stick elements).  Unlike DL16_TO_FP32,
+// sticks are NOT interleaved with each other, so no pair-count check is needed.
+size_t find_stick_dim_fp32todl16(const DataConversionStrideInfo& dcsi,
+                                 int64_t elems_per_stick) {
+  const int64_t host_stick_stride = elems_per_stick * dcsi.stride_dst_[0];
+  int64_t stick_dim = -1;
+  for (size_t k = 1; k < dcsi.size_.size(); k++) {
+    if (dcsi.size_[k] > 1 && dcsi.stride_dst_[k] == host_stick_stride) {
+      TORCH_CHECK(stick_dim < 0,
+                  "Ambiguous stick dimension for FP32_TO_DL16 D2H");
+      stick_dim = static_cast<int64_t>(k);
+    }
+  }
+  TORCH_CHECK(stick_dim > 0,
+              "FP32_TO_DL16 D2H: could not find the stick dimension");
+  return static_cast<size_t>(stick_dim);
+}
+
+void ea_restore_fp32todl16(DataConversionStrideInfo& dcsi,
+                           const SpyreTensorLayout& stl) {
+  const int64_t eps = stl.elems_per_stick();
+  check_dcsi_shape(dcsi, stl, eps);
+
+  const int64_t src_elem_stride = dcsi.stride_src_[0];
+  const int64_t dst_elem_stride = dcsi.stride_dst_[0];
+  const size_t sd = find_stick_dim_fp32todl16(dcsi, eps);
+
+  // Within-stick permutation for FP32_TO_DL16 (64 fp16 elems/stick):
+  //   phys  = k*8 + w_hi*4 + w_lo
+  //     k    in 0..7  (device step 8, host step 4)
+  //     w_hi in 0..1  (device step 4, host step 32)
+  //     w_lo in 0..3  (device step 1, host step 1)
+  //   logical = k*4 + w_lo + w_hi*32
+  constexpr int64_t kGroupsPerStick = 8;  // k range  (eps/8 = 8 for eps=64)
+  constexpr int64_t kHalves = 2;          // w_hi range
+
+  LoopNest nest;
+  for (size_t k = 0; k < dcsi.size_.size(); k++) {
+    if (k == 0) {
+      // w_lo: device step 1, host step 1
+      nest.add_loop(kElemsPerGroup, src_elem_stride, dst_elem_stride);
+      // k:    device step 8, host step 4
+      nest.add_loop(kGroupsPerStick, kGroupsPerStick * src_elem_stride,
+                    kElemsPerGroup * dst_elem_stride);
+      // w_hi: device step 4, host step 32  (= eps/2 * dst_elem_stride)
+      nest.add_loop(kHalves, kElemsPerGroup * src_elem_stride,
+                    (eps / kHalves) * dst_elem_stride);
+    } else if (k == sd) {
+      // Stick dimension: sticks are sequentially ordered, pass through as-is.
+      nest.add_loop(dcsi.size_[k], dcsi.stride_src_[k], dcsi.stride_dst_[k]);
+    } else {
+      nest.add_loop(dcsi.size_[k], dcsi.stride_src_[k], dcsi.stride_dst_[k]);
+    }
+  }
+  dcsi.size_ = std::move(nest.size);
+  dcsi.stride_src_ = std::move(nest.stride_src);
+  dcsi.stride_dst_ = std::move(nest.stride_dst);
+}
+
+/*
  * Restore STANDARD element arrangement in D2H tensor copy of staggered
  * SpyreTensorLayout.
  *
  * DL16_TO_FP32 (device fp32, stick = 32 elems, sticks come in pairs):
  *   host col = blk * 64 + q * 8 + a * 4 + r
  *   device stick j = 2 * blk + a, position e = q * 4 + r      (r < 4, q < 8)
+ *
+ * FP32_TO_DL16 (device fp16/bf16, stick = 64 elems, sticks come in pairs):
+ *   phys = k*8 + w_hi*4 + w_lo  ->  logical = k*4 + w_lo + w_hi*32
+ *   (see ea_restore_fp32todl16 for full derivation)
  */
 void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
                 const SpyreTensorLayout& stl) {
   const ElementArrangement ea = stl.element_arrangement;
-  TORCH_CHECK(ea == ElementArrangement::DL16_TO_FP32,
+  TORCH_CHECK(ea == ElementArrangement::DL16_TO_FP32 ||
+                  ea == ElementArrangement::FP32_TO_DL16,
               "Element arrangement restoration is only supported for "
-              "DL16_TO_FP32, got: ",
+              "DL16_TO_FP32 and FP32_TO_DL16, got: ",
               elementArrangementToString(ea));
   const int64_t eps = stl.elems_per_stick();
   TORCH_CHECK(eps > 0 && eps % (kSticksPerPair * kElemsPerGroup) == 0,
@@ -515,7 +602,11 @@ void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
               elementArrangementToString(ea));
 
   for (auto& dcsi : dcsis) {
-    ea_restore_fp16tofp32(dcsi, stl);
+    if (ea == ElementArrangement::DL16_TO_FP32) {
+      ea_restore_fp16tofp32(dcsi, stl);
+    } else {
+      ea_restore_fp32todl16(dcsi, stl);
+    }
   }
 }
 
@@ -958,9 +1049,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.dcsi_ = get_device_stride_infos(cpu_sizes, cpu_strides, cpu_offset,
                                         device_offset, stl, host2device);
 
-    // On D2H readback restore EA to STANDARD see issue #4393.
+    // On D2H readback restore EA to STANDARD (issue #4393).
+    // Covers both DL16_TO_FP32 (fp16->fp32) and FP32_TO_DL16 (fp32->fp16/bf16)
+    // which share the same interleaving geometry.
     if (!host2device &&
-        stl.element_arrangement == ElementArrangement::DL16_TO_FP32) {
+        (stl.element_arrangement == ElementArrangement::DL16_TO_FP32 ||
+         stl.element_arrangement == ElementArrangement::FP32_TO_DL16)) {
       ea_restore(dci.dcsi_, stl);
     }
 
