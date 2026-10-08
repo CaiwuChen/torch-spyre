@@ -4280,31 +4280,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "mha_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 32, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     False,
                 ),
                 "gqa_decode": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=2, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
                     cached_randn(
                         (2, 257, 8, 128), differentiation=3, dtype=torch.float16
-                    ),
+                    ).transpose(1, 2),
+                    None,
                     False,
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
