@@ -41,6 +41,7 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
     DEVICE_NAME,
+    DLFLOAT16_MAX,
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
@@ -149,17 +150,21 @@ def register_fallback_over_decomp(fallback_ops):
     with ``override_decomp=True`` installs a lowering so that auto-path — and
     its assertion — is never reached.
 
-    Only overloads that are in ``lowering.decompositions`` and currently lack a
-    lowering are touched, so this composes with ``unregister_lowerings`` (which
-    runs first) and does not clobber Spyre's own lowerings.
+    An overload is eligible if it appears in either ``lowering.decompositions``
+    (the Spyre+Inductor merged table) *or* ``torch._decomp.get_decompositions``
+    (the raw upstream table that ``make_fallback``'s CI guard checks directly).
+    Checking both tables closes the gap where an overload is present in the
+    global post-autograd table (e.g. via ``_refs`` registrations) but absent
+    from Inductor's decomposition table — which is what caused the CI guard to
+    fire for ``cumsum`` and ``bitwise_xor`` after Spyre unregistered those lowerings.
     """
     added = []
     for op in fallback_ops:
         for overload in lowering.get_overloads(op):
             if (
                 overload in lowering.decompositions
-                and overload not in lowering.lowerings
-            ):
+                or bool(torch._decomp.get_decompositions([overload]))
+            ) and overload not in lowering.lowerings:
                 lowering.make_fallback(overload, override_decomp=True)
                 added.append(overload)
     return added
@@ -1132,6 +1137,9 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
 
 @register_spyre_lowering(torch.ops.spyre.clamp)
 def lower_clamp(x, min=None, max=None):
+    if min is None and max is None:
+        raise Unsupported("clamp requires at least one bound")
+
     operands = [torch.empty(0, dtype=x.get_dtype())]
     if min is not None:
         operands.append(
@@ -1154,13 +1162,17 @@ def lower_clamp(x, min=None, max=None):
 
     converted_x = x if x.get_dtype() == val_dtype else to_dtype(x, val_dtype)
 
+    # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
+    # encoding is finite. FP32 has IEEE infinities, so preserve those too.
+    limit = float("inf") if val_dtype == torch.float32 else DLFLOAT16_MAX
+
     if min is None:
-        min_val = torch.finfo(val_dtype).min
+        min_val = -limit
     else:
         min_val = float(min)
 
     if max is None:
-        max_val = torch.finfo(val_dtype).max
+        max_val = limit
     else:
         max_val = float(max)
 
