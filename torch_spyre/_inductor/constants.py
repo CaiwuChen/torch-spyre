@@ -170,7 +170,6 @@ SPYRE_FP32_OPS = [
     "equal",
     "notequal",
     "prod",
-    "clip",
 ]
 
 # Operations the device has a 32-bit integer intrinsic for: `spyreop.addi32toi32`
