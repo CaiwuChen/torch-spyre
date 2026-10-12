@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 
+from torch._inductor.exc import InductorError
 from torch_spyre.ops.fallbacks import FallbackWarning
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -465,6 +466,34 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     case for case in TO_DTYPE_OP_EXPECT_FAIL if case not in TO_DTYPE_OP_RESCALE_REJECTED
 ]
 
+# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
+# host, and the result is wrong on 27-88% of its elements. The values on the device
+# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
+# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
+# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
+# converting the result back on the device restores the input exactly, which shows
+# the values are right; the other four cannot be checked that way, because the
+# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
+# the partial-stick limit (4x68).
+_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
+_STAGGERED_READBACK_UNCHECKED = (
+    "readback of the staggered cast result is wrong, probably #4393 "
+    "(the values cannot be checked on the device for this shape)"
+)
+_STAGGERED_READBACK_UNCHECKED_CASES = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in ("4x32", "4x68")
+}
+TO_DTYPE_OP_EXPECT_FAIL = {
+    case: (
+        _STAGGERED_READBACK_UNCHECKED
+        if case in _STAGGERED_READBACK_UNCHECKED_CASES
+        else _STAGGERED_READBACK
+    )
+    for case in TO_DTYPE_OP_EXPECT_FAIL
+}
+
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         cached_randn(shape, dtype=src),
@@ -547,12 +576,15 @@ TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = [
     if case not in _ROUND_TRIP_COPY_NOW_PASSING
 ]
 # These fail with a value mismatch, but pass on some runs (in cold-cache full runs of
-# the xfail-marked tests, each has passed in some of them). The bfloat16 case is the
-# sibling of the float16 one. Cause not investigated (see #5285), so they are
-# non-strict xfails.
+# the xfail-marked tests, each has passed in some of them), so they are non-strict
+# xfails. They fail on a single core as well, with the signature of the lost second
+# stick of a pair below (#5361), so splitting a dim across cores (#5285) does not
+# explain them; #5285 tracks the intermittency.
 _ROUND_TRIP_IMPLICIT_UNSTABLE = {
-    "float16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
-    "bfloat16_to_float32_4x63": "mismatch that passes on some runs, cause unknown, #5285",
+    "float16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
+    "bfloat16_to_float32_4x63": "mismatch that passes on some runs; lost second stick "
+    "of a stick pair (#5361), intermittency #5285",
 }
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     case
@@ -561,6 +593,50 @@ TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = [
     and case not in _ROUND_TRIP_IMPLICIT_UNSTABLE
     and case not in ROUND_TRIP_IMPLICIT_RESCALE_REJECTED
 ]
+
+# The round trips left in the three lists above return the right number of elements
+# with about half of them zero (#5361). The upcast value is staggered, so an fp16
+# stick is spread over a pair of fp32 sticks, in interleaved groups of four
+# elements; when the stick dim does not fill whole pairs, the pair's second stick is
+# missing. It happens in two ways:
+# - 4x16 and 4x63: the second stick is not allocated, so it fails on one core too;
+# - 4x68: it is allocated, but work division leaves it to no core, so it passes
+#   with SENCORES=1.
+_PAIR_SECOND_STICK_LOST = (
+    "the staggered fp32 value lacks the second stick of a stick pair, so half the "
+    "elements come back as zero (#5361)"
+)
+_PAIR_SECOND_STICK_UNSPLIT = (
+    "work division leaves the second stick of a stick pair to no core; correct "
+    "with SENCORES=1 (#5361)"
+)
+_ROUND_TRIP_PAIR_REASON_BY_SHAPE = {
+    "4x16": _PAIR_SECOND_STICK_LOST,
+    "4x63": _PAIR_SECOND_STICK_LOST,
+    "4x68": _PAIR_SECOND_STICK_UNSPLIT,
+}
+
+
+def _round_trip_pair_reasons(cases):
+    """``{case: reason}`` for round trips that lose the second stick of a pair.
+
+    A case whose shape has no reason raises KeyError: a new failing shape has to
+    be looked at before it is given one.
+    """
+    return {
+        case: _ROUND_TRIP_PAIR_REASON_BY_SHAPE[case.rsplit("_", 1)[1]] for case in cases
+    }
+
+
+TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
+)
+TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
+    TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
+)
 
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
@@ -5144,11 +5220,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
+            # Both cases pass on CI's deeptools and fail on other builds, so they are
+            # non-strict: a pass is reported, not an error.
             # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
+            # some builds do.
+            # #5358: dbo-opt intermittently fails program verification for the fp32
+            # reduction over the 256-wide last dim on deeptools main.
             "expect_fail_unstable": {
                 "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
             },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
@@ -5535,6 +5615,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5783,6 +5870,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
+            # #5358: dbo-opt intermittently fails program verification for the
+            # fp32 reduction over the 256-wide last dim on deeptools main, and
+            # passes on the older build CI uses. Non-strict, so either outcome is
+            # tolerated.
+            "expect_fail_unstable": {
+                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
+            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -6643,6 +6737,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
+                # Genuinely grouped (non-depthwise) conv2d: groups=2 with
+                # C_in=16 -> C_in_per_group=8 and C_out=32 -> C_out_per_group=16.
+                # Since C_in != groups (not depthwise) and groups != 1, this
+                # rides conv2d_via_bmm_decomp's grouped im2col+matmul branch
+                # (spyre.unfold + a batched grouped matmul), the path the
+                # reviewer noted "can also handle groups != 1".
+                "1x16x32_ksize3_groups2": (
+                    cached_randn((1, 16, 32, 32)),
+                    cached_randn((32, 8, 3, 3)),
+                    None,
+                    (1, 1),
+                    (1, 1),
+                    2,
+                ),
             },
         },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
@@ -6923,6 +7031,82 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # whose custom-op reshape does not handle this test's
                 # channel-last weight layout (a separate, pre-existing issue
                 # unrelated to direct lowering).
+            },
+        },
+        # Conv3D with a unit temporal (depth) kernel, folded to a batched
+        # Conv2d by conv2d_via_bmm_decomp (input.dim()==5 branch): each depth
+        # slice is convolved independently with the same [C_out,C_in,kH,kW]
+        # weight, so (N,C,D,H,W) -> (N*D,C,H,W) -> conv2d -> unfold. The inner
+        # 2D conv reuses the direct-lowering path when the flag is on (these
+        # cases mirror the supported corners of test_conv2d_direct: fp16,
+        # groups==1, zero pad, dilation 1, C_in stick-aligned, kH/kW<=3). Params
+        # are standard NCDHW (x, weight[C_out,C_in,kD=1,kH,kW], bias, stride);
+        # the test builds channel-last device tensors and toggles the flag.
+        ("test_conv3d_via_conv2d", "test_conv3d_via_conv2d_base"): {
+            "param_sets": {
+                # D==1: degenerate depth -- the fold is a single-slice batch.
+                "1x64x1x8x8_k3": (
+                    cached_randn((1, 64, 1, 8, 8)),
+                    cached_randn((64, 64, 1, 3, 3)),
+                    None,
+                    (1, 1, 1),
+                ),
+                # D>1: the batched fold over multiple depth slices, 3x3 kernel.
+                "1x64x4x8x8_k3": (
+                    cached_randn((1, 64, 4, 8, 8)),
+                    cached_randn((64, 64, 1, 3, 3)),
+                    None,
+                    (1, 1, 1),
+                ),
+                # NOTE: N>1 AND D>1 together (e.g. 2x64x3x8x8) is deliberately
+                # rejected as Unsupported by the fold -- see
+                # test_conv3d_via_conv2d_temporal1_gate -- so no such success
+                # case appears here. N==1 (any D) and D==1 (any N) are covered.
+                # 2x2 kernel -- smallest direct-lowered window.
+                "1x64x4x8x8_k2": (
+                    cached_randn((1, 64, 4, 8, 8)),
+                    cached_randn((64, 64, 1, 2, 2)),
+                    None,
+                    (1, 1, 1),
+                ),
+                # Bias present: added once on C_out inside the inner 2D conv.
+                "1x64x4x8x8_k3_bias": (
+                    cached_randn((1, 64, 4, 8, 8)),
+                    cached_randn((64, 64, 1, 3, 3)),
+                    cached_randn((64,)),
+                    (1, 1, 1),
+                ),
+                # C_out != C_in (32 output channels).
+                "1x64x4x8x8_k3_cout32": (
+                    cached_randn((1, 64, 4, 8, 8)),
+                    cached_randn((32, 64, 1, 3, 3)),
+                    None,
+                    (1, 1, 1),
+                ),
+            },
+        },
+        ("test_conv3d_via_conv2d_im2col", "test_conv3d_via_conv2d_im2col_base"): {
+            "param_sets": {
+                # Small non-overlapping patchify: kernel==stride==4, C_in=6.
+                # Both kernel>3 and C_in not 64-aligned put the folded 2D conv
+                # outside the direct SDSC envelope, so it rides im2col+matmul.
+                "1x6x2x8x8_k4s4": (
+                    cached_randn((1, 6, 2, 8, 8)),
+                    cached_randn((16, 6, 1, 4, 4)),
+                    None,
+                    (1, 4, 4),
+                ),
+                # Large non-overlapping patchify (kernel==stride==16, C_in=6 ->
+                # C_out=1024) over a 224x224 x 4-depth cube -- a ViT-style 3D
+                # patch embed. Exercises im2col at scale: stick-aligned
+                # contraction (6*16*16=1536) and a large token count
+                # (H_out*W_out=14*14) that pads to stick boundaries.
+                "1x6x4x224x224_k16s16": (
+                    cached_randn((1, 6, 4, 224, 224)),
+                    cached_randn((1024, 6, 1, 16, 16)),
+                    None,
+                    (1, 16, 16),
+                ),
             },
         },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
@@ -8348,9 +8532,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend hits an internal lowering bug for "
-            "torch.nansum (stable error signature: InductorError: IndexError: "
-            "list index out of range)"
+            "torch.nansum (stable error signature: InductorError: RuntimeError: "
+            "Failed to import the generated kernel, a SyntaxError)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_nansum_all_dims_known_xfail(self):
@@ -8367,9 +8552,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.std yet (stable "
-            "error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "error signature: InductorError: KeyError: 'No FX node for buf...', "
+            "the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_std_dim0_known_xfail(self):
@@ -8381,9 +8567,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.var yet (stable "
-            "error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "error signature: InductorError: KeyError: 'No FX node for buf...', "
+            "the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_var_dim0_known_xfail(self):
@@ -8395,9 +8582,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.std_mean yet "
-            "(stable error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_std_mean_dim0_known_xfail(self):
@@ -8409,9 +8597,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.var_mean yet "
-            "(stable error signature: InductorError: TypeError: "
-            "'UnimplementedOp' object is not subscriptable)"
+            "(stable error signature: InductorError: NotImplementedError: "
+            "Pointwise)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_var_mean_dim0_known_xfail(self):
@@ -8465,9 +8654,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.quantile yet "
-            "(stable error signature: InductorError: Unsupported: unexpected "
-            "argument PointwiseOp(op='to_dtype', ...) to mul)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_quantile_q050_dim0_known_xfail(self):
@@ -8481,9 +8671,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     @pytest.mark.xfail(
         reason=(
             "Spyre compiled backend does not support torch.nanquantile yet "
-            "(stable error signature: InductorError: IndexError: list index "
-            "out of range)"
+            "(stable error signature: InductorError: KeyError: "
+            "'No FX node for buf...', the failure of #3287)"
         ),
+        raises=InductorError,
         strict=True,
     )
     def test_nanquantile_q050_dim0_known_xfail(self):
@@ -10118,6 +10309,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 x, weight, bias, stride=stride, padding=padding, groups=groups
             )
 
+        # Reference accumulated in fp32. A patch-embed conv (e.g. the
+        # 1x6x128_patch16_bias case) contracts over a large K (6*16*16 = 1536);
+        # CPU fp16 torch.conv2d accumulates that reduction in fp16 and loses
+        # ~150 abs of precision, while Spyre accumulates in higher precision and
+        # matches the fp32 result (verified: device vs fp32 max|d| = 0.5, 0/4096
+        # over atol). The default fp16 CPU reference would fail the correct
+        # device output against CPU's own lossy accumulation. For the small-K
+        # cases fp32 and fp16 agree, so the fp32 reference is a no-op there.
+        bias_f = bias.float() if bias is not None else None
+        ref = torch.conv2d(
+            x.float(),
+            weight.float(),
+            bias_f,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+        )
+
         self.compare_with_cpu(
             fn,
             x,
@@ -10128,6 +10337,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+            dlfloat16_reference=ref,
         )
 
     def test_conv2d_direct_base(self, x, weight, bias, stride):
@@ -10164,6 +10374,206 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 run_eager=False,
             )
 
+    def _run_conv3d_via_conv2d(self, x, weight, bias, stride, direct_flag):
+        # Shared body for the conv3d-via-conv2d cases. A Conv3D with a unit
+        # temporal (depth) kernel is folded to a batched Conv2d by
+        # conv2d_via_bmm_decomp (input.dim()==5 branch); the folded 4D conv then
+        # rides whichever 2D path fits -- the native conv2d SDSC when
+        # direct_flag is on and the case is in the SDSC envelope, else
+        # im2col+matmul. direct_flag pins config.conv2d_direct_lowering so a case
+        # can target a specific inner path.
+        #
+        # Same channel-last convention as test_conv2d_direct_base, extended to
+        # 5D: Spyre sticks C innermost, so the activation is handed to the
+        # harness as channel-last NDHWC and the weight sticks on C_out. fn
+        # permutes back to the logical NCDHW / [C_out,C_in,kD,kH,kW] layouts and
+        # calls torch.conv3d, so the standard compare_with_cpu harness holds.
+        #
+        # run_eager=False: Spyre has no eager conv3d kernel; only the compiled
+        # (fold + lowering) path is valid here.
+        x_ndhwc = x.permute(0, 2, 3, 4, 1).contiguous()  # [N, D, H, W, C_in]
+        # [C_out,C_in,kD,kH,kW] -> [C_in,kD,kH,kW,C_out]
+        w_dev = weight.permute(1, 2, 3, 4, 0).contiguous()
+
+        def fn(xc, wc, b):
+            xn = xc.permute(0, 4, 1, 2, 3)  # NDHWC -> NCDHW
+            wn = wc.permute(4, 0, 1, 2, 3)  # [C_in,kD,kH,kW,C_out] -> [C_out,...]
+            out = torch.conv3d(xn, wn, b, stride=stride, padding=0, groups=1)
+            return out.permute(0, 2, 3, 4, 1)  # NCDHW -> NDHWC
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", direct_flag):
+            self.compare_with_cpu(
+                fn,
+                x_ndhwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
+    def test_conv3d_via_conv2d_base(self, x, weight, bias, stride):
+        # Temporal-1 Conv3D whose folded 2D conv is in the direct SDSC envelope
+        # (C_in 64-aligned, kernel <= 3): direct-lowering flag on -> native
+        # conv2d SDSC.
+        self._run_conv3d_via_conv2d(x, weight, bias, stride, direct_flag=True)
+
+    def test_conv3d_via_conv2d_im2col_base(self, x, weight, bias, stride):
+        # Temporal-1 Conv3D whose folded 2D conv is OUTSIDE the direct SDSC
+        # envelope (kernel > 3 and/or C_in not 64-aligned, e.g. a ViT/Prithvi
+        # patch-embed) so it decomposes to im2col+matmul. The direct-lowering
+        # flag is OFF, proving the fold rides the im2col path too (the "allow
+        # im2col for Conv3D" policy) rather than requiring the direct path.
+        #
+        # Unlike the direct base test, inputs are plain row-major NCDHW /
+        # [C_out,C_in,kD,kH,kW] -- the natural layout a real model (e.g. Prithvi)
+        # hands to conv3d, and the one the im2col path wants. The direct path
+        # needs channel-last so C lands on the stick; im2col instead linearizes
+        # the channels into the matmul contraction, so it wants the ordinary
+        # contiguous layout. Handing im2col a channel-last weight (C_out on the
+        # stick as the outermost logical dim) is unrepresentable for the
+        # reshape/d2h that flattens it, so it is deliberately not tested here.
+        #
+        # run_eager=False: Spyre has no eager conv3d kernel; only the compiled
+        # (fold + im2col) path is valid here.
+        def fn(xc, wc, b):
+            return torch.conv3d(xc, wc, b, stride=stride, padding=0, groups=1)
+
+        # Reference accumulated in fp32. A patch-embed conv contracts over a
+        # large K (here 6*16*16 = 1536); CPU fp16 torch.conv3d accumulates that
+        # reduction in fp16 and loses ~200 abs of precision, while Spyre
+        # accumulates in higher precision and matches the fp32 result (verified:
+        # device vs fp32 max|d| < 0.7). The default fp16 CPU reference would
+        # fail the correct device output against CPU's own lossy accumulation.
+        #
+        # Hand the fp32 reference to the harness via dlfloat16_reference (NOT
+        # cpu_eager_result): it keeps the reference high-precision until the LX
+        # wrapper ops have run, then casts once to fp16. In the base harness
+        # that is just the single fp16 round; under LX planning it also routes
+        # the reference through the same wrap as the device side (e.g.
+        # sum(dim=0) for the reduction variant), so rank and value match. A raw
+        # cpu_eager_result would skip that wrap and mismatch the summed device
+        # output in both shape and precision.
+        bias_f = bias.float() if bias is not None else None
+        ref = torch.conv3d(
+            x.float(), weight.float(), bias_f, stride=stride, padding=0, groups=1
+        )
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", False):
+            self.compare_with_cpu(
+                fn,
+                x,
+                weight,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+                dlfloat16_reference=ref,
+            )
+
+    def test_conv3d_via_conv2d_grouped(self):
+        # Routing policy for a temporal-1 Conv3D, with direct lowering ON (the
+        # realistic config): groups == 1 uses the native conv2d SDSC (direct),
+        # but a genuinely grouped (groups != 1) conv CANNOT -- the direct
+        # predicate requires groups == 1 -- so it is NOT rejected; it folds
+        # through into conv2d_via_bmm_decomp's grouped im2col+matmul branch.
+        #
+        # This pins conv2d_direct_lowering ON and runs a groups=2 conv3d
+        # (C_in=6 -> C_in_per_group=3, C_out=16) to prove the grouped fold-through
+        # works end-to-end even when direct lowering is enabled: the grouped conv
+        # predicts will_direct=False, folds row-major (the layout im2col wants),
+        # and the recursive 4D conv lands in the grouped-matmul branch.
+        #
+        # Inputs are plain row-major NCDHW: im2col linearizes the channels into
+        # the matmul contraction and wants the ordinary contiguous layout (a
+        # channel-last weight is unrepresentable for the im2col reshape, see
+        # test_conv3d_via_conv2d_im2col_base).
+        #
+        # run_eager=False: Spyre has no eager conv3d kernel; only the compiled
+        # (fold + im2col) path is valid here.
+        x = cached_randn((1, 6, 2, 8, 8))
+        weight = cached_randn((16, 3, 1, 4, 4))
+
+        def fn(xc, wc, b):
+            return torch.conv3d(xc, wc, b, stride=(1, 4, 4), padding=0, groups=2)
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x,
+                weight,
+                None,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
+    def test_conv3d_via_conv2d_temporal1_gate(self):
+        # Pure-Python guard check (no compile/hardware) of the
+        # conv2d_via_bmm_decomp 5D branch. Only the *temporal* geometry gates the
+        # fold: a unit temporal kernel (kD==1 with unit depth stride, zero depth
+        # pad, unit depth dilation) makes Conv3D a batched Conv2d and folds; a
+        # genuinely 3-D conv (kD>1 or non-trivial depth geometry) is out of scope
+        # and must raise Unsupported. This gate is independent of
+        # config.conv2d_direct_lowering -- the flag only steers the *inner* 2D op
+        # (direct SDSC vs im2col+matmul), it no longer gates Conv3D on/off. The
+        # rejection fires before any Spyre-device op, so it is checkable on CPU
+        # tensors here; the accepted path is exercised end-to-end in
+        # test_conv3d_via_conv2d_base.
+        from torch_spyre._inductor.decompositions import conv2d_via_bmm_decomp
+        from torch_spyre._inductor.errors import Unsupported
+
+        def _call(kD=1, stride_d=1, pad_d=0, dil_d=1, groups=1, N=1, D=2):
+            x = torch.zeros(N, 64, D, 8, 8, dtype=torch.float16)
+            w = torch.zeros(64, 64 // groups, kD, 3, 3, dtype=torch.float16)
+            return conv2d_via_bmm_decomp(
+                x,
+                w,
+                None,
+                [stride_d, 1, 1],
+                [pad_d, 0, 0],
+                [dil_d, 1, 1],
+                False,
+                [0, 0, 0],
+                groups,
+            )
+
+        # The temporal gate holds regardless of the direct-lowering flag.
+        for flag in (False, True):
+            with mock.patch.object(inductor_config, "conv2d_direct_lowering", flag):
+                # Non-temporal-1 depth geometry is genuinely 3-D -> rejected.
+                with self.assertRaises(Unsupported):
+                    _call(kD=2)
+                with self.assertRaises(Unsupported):
+                    _call(stride_d=2)
+                with self.assertRaises(Unsupported):
+                    _call(pad_d=1)
+                with self.assertRaises(Unsupported):
+                    _call(dil_d=2)
+                # A temporal-1 fold with BOTH batch N>1 and depth D>1 cannot
+                # express the N*D merge as a pure view, so it is rejected up
+                # front (not currently supported). N==1 (any D) and D==1 (any N)
+                # fold to a single batch range and are accepted (below).
+                with self.assertRaises(Unsupported):
+                    _call(N=2, D=3)
+                # Note: a grouped (groups != 1) temporal-1 conv3d is NO LONGER
+                # rejected here -- it folds through into conv2d_via_bmm_decomp's
+                # grouped im2col+matmul branch (see the 5D branch comment and the
+                # end-to-end test_conv3d_via_conv2d_grouped case), so it is
+                # intentionally not asserted to raise.
+
+                # Temporal-1 passes the gate: it must NOT raise Unsupported. It
+                # proceeds into the fold, whose reshape_via_cpu has no CPU kernel
+                # in this pure-Python test, so a non-Unsupported error there is
+                # expected and ignored (the fold runs for real on hardware in the
+                # base test).
+                try:
+                    _call(kD=1)
+                except Unsupported as e:  # noqa: F841
+                    self.fail(f"temporal-1 conv3d should pass the gate, got: {e}")
+                except Exception:
+                    pass
+
     def test_conv2d_direct_support_predicate(self):
         # Pure-Python guard check (no compile/hardware): the direct-lowering
         # support predicate must decline the corners the Spyre conv SDSC / fp16
@@ -10190,9 +10600,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
         def _supported(c_in, k=3, hw=8, **overrides):
-            x = torch.zeros(1, c_in, hw, hw, dtype=torch.float16)
-            w = torch.zeros(eps, c_in, k, k, dtype=torch.float16)
-            return _is_direct_conv_supported(x, w, **{**common, **overrides})
+            return _is_direct_conv_supported(
+                (1, c_in, hw, hw),
+                torch.float16,
+                (eps, c_in, k, k),
+                **{**common, **overrides},
+            )
 
         # C_in stick alignment.
         self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
