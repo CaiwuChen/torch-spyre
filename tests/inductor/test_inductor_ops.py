@@ -653,7 +653,21 @@ SCALED_MM_TESTS = {
     for sa, sb, b in _SCALED_MM_PARAMS
 }
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
+
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
+
+
+def _clamp_tol(dtype):
+    """Exact for integers; epsilon-scale (FP16_EPS / FP32_EPS) for fp16 / fp32.
+
+    clamp only selects between the input and a bound, so no arithmetic error
+    accumulates -- the default 0.1 tolerance would hide real bugs.
+    """
+    if not dtype.is_floating_point:
+        return 0, 0
+    eps = FP16_EPS if dtype == torch.float16 else FP32_EPS
+    return eps, eps
+
 
 # DLFloat16's largest finite.  0x7FFF is the NaN-Infinity symbol, so the largest
 # finite is 0x7FFE -- mantissa 0x1FE, not 0x1FF.
@@ -8676,16 +8690,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         """clamp with mixed dtype operands (tensor vs float/int scalars).
 
         Integer-tensor cases (int32/int64) use exact tolerance; float-tensor
-        cases tolerate the fp16/fp32 rounding that happens on device.
+        cases use a tight per-dtype epsilon (FP16_EPS / FP32_EPS).
         """
-        if x.dtype.is_floating_point:
-            self._run_clamp_cpu(op, x, min_val, max_val)
-        else:
-            self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
+        atol, rtol = _clamp_tol(x.dtype)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=atol, rtol=rtol)
 
     def test_clamp_fp16_fp32_cpu(self, op, x, min_val, max_val):
         """fp16 and fp32 clamp across 1D/2D/3D/4D shapes (native float path)."""
-        self._run_clamp_cpu(op, x, min_val, max_val)
+        atol, rtol = _clamp_tol(x.dtype)
+        self._run_clamp_cpu(op, x, min_val, max_val, atol=atol, rtol=rtol)
 
     @pytest.mark.filterwarnings(
         "ignore:Backend Spyre does not support int64:UserWarning"
@@ -8700,34 +8713,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self._run_clamp_cpu(op, x, min_val, max_val, atol=0, rtol=0)
 
     def test_clamp_inplace_cpu(self, op, x, min_val, max_val):
-        """in-place clamp_ variants (fixes #4069)."""
-        is_int = not x.dtype.is_floating_point
-        atol = 0 if is_int else 0.1
-        rtol = 0 if is_int else 0.1
+        """in-place clamp_ variants mutating a graph input (fixes #4069).
+
+        The input itself is clamped in place and returned, so the compiled
+        graph must write the result back into its input buffer. (Clamping
+        ``a.clone()`` would be functionalized into a plain out-of-place clamp
+        and never exercise the write-back.)
+        """
+        atol, rtol = _clamp_tol(x.dtype)
         if op is torch.Tensor.clamp_:
-            self.compare_with_cpu(
-                lambda a: a.clone().clamp_(min=min_val, max=max_val),
-                x,
-                run_eager=False,
-                atol=atol,
-                rtol=rtol,
-            )
+
+            def fn(a):
+                a.clamp_(min=min_val, max=max_val)
+                return a
+
         elif op is torch.Tensor.clamp_min_:
-            self.compare_with_cpu(
-                lambda a: a.clone().clamp_min_(min_val),
-                x,
-                run_eager=False,
-                atol=atol,
-                rtol=rtol,
-            )
+
+            def fn(a):
+                a.clamp_min_(min_val)
+                return a
+
         elif op is torch.Tensor.clamp_max_:
-            self.compare_with_cpu(
-                lambda a: a.clone().clamp_max_(max_val),
-                x,
-                run_eager=False,
-                atol=atol,
-                rtol=rtol,
-            )
+
+            def fn(a):
+                a.clamp_max_(max_val)
+                return a
+
+        # clone_inputs: fn mutates its input, so the CPU reference and the
+        # Spyre run must each get a fresh copy.
+        self.compare_with_cpu(
+            fn, x, run_eager=False, atol=atol, rtol=rtol, clone_inputs=True
+        )
 
     def test_clamp_preserves_unspecified_bound(self, operation, dtype):
         """Missing bounds must preserve the input device format's full range."""
