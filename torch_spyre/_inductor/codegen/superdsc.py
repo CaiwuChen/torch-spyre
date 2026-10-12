@@ -14,6 +14,7 @@
 
 import dataclasses
 import math
+import struct
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -263,16 +264,31 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
+# SAMV has no 32-bit precision, so the backend masks a 32-bit element as two
+# 16-bit halves that are both filled from one 16-bit mask value. An fp32 mask
+# value must therefore have identical upper and lower 16 bits, otherwise DDC
+# rejects it ("needs a mask value made of a repeating 16bit pattern"). 0.0
+# (sum/mean) already qualifies. +-inf cannot be expressed this way (an all-ones
+# exponent with a repeating pattern is always a NaN), so the largest finite
+# repeating-pattern values stand in for them. They are built from their bit
+# patterns because a hand-typed decimal such as -3.4028e38 rounds to a
+# different fp32 whose halves differ.
+_FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
+_FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
     "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
 }
 
 
-def _get_mask_value(op: str) -> float:
+def _get_mask_value(
+    op: str, data_format: DataFormats = DataFormats.SEN169_FP16
+) -> float:
+    is_fp32 = data_format == DataFormats.IEEE_FP32
     if op == "max":
-        return _FP16_MIN
+        return _FP32_MIN if is_fp32 else _FP16_MIN
     if op == "min":
-        return _FP16_MAX
+        return _FP32_MAX if is_fp32 else _FP16_MAX
     if op in _POINTWISE_PADDING_MASK_VALUE:
         return _POINTWISE_PADDING_MASK_VALUE[op]
     return 0
@@ -2358,7 +2374,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # Constant ids follow insertion order, so capture the index here rather
         # than assuming 0 -- ops with their own constants shift it (see #4390).
         masking_const_id = len(constants)
-        constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
+        constants["samv-maskvalue"] = _get_mask_value(op_spec.op, args[0].data_format)
 
     # Forward conv2d (#3284), like matmul, counts only the non-output args as
     # inputs. Depthwise conv2d (#3510) is a reduction that feeds its output
