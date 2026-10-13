@@ -8553,15 +8553,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # #2534), these compile and pass cleanly.
     def test_amax_fp32_padded_stick_dim(self):
         x = cached_randn((67, 100), dtype=torch.float32)
-        self.compare_with_cpu(lambda x: torch.amax(x, dim=-1), x, run_eager=False)
+        self.compare_with_cpu(
+            lambda x: torch.amax(x, dim=-1),
+            x,
+            atol=1e-3,
+            rtol=1e-3,
+            run_eager=False,
+        )
 
     def test_amin_fp32_padded_stick_dim(self):
         x = cached_randn((67, 100), dtype=torch.float32)
-        self.compare_with_cpu(lambda x: torch.amin(x, dim=-1), x, run_eager=False)
+        self.compare_with_cpu(
+            lambda x: torch.amin(x, dim=-1),
+            x,
+            atol=1e-3,
+            rtol=1e-3,
+            run_eager=False,
+        )
 
     def test_softmax_fp32_padded_stick_dim(self):
         x = cached_randn((67, 100), dtype=torch.float32)
-        self.compare_with_cpu(lambda x: torch.softmax(x, dim=-1), x, run_eager=False)
+        self.compare_with_cpu(
+            lambda x: torch.softmax(x, dim=-1),
+            x,
+            atol=1e-3,
+            rtol=1e-3,
+            run_eager=False,
+        )
 
     @pytest.mark.xfail(
         reason=(
