@@ -673,10 +673,6 @@ class TestNegativeScalarOperations:
         result = _run_spyre(execution_mode, int_float_add, x)
         assert result.dtype in (torch.float32, torch.float64)
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1454
-    @pytest.mark.skip(
-        reason="Mixed-dtype tensors (bool + float) sharing stick variable not supported"
-    )
     def test_bool_tensor_scalar_multiply(self, execution_mode):
         """Bool tensor * float scalar."""
 
@@ -687,7 +683,8 @@ class TestNegativeScalarOperations:
         result = _run_spyre(execution_mode, bool_mul, x)
         assert result.dtype in (torch.float32, torch.float64, torch.int64)
         expected = torch.tensor([[2.0, 0.0], [0.0, 2.0]])
-        assert torch.allclose(result.float(), expected)
+        # Compared on the host: the device has no kernel for allclose.
+        assert torch.allclose(result.cpu().float(), expected)
 
     # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
     @pytest.mark.skip(
@@ -748,14 +745,6 @@ class TestNegativeScalarOperations:
         assert result.shape == x.shape
         assert result.requires_grad
 
-    # Non-strict: the outcome depends on the deeptools build. It passes on deeptools
-    # main and fails on the older build CI uses, with "In-device copy not
-    # implemented" (#1558). Make it a plain test once CI is on main.
-    @pytest.mark.xfail(
-        strict=False,
-        reason="RuntimeError: In-device copy not implemented (#1558); passes on "
-        "deeptools main, fails on the older build",
-    )
     def test_inplace_scalar_operation(self, execution_mode):
         """In-place multiply by scalar."""
 
