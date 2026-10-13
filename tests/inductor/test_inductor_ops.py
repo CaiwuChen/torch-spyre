@@ -220,6 +220,20 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
     "ord2_5d_mixed_1_neg1": (2, (1, -1), cached_randn((2, 3, 5, 7, 64))),
     "ord1_pad_2d_dim_1": (1, 1, cached_randn((63, 129))),
     "ord2_pad_5d_dim_234": (2, (2, 3, 4), cached_randn((2, 3, 5, 7, 9))),
+    "ord2_fp32_pad_2d_dim_1": (2, 1, cached_randn((67, 31), dtype=torch.float32)),
+    "ord1_fp32_pad_2d_dim_1": (1, 1, cached_randn((67, 31), dtype=torch.float32)),
+    "ord2_fp32_pad_3d_dim_neg1": (2, -1, cached_randn((3, 7, 9), dtype=torch.float32)),
+    "ord1_fp32_pad_3d_dim_neg1": (1, -1, cached_randn((3, 7, 9), dtype=torch.float32)),
+    "ordinf_fp32_pad_3d_dim_neg1": (
+        float("inf"),
+        -1,
+        cached_randn((3, 7, 9), dtype=torch.float32),
+    ),
+    "ordneginf_fp32_pad_3d_dim_neg1": (
+        -float("inf"),
+        -1,
+        cached_randn((3, 7, 9), dtype=torch.float32),
+    ),
 }
 
 
@@ -4904,14 +4918,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            # Both cases pass on CI's deeptools and fail on other builds, so they are
-            # non-strict: a pass is reported, not an error.
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do.
             # #5358: dbo-opt intermittently fails program verification for the fp32
             # reduction over the 256-wide last dim on deeptools main.
             "expect_fail_unstable": {
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
                 "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
             },
             "param_sets": {
@@ -5027,6 +5036,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
                 ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((31,), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    True,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
             },
         },
         ("test_sum_keepdim0", "test_sum_eager"): {
@@ -5112,17 +5146,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     cached_randn((6, 7, 12, 64), dtype=torch.float32, scale=0.01),
                 ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    False,
+                    cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((31,), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_3d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    False,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
             },
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "fp32_3d_dim_2": "fp32 stick masking, passes on CI, #4492",
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5220,6 +5282,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                     cached_randn((3, 7, 9), dtype=torch.float32),
                 ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((31,), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    True,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    True,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    True,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
             },
         },
         ("test_mean_keepdim0", "test_mean_eager"): {
@@ -5289,13 +5376,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     cached_randn((67, 256), dtype=torch.float32),
                 ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    False,
+                    cached_randn((3, 7, 9), dtype=torch.float32),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((31,), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    False,
+                    cached_randn((67, 31), dtype=torch.float32),
+                ),
+                "fp32_pad_3d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((3, 7, 9), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    False,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    False,
+                    cached_randn((3, 7, 9, 31), dtype=torch.float32, scale=0.1),
+                ),
             },
-            "expect_fail": [
-                "fp16_3d_dim_2",
-                "fp16_3d_dim_neg1",
-                "fp32_3d_dim_2",
-                "fp32_3d_dim_neg1",
-            ],
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
@@ -5433,6 +5549,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (6, 7, 12, 256), dim=3, dtype=torch.float32, seed=0xAFFE
                     ),
                 ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=-1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (31,), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 31), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
             },
         },
         ("test_max_keepdim0", "test_max_eager"): {
@@ -5548,6 +5706,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     unique_randn_along_dim(
                         (6, 17, 7, 64), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=-1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (31,), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 31), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_3d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=3, dtype=torch.float32, seed=0xAFFE
                     ),
                 ),
             },
@@ -5688,6 +5895,48 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                         (6, 7, 12, 256), dim=3, dtype=torch.float32, seed=0xAFFE
                     ),
                 ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=-1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (31,), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    True,
+                    unique_randn_along_dim(
+                        (67, 31), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    True,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
             },
         },
         ("test_min_keepdim0", "test_min_eager"): {
@@ -5803,6 +6052,55 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     False,
                     unique_randn_along_dim(
                         (6, 17, 7, 64), dim=3, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_3d_dim_neg1": (
+                    -1,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=-1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_1d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (31,), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_2d_dim_1": (
+                    1,
+                    False,
+                    unique_randn_along_dim(
+                        (67, 31), dim=1, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_3d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_0": (
+                    0,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=0, dtype=torch.float32, seed=0xAFFE
+                    ),
+                ),
+                "fp32_pad_4d_dim_3": (
+                    3,
+                    False,
+                    unique_randn_along_dim(
+                        (3, 7, 9, 31), dim=3, dtype=torch.float32, seed=0xAFFE
                     ),
                 ),
             },
