@@ -8548,9 +8548,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
 
     # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
-    # multiple of the 32 elements in an fp32 stick). With SAMV masking for fp32
-    # choosing the pad value per dtype (0xFF7FFF7F for max, 0x7F7F7F7F for min,
-    # #2534), these compile and pass cleanly.
+    # multiple of the 32 elements in an fp32 stick). With coordinate masking
+    # selecting the padding value per dtype (#2534), these compile and pass.
     def test_amax_fp32_padded_stick_dim(self):
         x = cached_randn((67, 100), dtype=torch.float32)
         self.compare_with_cpu(

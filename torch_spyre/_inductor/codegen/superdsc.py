@@ -264,15 +264,10 @@ class SDSCSpec:
 _FP16_MAX = 65504.0
 _FP16_MIN = -65504.0
 
-# SAMV has no 32-bit precision, so the backend masks a 32-bit element as two
-# 16-bit halves that are both filled from one 16-bit mask value. An fp32 mask
-# value must therefore have identical upper and lower 16 bits, otherwise DDC
-# rejects it ("needs a mask value made of a repeating 16bit pattern"). 0.0
-# (sum/mean) already qualifies. +-inf cannot be expressed this way (an all-ones
-# exponent with a repeating pattern is always a NaN), so the largest finite
-# repeating-pattern values stand in for them. They are built from their bit
-# patterns because a hand-typed decimal such as -3.4028e38 rounds to a
-# different fp32 whose halves differ.
+# 32-bit coordinate masking uses a repeating 16-bit pattern for the mask
+# value. 0.0 (used for sum/mean) already satisfies this requirement.
+# For max and min, the largest finite values with matching upper and lower
+# 16-bit halves are constructed directly from their bit patterns.
 _FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
 _FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
 
