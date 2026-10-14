@@ -21,8 +21,13 @@ import sys
 import warnings
 import pytest
 import unittest
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
+from torch import fx
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout, InputBuffer, Pointwise
+from torch._inductor.virtualized import V
 
 
 from torch._inductor.exc import InductorError
@@ -43,8 +48,14 @@ import utils_inductor
 from unittest import mock
 from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.dtype_ops import DtypeOpTable, bool_equivalent_dtype
 from torch_spyre._inductor.constants import IDENTITY_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.split_multi_ops import (
+    _index_syms,
+    _validate_split_supported,
+)
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -224,11 +235,6 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
 
 
 SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
-    torch.amin: {
-        "compiled": True,
-        "eager": False,
-        "reason": "Spyre eager aten::amin.out is not supported yet (issue #1708)",
-    },
     torch.min: {
         "compiled": True,
         "eager": False,
@@ -385,6 +391,13 @@ def _cached_to_dtype_input(shape, src):
     return _cached_randint(shape, src)
 
 
+# The device has no integer compare, so integers are compared as fp32 and two that
+# differ by less than the fp32 spacing at that magnitude read as equal. See the
+# test_cmp_bigint comment for why this is recorded and not fixed.
+_CMP_BIGINT_REASON = (
+    "integers above 2**24 are compared as fp32, so near neighbours collapse"
+)
+
 TO_DTYPE_OP_MAP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}": (src, dst)
     for src, dst in ALL_DTYPE_PAIRS
@@ -393,7 +406,7 @@ TO_DTYPE_OP_MAP_PARAMS_SETS = {
 TO_DTYPE_OP_PARAMS_SETS = {
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
         _cached_fp32_for_int32_cast(shape)
-        if (src, dst) == (torch.float32, torch.int32)
+        if (src, dst) in ((torch.float32, torch.int32), (torch.float32, torch.int64))
         else _cached_to_dtype_input(shape, src),
         dst,
     )
@@ -404,26 +417,33 @@ TO_DTYPE_OP_PARAMS_SETS = {
 
 
 _DTYPE_OP_ALL_OPS_FAIL_SHAPES = {(4, 68), (68,)}
-# fp32 and int32 share a stick width, so their conversions have no stick pairs to
-# keep together and are exempt from the shapes above.
-_SAME_WIDTH_PAIRS = [(torch.float32, torch.int32), (torch.int32, torch.float32)]
+# fp32 and int32 share a stick width, as does int64, which the device stores as
+# int32, so their conversions have no stick pairs to keep together and are exempt
+# from the shapes above.
+_SAME_WIDTH_PAIRS = [
+    (torch.float32, torch.int32),
+    (torch.int32, torch.float32),
+    (torch.float32, torch.int64),
+    (torch.int64, torch.float32),
+]
 
 TO_DTYPE_OP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
+    if src != torch.float8_e4m3fn  # TO_DTYPE_OP_PARAMS_SETS has no float8 sources
     if (
         (shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES and (src, dst) not in _SAME_WIDTH_PAIRS)
         or (
             DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
             and (src, dst) not in _SAME_WIDTH_PAIRS
         )
-        # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
-        # so there's no width change to trip the fp16-stick boundary.
+        # Sub-stick guard doesn't apply to fp32<->int32/int64 — all are 32-bit
+        # on device, so there's no width change to trip the fp16-stick boundary.
         or (
             src == torch.float32
             and shape[-1] < 32
-            and (src, dst) != (torch.float32, torch.int32)
+            and (src, dst) not in _SAME_WIDTH_PAIRS
         )
     )
 ]
@@ -1337,7 +1357,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((64, 64), differentiation=3, dtype=torch.float16),
                 ),
             },
-            "expect_fail": ["fp32_enabled"],
+            "expect_fail": {
+                "fp32_enabled": "autocast casts the fp32 inputs to fp16 on the device, "
+                "and a matmul of those cast operands returns wrong values, #5368"
+            },
         },
         ("test_einsum", "test_mm_relaxed"): {
             "ops_dict": {
@@ -1458,6 +1481,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 71, 256),),
                 ]
             ),
+        },
+        # A pointwise op over y.expand_as(x), where y has a size-1 last dim, is its
+        # own FX node and so is realized at x's size. Its consumer pairs it with
+        # x, which needs no restickify.
+        ("test_expand_size1_pointwise", "test_expand_size1_pointwise_cpu"): {
+            "ops_dict": {
+                "abs": lambda x, y: x + y.expand_as(x).abs(),
+                "add_then_gt": lambda x, y: x > y.expand_as(x) + 1,
+                # Both operands of the inner add are expanded.
+                "add_two_expanded": lambda x, y: x
+                - (y.expand_as(x) + (y - 3).expand_as(x)),
+            },
+            # Small integers keep the op exact in float16; y is shifted so it differs
+            # from x.
+            "param_sets": {
+                f"{name}_{_dtype_name(dtype)}": (
+                    _cached_randint(x_shape, dtype),
+                    _cached_randint(y_shape, dtype) - 200,
+                )
+                for name, x_shape, y_shape in [
+                    ("3x5x128", (3, 5, 128), (3, 5, 1)),
+                    ("3x5x100_unaligned", (3, 5, 100), (3, 5, 1)),
+                    ("4d_mask", (1, 1, 8, 64), (1, 1, 8, 1)),
+                    # Controls: the size-1 last dim is not expanded.
+                    ("3x5x1_unexpanded", (3, 5, 1), (3, 5, 1)),
+                    ("100x1_unexpanded", (100, 1), (100, 1)),
+                    ("3x5x1_non_stick_dim_expanded", (3, 5, 1), (3, 1, 1)),
+                ]
+                for dtype in [torch.float16, torch.float32]
+            },
         },
         ("test_sub_broadcast", "test_binary_op_cpu"): {
             "ops_dict": {"sub": torch.sub},
@@ -1763,13 +1816,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_reduce_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
-            "expect_fail": [
-                "mean_fp16_3d_dim_2",
-                "mean_fp16_3d_dim_neg1",
-                "mean_fp32_3d_dim_2",
-                "mean_fp32_3d_dim_neg1",
-                "sum_fp32_3d_dim_neg1",
-            ],
         },
         ("test_reduce_edge_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
@@ -2710,10 +2756,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "fp16_fp32_2d4x64": "Multi-arg pointwise with mixed EA",
                 "fp32_fp16_2d4x64": "Multi-arg pointwise with mixed EA",
             },
-            "skip": [
-                "fp16_fp32_bcast_stick",
-                "fp16_fp32_bcast_0dim",
-            ],
+            # The compare is right on the device, but its staggered result is read
+            # back permuted with no error (#4393).
+            "expect_fail": {
+                "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
+                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
+            },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
                 "fp16_fp32_1d256": (
@@ -2899,7 +2947,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "gt": torch.gt,
                 "ge": torch.ge,
             },
-            "expect_fail": ["int32_2e9", "int64_2e9", "int32_max"],
+            "expect_fail": {
+                "int32_2e9": _CMP_BIGINT_REASON,
+                "int64_2e9": _CMP_BIGINT_REASON,
+                "int32_max": _CMP_BIGINT_REASON,
+            },
             "param_sets": {
                 "int32_2e9": (
                     torch.tensor([2000000000, 2000000001] * 32, dtype=torch.int32),
@@ -4278,8 +4330,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # is registered this stops raising, and the case has to become a positive one.
             "expect_raise": {"eval_mode": "Could not run 'aten::native_batch_norm'"},
         },
-        # TODO: TorchInductor compilation failure in the Spyre lowering pass —
-        # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
+        # TODO: group_norm fails layout propagation with a stick incompatibility
+        # (issue #3287).
         ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
             "param_sets": {
                 "8_groups": (
@@ -4288,7 +4340,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((256,), dtype=torch.float16),
                 ),
             },
-            "expect_fail": ["8_groups"],
+            "expect_fail": {
+                "8_groups": "compile fails in split_multi_ops with KeyError: 'No FX "
+                "node for buf...', #3287"
+            },
         },
         # beta is a Python constant folded into the traced graph. beta=2 stays
         # on the log branch; beta=50 pushes most elements past the threshold;
@@ -4856,7 +4911,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # reference numerics enough to push an already-marginal fp16
             # accumulation over the line. Same class as the cases xfailed in
             # commit 3a2d482. amax on the same shape passes, so target sum only.
-            "expect_fail": ["sum_3d128_01"],
+            "expect_fail": {
+                "sum_3d128_01": "one element of 16384 drifts by 0.11 against the "
+                "0.1 tolerance since PT 2.12 changed the CPU reference numerics"
+            },
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -5220,16 +5278,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
-            # Both cases pass on CI's deeptools and fail on other builds, so they are
-            # non-strict: a pass is reported, not an error.
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do.
-            # #5358: dbo-opt intermittently fails program verification for the fp32
-            # reduction over the 256-wide last dim on deeptools main.
-            "expect_fail_unstable": {
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358",
-            },
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
                 "fp16_2d_dim_0": (
@@ -5432,13 +5480,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
-            # #4492: the backend rejects stick masking for 32-bit types, but only
-            # some builds do. These pass on CI's deeptools and fail on some others,
-            # so they are non-strict: a pass is reported, not an error.
-            "expect_fail_unstable": {
-                "fp32_3d_dim_2": "fp32 stick masking, passes on CI, #4492",
-                "fp32_3d_dim_neg1": "fp32 stick masking, passes on CI, #4492",
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5606,22 +5647,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((67, 256), dtype=torch.float32),
                 ),
             },
-            "expect_fail": [
-                "fp16_3d_dim_2",
-                "fp16_3d_dim_neg1",
-                "fp32_3d_dim_2",
-                "fp32_3d_dim_neg1",
-            ],
         },
         ("test_max_keepdim1", "test_max_eager"): {
             "ops_dict": {"max": torch.max},
-            # #5358: dbo-opt intermittently fails program verification for the
-            # fp32 reduction over the 256-wide last dim on deeptools main, and
-            # passes on the older build CI uses. Non-strict, so either outcome is
-            # tolerated.
-            "expect_fail_unstable": {
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -5870,13 +5898,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_min_keepdim1", "test_min_eager"): {
             "ops_dict": {"min": torch.min},
-            # #5358: dbo-opt intermittently fails program verification for the
-            # fp32 reduction over the 256-wide last dim on deeptools main, and
-            # passes on the older build CI uses. Non-strict, so either outcome is
-            # tolerated.
-            "expect_fail_unstable": {
-                "fp32_4d_dim_3": "dbo-opt verification fails intermittently on deeptools main, #5358"
-            },
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -7190,6 +7211,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
+            # int64 prod over the stick dim decomposes to select+mul, and a
+            # stick-dim select reads one element per stick, a layout only a
+            # restickify can rearrange. ReStickifyOpHBM supports fp16 only.
+            "expect_fail": [
+                "int64_dim1",
+                "int64_dim1_keepdim",
+                "int64_dim1_2",
+                "int64_dim1_2_keepdim",
+            ],
         },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
@@ -7295,6 +7325,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "param_sets": {
                 "3d_to_4d_view_permute_mul": (cached_randn((2, 3, 4)),),
+            },
+        },
+        # int64 arithmetic over rows of one tensor. The rows hold distinct values,
+        # so combining a row with the wrong one gives a wrong answer.
+        ("test_split_multi_ops_view_loads", "test_split_multi_ops_view_loads_cpu"): {
+            "ops_dict": {
+                "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
+                "mul_3_rows": lambda x: x.select(0, 0)
+                * x.select(0, 1)
+                * x.select(0, 2),
+                "add_3_rows": lambda x: x.select(0, 0)
+                + x.select(0, 1)
+                + x.select(0, 2),
+            },
+            "param_sets": {
+                "3x32": (
+                    torch.tensor([[2] * 32, [3] * 32, [5] * 32], dtype=torch.int64),
+                ),
             },
         },
         # A view that splits the stick dim into (heads, D) and then slices or
@@ -7982,7 +8030,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             with torch.autocast(device_type="spyre", enabled=enabled):
                 return a @ b
 
+        if enabled and a.dtype == torch.float32:
+            # Autocast runs this matmul in fp16 on the device. The CPU does not
+            # autocast for the spyre device type, so the reference casts itself.
+            compare_with_pytorch(fn, lambda x, y: x.half() @ y.half(), a, b)
+            return
         self.compare_with_cpu(fn, a, b)
+
+    def test_expand_size1_pointwise_cpu(self, op, x, y):
+        # A restickify here means the expanded operand kept its
+        # one-element-per-stick layout.
+        with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
+            self.compare_with_cpu(
+                op, x, y, atol=0.005, rtol=0.005, cpu_compile=False, run_eager=False
+            )
+        self.assertFalse(
+            any("op_spec: ReStickifyOpHBM," in message for message in logs.output),
+            "compiled with a restickify",
+        )
 
     def test_binary_op_cpu(self, op, x, y):
         # Eager mode support varies by op:
@@ -8371,7 +8436,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "spyre",
             )
 
-    @unittest.skip("topk.ddl does not support sparse input tensors; see #4732")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=InductorError,
+        reason=(
+            "topk.ddl (dxp_standalone) does not support sparse input tensors; "
+            "the backend compiler fails (#4732)"
+        ),
+    )
     def test_topk_sparse_input(self):
         # amax over the stick dim produces a sparse output (constant 0 in the
         # rightmost device coord). topk over a surviving dim of that sparse
@@ -8528,6 +8600,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         with pytest.raises(Exception, match=r"sum on DataFormats\.IEEE_INT32"):
             self.compare_with_cpu(lambda x: torch.nanmean(x), x, run_eager=False)
+
+    # fp32 max, min and softmax over a stick dim that needs padding (100 is not a
+    # multiple of the 32 elements in an fp32 stick). The front end pads with the fp16
+    # constants (+-65504.0, torch_spyre/_inductor/codegen/superdsc.py:_get_mask_value)
+    # whatever the dtype, and the backend rejects a 32-bit mask value whose two 16-bit
+    # halves differ (0xc77fe000 here). sum and mean pad with 0.0 and work. fp16 is fine.
+    # TODO: a missing feature (#2534): choose the pad value per dtype (0xFF7FFF7F for
+    # max, 0x7F7F7F7F for min). When it lands these have to become positive tests.
+    @expects_raise
+    def test_amax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amax(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_amin_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(lambda x: torch.amin(x, dim=-1), x, run_eager=False)
+
+    @expects_raise
+    def test_softmax_fp32_padded_stick_dim_rejected(self):
+        x = cached_randn((67, 100), dtype=torch.float32)
+        with pytest.raises(InductorError, match="repeating 16bit pattern"):
+            self.compare_with_cpu(
+                lambda x: torch.softmax(x, dim=-1), x, run_eager=False
+            )
 
     @pytest.mark.xfail(
         reason=(
@@ -8813,16 +8912,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         fn, call_args = _pattern_resolve(variant, args)
         atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
-        # The ViT attention with a CLS token has an unaligned token dim that the
-        # planner splits across cores; the backend cannot mask that (#5285). The
-        # softmax kernel fails in dbo-opt in both modes.
+        # The ViT attention with a CLS token has an unaligned token dim. In eager
+        # mode the planner splits it across cores for the softmax kernel, and the
+        # backend cannot mask that (#5285), so dbo-opt rejects it. Compiled, the
+        # softmax ops are no longer pinned by the padding's offset write, so the
+        # co-optimizing allocator divides them over batch and heads instead.
         with (
             pytest.raises(
                 Exception,
                 match="Cannot currently apply coordinate masking for dimensions "
                 "split across cores",
             )
-            if variant == "vit_attention_cls_token"
+            if variant == "vit_attention_cls_token" and execution_mode == "eager"
             else contextlib.nullcontext()
         ):
             compare_with_cpu(
@@ -9332,6 +9433,84 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x.view(*x.shape, 1).permute(0, 3, 1, 2).mul(5.0)
 
         self.compare_with_cpu(fn, x)
+
+    def test_split_multi_ops_view_loads_cpu(self, op, x):
+        # Small integers convert to fp32 exactly, so any difference is a wrong row.
+        self.compare_with_cpu(op, x, atol=0, rtol=0)
+
+    def test_split_multi_ops_view_loads_guard(self):
+        """split_multi_ops refuses an intermediate only if it combines view loads."""
+
+        def load(vid, name, index):
+            return ("load", vid, (), {"_name": name, "_index": index})
+
+        def validate(sizes, trace):
+            """Run the guard on a hand-built trace over one output dim of 32."""
+            with V.set_graph_handler(GraphLowering(fx.symbolic_trace(lambda: None))):
+                for name, size in sizes.items():
+                    V.graph.name_to_buffer[name] = InputBuffer(
+                        name=name,
+                        layout=FixedLayout(
+                            torch.device("cpu"),
+                            torch.float32,
+                            size,
+                            [32, 1][-len(size) :],
+                        ),
+                    )
+                pointwise = Pointwise.create(
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    inner_fn=lambda index: None,
+                    ranges=[32],
+                ).data.data
+                op = SimpleNamespace(data=pointwise, get_name=lambda: "buf0")
+                intermediate_ops = [e for e in trace if e[0] != "load"][:-1]
+                _validate_split_supported(op, trace, intermediate_ops)
+
+        (i0,) = _index_syms(1)
+        cases = {
+            # The split rebuilds the op over whole buffers, which would pair each
+            # element with itself.
+            "two_rows_of_one_buffer": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0),
+                    load(1, "arg", i0 + 32),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                True,
+            ),
+            # A single tensor operand is reloaded at its own index on replay.
+            "one_view_load": (
+                {"arg": [3, 32]},
+                [
+                    load(0, "arg", i0 + 32),
+                    ("constant", 1, (), {"fill_value": 2.0, "dtype": torch.float32}),
+                    ("add", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+            # Two buffers read at their own positions combine correctly.
+            "whole_buffers": (
+                {"a": [32], "b": [32]},
+                [
+                    load(0, "a", i0),
+                    load(1, "b", i0),
+                    ("mul", 2, (0, 1), {}),
+                    ("to_dtype", 3, (2,), {}),
+                ],
+                False,
+            ),
+        }
+        for case, (sizes, trace, refused) in cases.items():
+            with self.subTest(case):
+                if refused:
+                    with self.assertRaises(Unsupported):
+                        validate(sizes, trace)
+                else:
+                    validate(sizes, trace)
 
     def test_view_split_stick_slice_cpu(self, view_shape, slicer, x):
         """View the stick dim as (heads, D), then slice or stride D.
@@ -10058,6 +10237,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"({src},{dst}) is identity but ({dst},{src}) returned {rev}"
             )
 
+    def test_dtype_op_table_bool_gate_matches_codegen(self):
+        """A bool conversion the lowering accepts has an op in every bool format.
+
+        The lowering decides from torch dtypes alone, before a bool has its
+        device format, and the codegen resolves the op from that format. Each
+        destination it accepts must therefore resolve under every format a bool
+        can take, or a conversion compiles to an Unsupported error.
+        """
+        bool_formats = [
+            fmt
+            for fmt in DataFormats.__members__.values()
+            if bool_equivalent_dtype(fmt) is not None
+        ]
+        assert bool_formats
+        dtypes = {dtype for pair in DtypeOpTable.get_dtype_pairs() for dtype in pair}
+        for dst in dtypes:
+            if not DtypeOpTable.is_supported(torch.bool, dst):
+                continue
+            for fmt in bool_formats:
+                assert DtypeOpTable.get_bool_src_operator(fmt, dst) is not None, (
+                    f"bool -> {dst} is accepted but has no op from {fmt}"
+                )
+
     def test_to_dtype_cpu(self, x, dst_dtype):
         def fn(x, dst_dtype):
             return x.to(dtype=dst_dtype)
@@ -10276,6 +10478,106 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_float32_to_int_truncates_cpu(self):
+        # A cast to an integer truncates, including a negative value with a
+        # fraction, which the device op alone floors.
+        x = torch.tensor(
+            [0.4, 0.6, 1.5, 2.5, -0.4, -0.6, -1.5, -2.9] * 8, dtype=torch.float32
+        )
+        for dst in (torch.int32, torch.int64):
+            with self.subTest(dst=dst):
+                self.compare_with_cpu(
+                    lambda x, dst=dst: x.to(dst),
+                    x,
+                    atol=0.0,
+                    rtol=0.0,
+                    cpu_compile=False,
+                    run_eager=False,
+                )
+
+    def test_float32_to_int_truncates_views_cpu(self):
+        # The trunc reads its source twice, so over a view it must still compile.
+        # The stick-aligned slice starts at a whole stick (32 float32 elements).
+        x = (((torch.arange(4 * 64) * 7) % 23) - 11.5).reshape(4, 64)
+        views = {
+            "select": lambda x: x.select(0, 1),
+            "transpose": lambda x: x.t(),
+            "expand": lambda x: x[:, :1].expand(4, 64),
+            "aligned_slice": lambda x: x[:, 32:64],
+        }
+        for name, view in views.items():
+            for dst in (torch.int32, torch.int64):
+                with self.subTest(view=name, dst=dst):
+                    self.compare_with_cpu(
+                        lambda x, view=view, dst=dst: view(x).to(dst),
+                        x,
+                        atol=0.0,
+                        rtol=0.0,
+                        cpu_compile=False,
+                        run_eager=False,
+                    )
+
+    def test_gather_staggered_index_lane0_cpu(self):
+        # A float16 index widened onto a stick converts to int32 through a
+        # staggered float32 (hf-adapters' MoE expert indices). The gather reads
+        # lane 0 of each stick, which the stagger keeps in place, so the
+        # staggered index pairs with standard weights.
+        T, top_k, stick, experts, rows, cols = 4, 8, 64, 16, 64, 64
+        ids = (torch.arange(T * top_k) * 5 % experts).reshape(T, top_k)
+        idx_wide = ids[..., None].expand(T, top_k, stick).to(torch.float16)
+        weights = torch.arange(experts * rows * cols).reshape(experts, rows, cols)
+        weights = (weights % 251).to(torch.bfloat16)
+
+        def fn(idx_wide, weights):
+            addr = idx_wide.to(torch.float32)[..., : stick // 2].to(torch.int32)
+            return weights[addr[..., 0]].reshape(T * top_k, rows, cols)
+
+        self.compare_with_cpu(
+            fn,
+            idx_wide.contiguous(),
+            weights,
+            atol=0.0,
+            rtol=0.0,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_float32_to_int_saturates(self):
+        # Where a cast has no defined result in C (NaN, an infinity, a value
+        # outside int32 cast to int32), the CPU returns the minimum integer and
+        # the device saturates to the int32 range. A float32 is exact as an
+        # integer up to 2**24 and converts exactly within the int32 range.
+        values = [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            2.0**31,
+            -3.0e9,
+            1.0e20,
+            2.0**31 - 128,
+            -(2.0**31),
+            2.0**24 + 2,
+            -7.0,
+        ]
+        expected = [
+            2**31 - 1,
+            2**31 - 1,
+            -(2**31),
+            2**31 - 1,
+            -(2**31),
+            2**31 - 1,
+            2**31 - 128,
+            -(2**31),
+            2**24 + 2,
+            -7,
+        ]
+        x = torch.tensor(values, dtype=torch.float32)
+        cast = torch.compile(lambda x: x.to(torch.int32))
+        torch.testing.assert_close(
+            cast(x.to(utils_inductor.DEVICE)).cpu(),
+            torch.tensor(expected, dtype=torch.int32),
+        )
 
     def test_bool_staggered_ea_src_to_fp16_cpu(self):
         # Both operands upcast in-graph, so the bool carries a DL16_TO_FP32 EA

@@ -1499,7 +1499,7 @@ def _create_sdsc_tensors(
             if (
                 dim_coord is not None
                 and not isinstance(dim_coord, IndirectAccess)
-                and dev_dim_size > it_dim_size
+                and dev_dim_size != it_dim_size
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
@@ -1509,8 +1509,12 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
+                # Overlapping views can iterate beyond an aligned physical
+                # axis (e.g. unfold's window is wider than its step). Core
+                # offsets divide this span by the work split, so use the
+                # iteration extent even when it exceeds the device extent.
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
@@ -2078,20 +2082,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
-    # require at least one outer spatial dim beyond the stick; inject a
-    # virtual mb=1 row when the op's tensor has only the stick dim.
+    # A dtype conversion that changes the elements per stick (DL16TOFP32,
+    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
+    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
+    # only the stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
+    changes_stick_width = len(op_spec.args) == 2 and (
+        op_spec.args[0].device_dtype.elems_per_stick()
+        != op_spec.args[1].device_dtype.elems_per_stick()
+    )
     mb_sym: Symbol | None = None
-    if (
-        (
-            DtypeOpTable.is_dtype_op(op_spec.op)
-            or op_spec.op == "qfp8ch"
-            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
-        )
-        and op_spec.op != IDENTITY_OP
-        and (op_dim_order == [] or op_dim_order == [op_stick_dim])
-    ):
+    if changes_stick_width and (op_dim_order == [] or op_dim_order == [op_stick_dim]):
+        assert op_spec.op != IDENTITY_OP and (
+            DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op in ("qfp8ch", "qfp8wt")
+        ), f"{op_spec.op} changes the elements per stick but is not a conversion"
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
         dim_splits = {mb_sym: 1, **dim_splits}
