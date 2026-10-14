@@ -1168,7 +1168,16 @@ def lower_clamp(x, min=None, max=None):
         type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
     )
 
-    converted_x = x if x.get_dtype() == val_dtype else to_dtype(x, val_dtype)
+    if x.get_dtype() != val_dtype:
+        converted_x = to_dtype(x, val_dtype)
+        origin = x.get_origin_node() if isinstance(x, ir.IRNode) else None
+        _ensure_synthetic_origin(
+            converted_x,
+            torch.ops.prims.convert_element_type.default,
+            () if origin is None else (origin,),
+        )
+    else:
+        converted_x = x
 
     # Both logical fp16 and bf16 use DLFloat16 on device, whose infinity
     # encoding is finite. FP32 has IEEE infinities, so preserve those too.
@@ -1191,16 +1200,25 @@ def lower_clamp(x, min=None, max=None):
             converted_x.make_loader()(index), min_val, max_val
         ),
         ranges=converted_x.get_size(),
-        origin_node=x.get_origin_node(),
+        origin_node=converted_x.get_origin_node(),
         traceback=x.get_traceback(),
     )
     pw.realize()
 
-    result = pw
     if result_dtype != val_dtype:
-        result = to_dtype(result, result_dtype)
+        origin = (
+            converted_x.get_origin_node()
+            if isinstance(converted_x, ir.IRNode)
+            else None
+        )
+        _ensure_synthetic_origin(
+            pw,
+            torch.ops.spyre.clamp,
+            () if origin is None else (origin,),
+        )
+        return to_dtype(pw, result_dtype, skip_trunc=True)
 
-    return result
+    return pw
 
 
 @register_spyre_lowering(torch.ops.spyre.keep_by_index)
