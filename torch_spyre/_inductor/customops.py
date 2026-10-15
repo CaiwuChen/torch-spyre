@@ -1350,22 +1350,44 @@ def compute_grouped_mm_routing_tables(
     total_tokens: int,
     num_experts: int,
     capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Compute index tables on CPU for the on-device pack/BMM/unpack grouped_mm path.
 
     capacity is passed in by the decomposition (computed from static input shapes),
     so the real kernel and register_fake always agree on output shapes without any
     data-dependent computation here.
 
-    Returns:
-      src_indices: [num_experts * capacity], int32 — maps each slot in padded_a
+    Returns ONE packed int32 tensor of shape [num_experts * capacity + total_tokens]
+    (a single output keeps this a single-output FallbackKernel, which is what lets
+    mark_lx_safe take effect; a tuple return lowers to a multi-output kernel that
+    LX context switching skips). The decomposition slices it:
+      packed[:num_experts * capacity]  (src_indices) — maps each slot in padded_a
                    [num_experts, capacity, K] to a row in mat_a, or to total_tokens
                    (the appended zero-row) for padding slots.
-      dst_indices: [total_tokens], int32 — maps each output token to its position
-                   in flat padded_out [num_experts * capacity, N].
+      packed[num_experts * capacity:]  (dst_indices) — maps each output token to
+                   its position in flat padded_out [num_experts * capacity, N].
     """
     offs_cpu = offs.to("cpu", dtype=torch.int32)
     offs_list = offs_cpu.tolist()
+
+    if len(offs_list) != num_experts:
+        raise ValueError(
+            f"compute_grouped_mm_routing_tables: offs has {len(offs_list)} entries "
+            f"but num_experts={num_experts}"
+        )
+    prev = 0
+    for e, end in enumerate(offs_list):
+        if end < prev:
+            raise ValueError(
+                f"compute_grouped_mm_routing_tables: offs must be non-decreasing "
+                f"and non-negative, but offs[{e}]={end} follows {prev}"
+            )
+        prev = end
+    if prev > total_tokens:
+        raise ValueError(
+            f"compute_grouped_mm_routing_tables: offs[-1]={prev} exceeds "
+            f"total_tokens={total_tokens}"
+        )
 
     src_indices = torch.full((num_experts * capacity,), total_tokens, dtype=torch.int32)
     dst_indices = torch.zeros(total_tokens, dtype=torch.int32)
@@ -1375,8 +1397,8 @@ def compute_grouped_mm_routing_tables(
         end = offs_list[e]
         count = end - start
         if count > capacity:
-            # TODO: support overflow via multiple tiles per expert so that
-            # arbitrarily skewed distributions work without raising here.
+            # TODO(#5534): support overflow via multiple tiles per expert so
+            # that arbitrarily skewed distributions work without raising here.
             raise RuntimeError(
                 f"compute_grouped_mm_routing_tables: expert {e} has {count} tokens "
                 f"but capacity={capacity}.  "
@@ -1392,10 +1414,7 @@ def compute_grouped_mm_routing_tables(
             )
         start = end
 
-    return (
-        src_indices.to(device=offs.device),
-        dst_indices.to(device=offs.device),
-    )
+    return torch.cat([src_indices, dst_indices]).to(device=offs.device)
 
 
 @compute_grouped_mm_routing_tables.register_fake
@@ -1404,10 +1423,9 @@ def _(
     total_tokens: int,
     num_experts: int,
     capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty(num_experts * capacity, dtype=torch.int32, device=offs.device),
-        torch.empty(total_tokens, dtype=torch.int32, device=offs.device),
+) -> torch.Tensor:
+    return torch.empty(
+        num_experts * capacity + total_tokens, dtype=torch.int32, device=offs.device
     )
 
 

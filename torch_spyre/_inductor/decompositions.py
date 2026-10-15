@@ -168,8 +168,6 @@ _SDPA_DECODE_MAX_MULTI_BLOCK_EXTENT = 1024
 # the allocator remains the authority on whether the value is actually kept.
 _SDPA_RESTICK_LX_BYTES_PER_REUSING_HEAD = 2 * 1024
 
-_GROUPED_MM_BLOCK_SIZE = 64
-
 
 @dataclasses.dataclass(frozen=True)
 class _SDPATilingConfig:
@@ -3914,6 +3912,16 @@ def spyre_index_add(
     return torch.index_put(self, indices, updated, accumulate=False)
 
 
+def _grouped_mm_capacity(n: int, num_experts: int) -> int:
+    """Static per-expert capacity: 2 * ceil_to_64(n / num_experts), clamped to [64, n].
+
+    Computed from static shapes only so the decomposition stays traceable.
+    compute_grouped_mm_routing_tables raises at runtime if any segment exceeds it.
+    """
+    per_expert = (n + num_experts - 1) // num_experts
+    return max(64, min(n, ((per_expert + 63) // 64) * 64 * 2))
+
+
 @register_spyre_decompositions([torch.ops.aten._grouped_mm.default])
 def spyre_grouped_mm(
     self: torch.Tensor,
@@ -3935,10 +3943,25 @@ def spyre_grouped_mm(
     4. 2D x 2D with offs (mat_a [M, K_total] x mat_b [K_total, N]):
        On-device Pack along reduction dim K -> Direct 3D BMM [E, M, capacity] @ [E, capacity, N]
        -> out [E, M, N].
+
+    Scope and known limitations:
+      * BF16 only (upstream's meta rejects bias, a non-default out_dtype, and
+        fp16 off CUDA).
+      * `offs` must be a Spyre tensor. Eager calls with a CPU `offs` are
+        rejected by `_OPWrapper`'s device check (upstream accepted them).
+      * Per-expert capacity is static: 2 * ceil_to_64(n / num_experts),
+        clamped to [64, n]. A segment larger than that raises RuntimeError in
+        compute_grouped_mm_routing_tables; see #5534.
     """
+    # Upstream's meta rejects bias and any out_dtype other than the input dtype
+    # for the dtypes Spyre supports (bf16), so these are never legitimately set.
+    assert bias is None, "Spyre grouped_mm does not support bias"
+    assert out_dtype is None or out_dtype == self.dtype, (
+        "Spyre grouped_mm does not support out_dtype != input dtype"
+    )
+
     a_is_2d = self.dim() == 2
     b_is_2d = mat2.dim() == 2
-    mat2_c = mat2.contiguous()
 
     if a_is_2d and not b_is_2d:
         assert offs is not None, "2D x 3D grouped_mm requires offs"
@@ -3947,16 +3970,13 @@ def spyre_grouped_mm(
         num_experts: int = mat2.shape[0]
         N: int = mat2.shape[-1]
 
-        # capacity = 2 × ceil_to_64(T/E), clamped to [64, T].
-        # Raises at runtime if any segment exceeds this; see compute_grouped_mm_routing_tables.
-        tokens_per_expert = (total_tokens + num_experts - 1) // num_experts
-        capacity = max(
-            64, min(total_tokens, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2))
-        )
+        capacity = _grouped_mm_capacity(total_tokens, num_experts)
 
-        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, total_tokens, num_experts, capacity
         )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
 
         zero_row = torch.zeros(1, K, dtype=self.dtype, device=self.device)
         self_with_zero = torch.cat([self, zero_row], dim=0)
@@ -3964,12 +3984,12 @@ def spyre_grouped_mm(
             num_experts, capacity, K
         )
 
-        padded_out = torch.bmm(padded_a, mat2_c)
+        padded_out = torch.bmm(padded_a, mat2.contiguous())
         flat_out = padded_out.reshape(num_experts * capacity, N)
         out = torch.index_select(flat_out, 0, dst_indices)
 
     elif not a_is_2d and not b_is_2d:
-        out = torch.bmm(self, mat2_c)
+        out = torch.bmm(self, mat2.contiguous())
 
     elif not a_is_2d and b_is_2d:
         assert offs is not None, "3D x 2D grouped_mm requires offs"
@@ -3978,12 +3998,13 @@ def spyre_grouped_mm(
         K = self.shape[2]
         T = mat2.shape[1]
 
-        tokens_per_expert = (T + num_experts - 1) // num_experts
-        capacity = max(64, min(T, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2)))
+        capacity = _grouped_mm_capacity(T, num_experts)
 
-        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, T, num_experts, capacity
         )
+        src_indices = packed[: num_experts * capacity]
+        dst_indices = packed[num_experts * capacity :]
 
         b_2d_T = mat2.transpose(0, 1).contiguous()
         zero_row = torch.zeros(1, K, dtype=mat2.dtype, device=mat2.device)
@@ -4007,14 +4028,12 @@ def spyre_grouped_mm(
         K_total = self.shape[1]
         N = mat2.shape[1]
 
-        tokens_per_expert = (K_total + num_experts - 1) // num_experts
-        capacity = max(
-            64, min(K_total, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2))
-        )
+        capacity = _grouped_mm_capacity(K_total, num_experts)
 
-        src_indices, _ = torch.ops.spyre.compute_grouped_mm_routing_tables(
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(
             offs, K_total, num_experts, capacity
         )
+        src_indices = packed[: num_experts * capacity]
 
         a_T = self.transpose(0, 1).contiguous()
         zero_row_a = torch.zeros(1, M, dtype=self.dtype, device=self.device)
@@ -4032,10 +4051,6 @@ def spyre_grouped_mm(
 
         out = torch.bmm(padded_a, padded_b)
 
-    if bias is not None:
-        out = out + bias
-    if out_dtype is not None:
-        out = out.to(out_dtype)
     return out
 
 

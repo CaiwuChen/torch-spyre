@@ -448,12 +448,24 @@ def _grouped_mm_ones_b_scaled(shape, expert_scale: float = 1.0, dtype=torch.bflo
 
 
 @functools.lru_cache(maxsize=None)
-def _grouped_mm_distinct_b(E: int, K: int, N: int, dtype=torch.bfloat16):
+def _grouped_mm_distinct_b(
+    E: int, K: int, N: int, dtype=torch.bfloat16, transposed: bool = False
+):
     """Return mat_b [E, K, N] where expert e has weight (e+1)/(K*E) per entry.
 
     Combined with _grouped_mm_ramp_a(T, K), output[t] = (t+1)/T * (e+1)/E.
-    A wrong-expert assignment shifts the output by at least 1/E (for t > 0).
+    A wrong-expert assignment shifts the output by (t+1)/T * |delta_e|/E, which
+    is at most 1/E and shrinks towards 0 for small t.
+
+    transposed=True returns a [E, K, N] *view* of a contiguous [E, N, K] tensor
+    (stride [N*K, 1, K]), the layout real MoE weights have
+    (``weight.transpose(-1, -2)`` of nn.Linear-layout experts).
     """
+    if transposed:
+        slabs = [
+            torch.full((1, N, K), float(e + 1) / (K * E), dtype=dtype) for e in range(E)
+        ]
+        return torch.cat(slabs, dim=0).transpose(-1, -2)
     slabs = [
         torch.full((1, K, N), float(e + 1) / (K * E), dtype=dtype) for e in range(E)
     ]
@@ -7413,12 +7425,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_split_multi_ops_view_loads", "test_split_multi_ops_view_loads_cpu"): {
             "ops_dict": {
                 "mul_2_rows": lambda x: x.select(0, 0) * x.select(0, 1),
-                "mul_3_rows": lambda x: x.select(0, 0)
-                * x.select(0, 1)
-                * x.select(0, 2),
-                "add_3_rows": lambda x: x.select(0, 0)
-                + x.select(0, 1)
-                + x.select(0, 2),
+                "mul_3_rows": lambda x: (
+                    x.select(0, 0) * x.select(0, 1) * x.select(0, 2)
+                ),
+                "add_3_rows": lambda x: (
+                    x.select(0, 0) + x.select(0, 1) + x.select(0, 2)
+                ),
             },
             "param_sets": {
                 "3x32": (
@@ -7627,24 +7639,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # grouped_mm — torch._grouped_mm parameterized tests
         ("test_grouped_mm", "test_grouped_mm_base"): {
             "param_sets": {
+                # The Gemma-shaped cases use transposed [E, K, N] views of
+                # contiguous [E, N, K] weights, the layout HF's
+                # grouped_mm_experts_forward passes (stride [N*K, 1, K]).
                 "model_ops_case1": (
                     _grouped_mm_ramp_a(192, 2816),
-                    _grouped_mm_distinct_b(128, 2816, 1408),
+                    _grouped_mm_distinct_b(128, 2816, 1408, transposed=True),
                     _cached_grouped_mm_offs(128, 192),
                 ),
                 "model_ops_case2": (
                     _grouped_mm_ramp_a(192, 704),
-                    _grouped_mm_distinct_b(128, 704, 2816),
+                    _grouped_mm_distinct_b(128, 704, 2816, transposed=True),
                     _cached_grouped_mm_offs(128, 192),
                 ),
                 "large_batch_T4096": (
                     _grouped_mm_ramp_a(4096, 2816),
-                    _grouped_mm_distinct_b(128, 2816, 1408),
+                    _grouped_mm_distinct_b(128, 2816, 1408, transposed=True),
                     _cached_grouped_mm_offs(128, 4096),
                 ),
                 "large_batch_T8192": (
                     _grouped_mm_ramp_a(8192, 2816),
-                    _grouped_mm_distinct_b(128, 2816, 1408),
+                    _grouped_mm_distinct_b(128, 2816, 1408, transposed=True),
                     _cached_grouped_mm_offs(128, 8192),
                 ),
                 "small_tokens_T64_E16": (
@@ -7712,22 +7727,71 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     _grouped_mm_distinct_b(64, 512, 256),
                     None,
                 ),
-                # Overflow case: T=192, E=4 → capacity=128.
-                # offs gives expert 0 exactly 129 tokens (one above capacity).
-                # The compiled path raises RuntimeError from the overflow guard
-                # in compute_grouped_mm_routing_tables, so this case is
-                # expected to fail until multi-tile overflow support is added.
+                # Random-normal inputs (a ~ N(0,1), b ~ N(0,1/K)): unlike the
+                # ramp / per-expert-constant cases above, these vary along K
+                # and N, so a permutation along either (e.g. a transpose /
+                # restickify bug) changes the output. Uneven groups include an
+                # empty expert and a segment over 64.
+                "randn_2d3d_T128_E4": (
+                    cached_randn((128, 128), differentiation="a", dtype=torch.bfloat16),
+                    cached_randn(
+                        (4, 128, 64),
+                        differentiation="b",
+                        dtype=torch.bfloat16,
+                        scale=128**-0.5,
+                    ),
+                    torch.tensor([30, 95, 95, 128], dtype=torch.int32),
+                    0.02,
+                ),
+                "randn_3d2d_T128_E4": (
+                    cached_randn(
+                        (4, 16, 64), differentiation="a", dtype=torch.bfloat16
+                    ),
+                    cached_randn(
+                        (64, 128),
+                        differentiation="b",
+                        dtype=torch.bfloat16,
+                        scale=64**-0.5,
+                    ),
+                    torch.tensor([30, 95, 95, 128], dtype=torch.int32),
+                    0.02,
+                ),
+                "randn_2d2d_K128_E4": (
+                    cached_randn((16, 128), differentiation="a", dtype=torch.bfloat16),
+                    cached_randn(
+                        (128, 32),
+                        differentiation="b",
+                        dtype=torch.bfloat16,
+                        scale=128**-0.5,
+                    ),
+                    torch.tensor([30, 95, 95, 128], dtype=torch.int32),
+                ),
+                # Overflow cases: T=192, E=4 → capacity=128; offs gives expert 0
+                # exactly 129 tokens (one above capacity) in each ragged variant.
+                # The overflow guard in compute_grouped_mm_routing_tables
+                # deliberately rejects this until multi-tile overflow support
+                # lands (see the TODO there), so these are expect_raise cases.
                 "overflow_2d3d_T192_E4": (
                     _grouped_mm_ramp_a(192, 32),
                     _grouped_mm_distinct_b(4, 32, 16),
                     torch.tensor([129, 192, 192, 192], dtype=torch.int32),
                 ),
+                "overflow_3d2d_T192_E4": (
+                    torch.stack([_grouped_mm_ramp_a(16, 32) for _ in range(4)]),
+                    _grouped_mm_ones_b_scaled((32, 192)),
+                    torch.tensor([129, 192, 192, 192], dtype=torch.int32),
+                ),
+                "overflow_2d2d_T192_E4": (
+                    _grouped_mm_ramp_a(16, 192),
+                    _grouped_mm_ones_b_scaled((192, 16)),
+                    torch.tensor([129, 192, 192, 192], dtype=torch.int32),
+                ),
             },
-            "expect_fail": [
-                # capacity=128 for T=192/E=4; expert 0 has 129 tokens → overflow
-                # guard raises RuntimeError.  Remove once multi-tile is supported.
-                "overflow_2d3d_T192_E4",
-            ],
+            "expect_raise": {
+                "overflow_2d3d_T192_E4": "capacity=128",
+                "overflow_3d2d_T192_E4": "capacity=128",
+                "overflow_2d2d_T192_E4": "capacity=128",
+            },
         },
     }
 
@@ -11533,27 +11597,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
-    def test_grouped_mm_base(self, mat_a, mat_b, offs):
+    def test_grouped_mm_base(self, mat_a, mat_b, offs, tol=0.005):
         """Base method for parameterized torch._grouped_mm tests.
 
         offs is a cumsum int32 offsets tensor for the 2D/3D-with-offs variants,
-        or None for the 3D×3D no-offs variant.
+        or None for the 3D×3D no-offs variant.  tol is the atol/rtol; the
+        random-normal cases pass a larger value because their outputs reach
+        magnitude ~4, where one bf16 ulp is 2**-6 (0.0156).  Routing errors
+        change outputs by O(1), so this still rejects them.
         """
         if offs is None:
 
             def fn(a, b):
                 return torch._grouped_mm(a, b)
 
-            self.compare_with_cpu(
-                fn, mat_a, mat_b, atol=0.005, rtol=0.005, run_eager=False
-            )
+            self.compare_with_cpu(fn, mat_a, mat_b, atol=tol, rtol=tol, run_eager=False)
         else:
 
             def fn(a, b, o):
                 return torch._grouped_mm(a, b, offs=o)
 
             self.compare_with_cpu(
-                fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
+                fn, mat_a, mat_b, offs, atol=tol, rtol=tol, run_eager=False
             )
 
     def test_grouped_mm_different_offs(self):
@@ -11616,6 +11681,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
           2. Every padding slot points to total_tokens (the zero-row index)
           3. dst_indices values are in [0, E * capacity)
           4. src_indices values are in [0, total_tokens]
+          5. Expert ownership: dst_indices[t] // capacity is the expert whose
+             offs segment contains t
 
         Uses uneven groups (counts 30/65/0/33), which includes an empty expert
         and a segment of 65 tokens crossing the 64-element block boundary.
@@ -11633,11 +11700,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         capacity = max(64, min(T, max(64, ((tokens_per_expert + 63) // 64) * 64 * 2)))
 
         # --- call the production custom op ---
-        src_indices, dst_indices = torch.ops.spyre.compute_grouped_mm_routing_tables(
-            offs, T, E, capacity
-        )
-        src = src_indices.tolist()
-        dst = dst_indices.tolist()
+        # It returns one packed int32 tensor [E * capacity + T]:
+        # src_indices followed by dst_indices.
+        packed = torch.ops.spyre.compute_grouped_mm_routing_tables(offs, T, E, capacity)
+        assert packed.dtype == torch.int32
+        src = packed[: E * capacity].tolist()
+        dst = packed[E * capacity :].tolist()
 
         assert len(src) == E * capacity, f"src length {len(src)} != {E * capacity}"
         assert len(dst) == T, f"dst length {len(dst)} != {T}"
@@ -11667,6 +11735,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         for i, v in enumerate(src):
             assert 0 <= v <= T, f"src[{i}]={v} out of [0, {T}]"
 
+        # (5) expert ownership of the tables themselves
+        start = 0
+        for e in range(E):
+            for t in range(start, start + counts_list[e]):
+                assert dst[t] // capacity == e, (
+                    f"token {t} belongs to expert {e} but dst[{t}]={dst[t]} "
+                    f"is in expert slot block {dst[t] // capacity}"
+                )
+            start += counts_list[e]
+
         # --- expert-ownership numerical check ---
         mat_a = _grouped_mm_ramp_a(T, K)
         mat_b = _grouped_mm_distinct_b(E, K, N)
@@ -11690,6 +11768,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             fn, mat_a, mat_b, offs, atol=0.005, rtol=0.005, run_eager=False
         )
+
+    @expects_raise
+    def test_grouped_mm_routing_rejects_invalid_offs(self):
+        """The routing op gives clear errors for malformed offs."""
+        import torch_spyre  # noqa: F401 — registers spyre custom ops
+
+        op = torch.ops.spyre.compute_grouped_mm_routing_tables
+        cases = [
+            (torch.tensor([32, 64, 96], dtype=torch.int32), "offs has 3"),
+            (torch.tensor([64, 32, 96, 128], dtype=torch.int32), "non-decreasing"),
+            (
+                torch.tensor([32, 64, 96, 129], dtype=torch.int32),
+                "exceeds total_tokens",
+            ),
+        ]
+        for offs, fragment in cases:
+            with pytest.raises(ValueError, match=fragment):
+                op(offs, 128, 4, 128)
 
     def test_grouped_mm_fullgraph(self):
         """All three ragged grouped_mm variants compile with fullgraph=True.
