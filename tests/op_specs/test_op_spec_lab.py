@@ -31,6 +31,7 @@ import pytest
 from sympy import sympify
 
 import torch
+from torch._inductor.codecache import CodeCacheFuture
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as spyre_config
@@ -139,6 +140,34 @@ class _FakeRunner:
 def _fake_sdsc(self, kernel_name, specs, pool_size=0):
     """Stand in for sdsc() with its real signature, so the spy is called as it is."""
     return _FakeRunner()
+
+
+def _fake_ktir(self, kernel_name, specs):
+    """The same for ktir(), whose signature carries no pool_size."""
+    return _FakeRunner()
+
+
+class _FakeCompiler:
+    """A SpyreAsyncCompile recording which emitter it was asked for.
+
+    Patched in as the class rather than the method: the real constructor starts
+    AsyncCompile's worker pool, which a test that compiles nothing has no use for.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def sdsc(self, name, specs, pool_size=0):
+        self.calls.append("sdsc")
+        return _FakeRunner()
+
+    def ktir(self, name, specs):
+        self.calls.append("ktir")
+        return _FakeRunner()
+
+    def wait(self, scope):
+        # The real one resolves futures here; these fakes are already runners.
+        return None
 
 
 def _arg_record(dtype=torch.float16):
@@ -338,7 +367,7 @@ def test_emitted_script_forwards_the_pool_size():
 
 
 def test_bundling_a_pool_spec_emits_the_pool_allocation(tmp_path):
-    """Bundle a pool spec for real -- no device, no mock, no dxp_standalone.
+    """Bundle a pool spec for real -- no device, no mock, no backend compiler.
 
     The unmocked call is the point: ``generate_bundle`` is where a dropped
     pool_size actually bites, and it asserts ``0 < pool_size`` only when it sees
@@ -483,6 +512,36 @@ def test_run_recorder_records_the_first_launch_only():
     assert proxy.code_dir == inner.code_dir  # unknown attributes forward
 
 
+def test_capture_preserves_compile_future_until_runner_resolution():
+    class _FakeCompileFuture(CodeCacheFuture):
+        def __init__(self, runner):
+            self.runner = runner
+            self.timeout = None
+
+        def result(self, timeout=None):
+            self.timeout = timeout
+            return self.runner
+
+    inner = _FakeRunner()
+    future = _FakeCompileFuture(inner)
+    compiler = SpyreAsyncCompile()
+    with patch.object(SpyreAsyncCompile, "sdsc", return_value=future):
+        with capture.capture_kernels() as records:
+            scope = {"kernel": compiler.sdsc("sdsc_stub_0", [_add_op()])}
+
+    assert isinstance(scope["kernel"], CodeCacheFuture)
+    with torch._inductor.config.patch(
+        {"compile_threads": 2, "compile_worker_wait_timeout": 17}
+    ):
+        compiler.wait(scope)
+
+    assert future.timeout == 17
+    recorder = scope["kernel"]
+    assert isinstance(recorder, capture._RunRecorder)
+    assert recorder._inner is inner
+    assert recorder._rec is records[0]
+
+
 def _stub_sdsc_program(tmp_path, body):
     """Write a target program that compiles ``n`` kernels, then runs ``body``."""
     program = tmp_path / "prog.py"
@@ -589,6 +648,137 @@ def test_pin_bundle_symbolic_args_ignores_an_unrecorded_value():
     with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
         runner.pin_bundle_symbolic_args(None)
         assert spyre_config.bundle_symbolic_args is True
+
+
+def _ktir_stage(tmp_path, emitted="module {}\n", available=True):
+    """Drive ``--stage ktir`` with the emitter stubbed; return (calls, out_dir).
+
+    The emitter itself is covered by test_ktir_emitter.py against real dialect
+    bindings; what is under test here is the stage -- the filename it writes and
+    the ``bake_addresses`` it derives -- so ``generate_ktir`` is a spy and this
+    runs with no mlir_ktdp installed.
+    """
+    calls: list = []
+
+    def fake_generate_ktir(name, specs, **options):
+        calls.append((name, list(specs), options))
+        return emitted
+
+    out_dir = str(tmp_path / "ktir_out")
+    argv = ["--stage", "ktir", "--out-dir", out_dir]
+    with (
+        patch.object(runner, "generate_ktir", fake_generate_ktir),
+        patch.object(runner, "dialect_available", lambda: available),
+    ):
+        runner.main("ktir_add_0", [_add_op()], [], argv=argv)
+    return calls, out_dir
+
+
+def test_ktir_stage_writes_the_dialect_text(tmp_path):
+    """``--stage ktir`` is the KTIR counterpart of ``--stage bundle``."""
+    calls, out_dir = _ktir_stage(tmp_path, emitted="module { /* kernel */ }\n")
+
+    assert len(calls) == 1
+    assert calls[0][0] == "ktir_add_0"
+    with open(os.path.join(out_dir, "ktir_add_0.ktir")) as fh:
+        assert fh.read() == "module { /* kernel */ }\n"
+
+
+@pytest.mark.parametrize("symbolic", [True, False])
+def test_ktir_stage_bakes_addresses_iff_the_capture_did(tmp_path, symbolic):
+    """The two forms read different fields, so this cannot be a free choice.
+
+    A baked emission resolves ``allocation["hbm"]`` as a byte address, which the
+    spec only holds under ``bundle_symbolic_args=False``; the symbolic form never
+    reads it. Deriving the option from the pinned flag is what keeps a captured
+    script off the ambient environment here too.
+    """
+    with spyre_config.patch(bundle_symbolic_args=symbolic):  # type: ignore[attr-defined]
+        calls, _ = _ktir_stage(tmp_path)
+
+    assert calls[0][2] == {"bake_addresses": not symbolic}
+
+
+def test_ktir_stage_names_the_missing_bindings(tmp_path):
+    """mlir_ktdp is an extra, so its absence is a setup step, not a traceback."""
+    with pytest.raises(SystemExit) as exc:
+        _ktir_stage(tmp_path, available=False)
+
+    assert "tools/install-ktir.sh" in str(exc.value)
+
+
+def test_run_stage_compiles_through_the_emitter_that_built_the_spec():
+    """A KTIR spec's baked addresses make generate_bundle refuse it outright.
+
+    So the choice cannot come from the ambient config: it has to be the value the
+    capture recorded, or a replay of a KTIR kernel fails in the SDSC emitter with
+    a message about a flag rather than about the wrong backend.
+    """
+    compiler = _FakeCompiler()
+    tensors = [torch.zeros(2, 2, dtype=torch.float16)]
+    with (
+        patch.object(runner, "SpyreAsyncCompile", lambda: compiler),
+        patch.object(runner, "to_device", lambda ts, layouts=None: list(ts)),
+    ):
+        runner.run_op_specs("k", [_add_op()], tensors, ktir_emitter=True)
+        runner.run_op_specs("k", [_add_op()], tensors, ktir_emitter=False)
+
+    assert compiler.calls == ["ktir", "sdsc"]
+
+
+def test_emitted_script_pins_the_emitter():
+    """Same reason as BUNDLE_SYMBOLIC_ARGS: the ambient config may disagree."""
+    rec = _record()
+    rec.ktir_emitter = True
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    namespace: dict = {"__file__": "/tmp/captured/ktir_add_0.py"}
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+
+    assert namespace["KTIR_EMITTER"] is True
+    assert "ktir_emitter=KTIR_EMITTER" in src
+    # The stage that cannot work on this spec is not advertised: a KTIR spec's
+    # addresses are baked, and generate_bundle rejects those.  Matched on the
+    # invocation, since the inlined main() documents both stages either way.
+    assert "<this file> --stage ktir" in src
+    assert "<this file> --stage bundle" not in src
+
+
+def test_capture_sees_the_ktir_emitter(tmp_path):
+    """Spying sdsc alone made a KTIR-mode capture record nothing at all.
+
+    Which surfaces as "no kernels captured: check the script calls torch.compile"
+    -- a hint that sends the reader to look at their program instead of at the
+    emitter their environment selected.
+    """
+    program = _stub_sdsc_program(
+        tmp_path, "SpyreAsyncCompile().ktir('ktir_stub_0', [])\n"
+    )
+    out_dir = tmp_path / "captured"
+    argv = [str(program), "--out", str(out_dir), "--emitter", "ktir"]
+
+    with patch.object(SpyreAsyncCompile, "ktir", _fake_ktir):
+        status = capture.main(argv)
+
+    assert status == 0
+    assert "KTIR_EMITTER = True" in (out_dir / "ktir_stub_0.py").read_text()
+
+
+def test_no_execute_stubs_every_backend_hook(tmp_path):
+    """--no-execute's mock targets are only resolved when --no-execute is used.
+
+    ``patch()`` raises AttributeError on a target that has been renamed, so the
+    KTIR pair -- reached by no other test -- would rot unnoticed otherwise.
+    """
+    program = _stub_sdsc_program(
+        tmp_path, "SpyreAsyncCompile().sdsc('sdsc_stub_0', [])\n"
+    )
+    out_dir = tmp_path / "captured"
+
+    with patch.object(SpyreAsyncCompile, "sdsc", _fake_sdsc):
+        status = capture.main([str(program), "--out", str(out_dir), "--no-execute"])
+
+    assert status == 0
+    assert (out_dir / "sdsc_stub_0.py").exists()
 
 
 def test_dedup_ignores_provenance_only_differences():
