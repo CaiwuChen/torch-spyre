@@ -2922,8 +2922,15 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
+    # The real strides, not the contiguous ones of the two sizes: this op may
+    # write its output in a permuted order, and its stride_map follows that.
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        old_host_stride=[int(s) for s in old_stride],
+        new_host_stride=[int(s) for s in layout.stride],
     )
     return _DivideRangesResult(retiled_info, symbol_remap)
 
@@ -4275,11 +4282,16 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            # The tile's real strides and the full buffer's, as _divide_ranges
+            # passes them the other way: a tile written in a permuted order
+            # grows back along the dims it was shrunk on.
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(s) for s in orig_layout.stride],
+                new_host_stride=[int(s) for s in strides],
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -5278,13 +5290,19 @@ def _insert_one_read_copy(
         # The guard above has established that the non-unit dims and
         # tile_ranges are the same length, so this walk cannot run off the
         # end.
+        # The copy's strides ride along the same walk: on a permuted source
+        # only they tell the resize which device dim steps which host dim.
+        # A unit dim's stride is never read.
         tile_size_ints = []
+        tile_stride_ints = []
         it_idx = 0
         for s in full_size_ints:
             if s == 1:
                 tile_size_ints.append(1)
+                tile_stride_ints.append(1)
             else:
                 tile_size_ints.append(int(tile_ranges[it_idx]))
+                tile_stride_ints.append(int(tile_strides[it_idx]))
                 it_idx += 1
         # Authoritative stick host dim from coordinate identity (issue
         # #3116); None falls back to size-based inference inside
@@ -5296,6 +5314,8 @@ def _insert_one_read_copy(
                 full_size_ints,
                 tile_size_ints,
                 stick_host_dim=stick_hd,
+                old_host_stride=[int(st) for st in full_layout.stride],
+                new_host_stride=tile_stride_ints,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides
@@ -7210,7 +7230,7 @@ def _is_dense_full_buffer_view(
 
     try:
         atoms, offset = decompose_index_for_tiling(
-            index, {sym: 1 for sym in index.free_symbols}
+            index, dict.fromkeys(index.free_symbols, 1)
         )
     except Unsupported:
         return False
@@ -7386,9 +7406,7 @@ def _index_already_at_new_scale(
     a dim's stride), which is a no-op either way.
     """
     try:
-        atoms, _offset = decompose_index_for_tiling(
-            index, {sym: 1 for sym in loop_syms}
-        )
+        atoms, _offset = decompose_index_for_tiling(index, dict.fromkeys(loop_syms, 1))
     except Unsupported:
         return False
     if not atoms:
@@ -7527,7 +7545,7 @@ def _retile_load_index(
 
         new_index = compute_tile_index(
             index_to_retile,
-            {sym: 1 for sym in loop_syms},
+            dict.fromkeys(loop_syms, 1),
             info.old_size,
             info.old_stride,
             info.new_stride,

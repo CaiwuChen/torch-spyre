@@ -99,6 +99,7 @@ from torch_spyre._inductor.wsr.tile_prediction import (
     _rejection_reason,
     predict_frame,
 )
+from torch_spyre._inductor.scratchpad import coarse_tiling as coarse_tiling_module
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
     CoarseTilingPass,
     _derive_group_idx_offset,
@@ -2130,6 +2131,173 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_grow_from_singleton_permuted(self):
+        """The grow path on a permuted buffer: a device dim tiled to size 1
+        (stride_map -1) grows back to the full buffer's actual host stride, not
+        the contiguous one."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        order = [1, 0, 2, 3]
+        expected = SpyreTensorLayout(size, stride, torch.float16, order)
+        # The per-tile buffer's compact strides, in the full buffer's dim order.
+        for tile_size, tile_stride in (
+            ([1, 8, 512, 512], [512, 512, 4096, 1]),
+            ([8, 1, 512, 512], [512, 4096, 4096, 1]),
+        ):
+            with self.subTest(tile_size=tile_size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                self.assertIn(-1, list(stl.stride_map))
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=3,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(result, expected)
+
+    def test_resize_device_layout_grow_from_one_stick(self):
+        """The grow path from a tile whose stick dim is one stick long: its
+        tile-count dim has size 1 but a real stride_map, so it is grown, not
+        taken for a placeholder or for a host dim of extent 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        # (size, stride, tile_size, tile_stride, dim_order, stick_host_dim)
+        cases = (
+            ([4, 128], [128, 1], [4, 64], [64, 1], [0, 1], 1),
+            # Also a host dim of extent 1, which the tile-count dim must not
+            # be matched to.
+            (
+                [512, 64, 64, 2],
+                [128, 1, 65536, 64],
+                [512, 64, 64, 1],
+                [64, 1, 32768, 64],
+                [0, 2, 3, 1],
+                None,
+            ),
+        )
+        for size, stride, tile_size, tile_stride, order, shd in cases:
+            with self.subTest(size=size):
+                stl = SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+                result = _resize_device_layout(
+                    stl,
+                    tile_size,
+                    size,
+                    stick_host_dim=shd,
+                    old_host_stride=tile_stride,
+                    new_host_stride=stride,
+                )
+                self.assertEqual(
+                    result, SpyreTensorLayout(size, stride, torch.float16, order)
+                )
+
+    def test_resize_device_layout_sub_stick_tile_count(self):
+        """A stick host dim shorter than a stick: its size-1 tile-count dim
+        steps the whole dim (stride_map 32 here), not a stick (64), and size-1
+        host dims are left over, so only that stride identifies it."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [1, 20, 1, 32], [640, 32, 32, 1]
+        order = [0, 1, 2, 3]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [20, 1, 1, 1, 64])
+        self.assertEqual(list(stl.stride_map), [32, -1, 32, -1, 1])
+
+        tile_size, tile_stride = [1, 10, 1, 32], [320, 32, 32, 1]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=3,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result, SpyreTensorLayout(tile_size, tile_stride, torch.float16, order)
+        )
+
+    def test_resize_device_layout_permuted_same_size_dims(self):
+        """A permuted layout whose two size-8 dims both miss the contiguous
+        strides: only the buffer's own strides tell which device dim is d0.
+
+        Attention scores [8, 8, 512, 512] with host strides (512, 4096, 32768, 1);
+        the tile count ceil(512/64) = 8 collides with both. Tiling d0 by 2 must
+        halve device dim 0 (stride_map 512), not leave the layout full size."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2, 3])
+        self.assertEqual(list(stl.device_size), [8, 512, 8, 8, 64])
+        self.assertEqual(list(stl.stride_map), [512, 32768, 64, 4096, 1])
+
+        # The per-tile buffer's compact strides, in the full buffer's dim order.
+        tile_size, tile_stride = [4, 8, 512, 512], [512, 2048, 16384, 1]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=3,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(list(result.device_size), [4, 512, 8, 8, 64])
+        # The stride_map follows the tile's host strides, as a layout built from
+        # them directly would.
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(tile_size, tile_stride, torch.float16, [1, 0, 2, 3]),
+        )
+
+    def test_resize_device_layout_ignores_a_coincident_contiguous_stride(self):
+        """[2, 128, 2, 64] with the stick on dim 1, at host strides
+        (16384, 1, 8192, 128): the tile-count dim (size 2, stride_map 64) ties
+        dims 0 and 2 in size and misses both their strides, but equals dim 2's
+        contiguous stride. Given the actual strides, that coincidence must not
+        make it dim 2's."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride, order = [2, 128, 2, 64], [16384, 1, 8192, 128], [0, 2, 3, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, order)
+        self.assertEqual(list(stl.device_size), [2, 64, 2, 2, 64])
+        self.assertEqual(list(stl.stride_map), [8192, 128, 64, 16384, 1])
+
+        tile_size, tile_stride = [2, 128, 2, 32], [8192, 1, 4096, 128]
+        result = _resize_device_layout(
+            stl,
+            size,
+            tile_size,
+            stick_host_dim=1,
+            old_host_stride=stride,
+            new_host_stride=tile_stride,
+        )
+        self.assertEqual(
+            result,
+            SpyreTensorLayout(tile_size, tile_stride, torch.float16, order),
+        )
+
+    def test_resize_device_layout_refuses_a_tile_count_dim_at_a_foreign_stride(
+        self,
+    ):
+        """The same layout without its strides: the two size-8 dims tie the
+        tile count in size, but not in stride, so they are not the tile count.
+        Taking them for it returned the layout unresized."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+
+        size, stride = [8, 8, 512, 512], [512, 4096, 32768, 1]
+        stl = SpyreTensorLayout(size, stride, torch.float16, [1, 0, 2, 3])
+        for tile_size in ([4, 8, 512, 512], [8, 4, 512, 512]):
+            with self.subTest(tile_size=tile_size):
+                with self.assertRaisesRegex(RuntimeError, "not the tile-count dim"):
+                    _resize_device_layout(stl, size, tile_size, stick_host_dim=3)
+
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
         cannot be uniquely identified from stride_map[-1].
@@ -2201,6 +2369,55 @@ class TestDivideRanges(unittest.TestCase):
         )
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
         self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+
+    def test_resize_device_layout_follows_permuted_host_strides(self):
+        """A buffer written in a permuted order: host dim 1 is the outer one,
+        as on the output of ``(x + y).permute(1, 0, 2) * 2``.
+
+        The contiguous strides of its size put the outer stride on host dim 0
+        instead. Standing in for the real ones, they name the wrong host dim
+        for a device dim where two host dims are the same size, and leave the
+        outer dim's stride as it was where an inner dim shrinks under it. With
+        the buffer's own strides, the resized layout is the one the tile would
+        be given if it were laid out directly.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.tile import compute_tile_stride
+
+        cases = [
+            # (size, stride, tile size)
+            (
+                "same size, outer dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [64, 16, 128],
+            ),
+            (
+                "same size, inner dim tiled",
+                [64, 64, 128],
+                [128, 8192, 1],
+                [16, 64, 128],
+            ),
+            ("inner dim tiled", [32, 64, 128], [128, 4096, 1], [8, 64, 128]),
+        ]
+        for name, size, stride, tile_size in cases:
+            with self.subTest(name):
+                tile_stride = [
+                    int(s) for s in compute_tile_stride(size, stride, tile_size)
+                ]
+                stl = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+                result = _resize_device_layout(
+                    stl,
+                    size,
+                    tile_size,
+                    old_host_stride=stride,
+                    new_host_stride=tile_stride,
+                )
+                expected = SpyreTensorLayout(
+                    tile_size, tile_stride, torch.float16, [0, 1, 2]
+                )
+                self.assertEqual(result, expected)
 
 
 def _mock_op_out_coords(op):
@@ -6329,6 +6546,76 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
         self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
 
+    def test_a_copy_of_a_permuted_source_is_resized_by_its_strides(self):
+        # Attention scores [8, 8, 512, 512] at host strides
+        # (512, 4096, 32768, 1), read by ops tiling d0 by 2. Without the
+        # strides the resize cannot tell d0 from d1 or the tile count; the
+        # copy kept the full-size device layout, twice its reservation.
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device, dtype = torch.device("cpu"), torch.float16
+        size, stride, order = [8, 8, 512, 512], [512, 4096, 32768, 1], [1, 0, 2, 3]
+        tile_size, tile_stride = [4, 8, 512, 512], [512, 2048, 16384, 1]
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, size, device, dtype
+        )
+        full_buf.layout = FixedTiledLayout(
+            device,
+            dtype,
+            [Integer(x) for x in size],
+            [Integer(x) for x in stride],
+            SpyreTensorLayout(size, stride, dtype, order, ElementArrangement.STANDARD),
+        )
+        loader = TensorBox(StorageBox(full_buf)).make_loader()
+        readers = []
+        for name in ("op_a", "op_b"):
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=loader,
+                ranges=[Integer(x) for x in tile_size],
+            )
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(x) for x in tile_size]),
+                data=pw.data.data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,),
+                loop_count=[Integer(2)],
+                loop_tiled_dims=[[0]],
+                tiled_dims_per_read=[[[]]],
+            )
+            V.graph.name_to_buffer[name] = op
+            readers.append(op)
+        operations = [full_buf, *readers]
+        plans = _plan_read_copies(operations, [((0,), readers, {})])
+        _insert_all_read_copy_ops(operations, plans)
+        (copy,) = [
+            op
+            for op in operations
+            if op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        self.assertEqual(
+            copy.layout.device_layout,
+            SpyreTensorLayout(tile_size, tile_stride, dtype, order),
+        )
+
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
@@ -9581,20 +9868,12 @@ class TestPredictFrame(unittest.TestCase):
     def test_unit_extent_level_followed_by_another_level(self):
         """A dim tiled to extent 1 by a *non-final* level.
 
-        The single-level cases above pass under a one-shot full->tile resize;
-        this one does not, which is why ``_predict_output_layout`` resizes once
-        per level. ``_resize_device_layout`` matches size-1 device dims to a
-        size-1 host dim by size alone (ir.py:236) -- no stride tiebreak, no
-        one-to-one constraint -- so once level 1 puts host dim 0 at extent 1,
-        level 2 re-matches the one-stick tile-count dim onto it and collapses
-        its stride to the ``-1`` sentinel.  A single resize never sees that
-        intermediate state and leaves the real stride there, predicting
-        stride_map [64, 64, -1, 1] against an applied [64, -1, -1, 1].
-
-        Needs all three: a dim tiled to extent 1, at a non-final level, with a
-        stick host dim of exactly one stick (64 elems at fp16) so a second
-        size-1 device dim exists to be mis-matched.  Drop any one and a
-        one-shot resize agrees.
+        With a stick host dim of exactly one stick (64 elems at fp16), the
+        tile-count dim has size 1 too. ``_resize_device_layout`` used to match
+        it to host dim 0 by size once level 1 put that at extent 1, collapsing
+        its stride to ``-1`` at level 2, which a one-shot full->tile resize
+        never did; hence ``_predict_output_layout`` resizes once per level,
+        as ``_divide_ranges`` does.
         """
         self._apply_and_compare(
             (2, 512, 64),
@@ -10937,6 +11216,42 @@ class TestPlannedFullBufferLayout(unittest.TestCase):
         ]
         self.assertEqual(combine.loop_info.squeezed_advance_per_read, [])
 
+    def test_full_buffer_grown_back_from_a_permuted_tile(self):
+        # Where no full layout was planned, the full buffer's is grown back
+        # from the tile's. This op writes its output with dim 1 outermost and
+        # is tiled on dim 0, the inner one, so the outer dim's stride shrinks
+        # with the tile and has to grow back with the full buffer.
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+        from torch_spyre._inductor.wsr.coarse_tile import _allocate_full_buffer
+
+        size, stride = [64, 64, 128], [128, 8192, 1]
+        op = _make_real_tiled_op("pw_permuted", size)
+        original = SpyreTensorLayout(size, stride, torch.float16, [0, 1, 2])
+        op.layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(s) for s in size],
+            [Integer(s) for s in stride],
+            original,
+        )
+        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        self.assertEqual(
+            op.layout.device_layout,
+            SpyreTensorLayout([16, 64, 128], [128, 2048, 1], torch.float16, [0, 1, 2]),
+        )
+
+        operations = V.graph.operations
+        operations.append(op)
+        full = _allocate_full_buffer(
+            op,
+            [Integer(s) for s in size],
+            tuple(Integer(s) for s in stride),
+            operations,
+            0,
+        )
+        self.assertEqual(full.layout.device_layout, original)
+
 
 class TestDeriveTilingGroups(unittest.TestCase):
     """derive_tiling_groups — consecutive runs of ops running one loop nest."""
@@ -10955,6 +11270,7 @@ class TestDeriveTilingGroups(unittest.TestCase):
         choices = {"op1": spec, "op2": spec, "op4": spec}
         groups = derive_tiling_groups(g, choices)
         self.assertEqual(self._names(groups), [["op1", "op2"], ["op4"]])
+        self.assertEqual([nest for _, nest in groups], [(4,), (4,)])
 
     def test_nest_change_breaks_the_run(self):
         g = self._graph_of(["op0", "op1"])
@@ -10979,6 +11295,75 @@ class TestDeriveTilingGroups(unittest.TestCase):
         g = self._graph_of(["op0", "op1"])
         self.assertEqual(derive_tiling_groups(g, {}), [])
         self.assertEqual(derive_tiling_groups(g, {"op0": TileSpec()}), [])
+
+
+class TestDeriveTilingGroupsMisreads(unittest.TestCase):
+    """A run of one nest breaks at a consumer that does not read a producer of
+    its stretch tile by tile; the stretch outlives the break and ends where the
+    nest changes. ``tile_misread`` is the per-edge test (covered on the card
+    in ``test_solver_auto_coarse_tiling``); here it is a table."""
+
+    def _groups(self, nests, reads, misreads):
+        """``nests``: op name -> nest; ``reads``: op name -> producers it
+        reads; ``misreads``: the ``(producer, consumer)`` pairs that misread."""
+        ops = []
+        for name in nests:
+            op = MagicMock()
+            op.get_name.return_value = name
+            op.get_operation_name.return_value = name
+            ops.append(op)
+        choices = {
+            name: TileSpec(tuple(TileAxis(i, c) for i, c in enumerate(nest)))
+            for name, nest in nests.items()
+            if nest
+        }
+
+        def read_writes(op):
+            names = reads.get(op.get_name(), ())
+            return SimpleNamespace(reads=[SimpleNamespace(name=n) for n in names])
+
+        def misread(graph, producer, _ps, consumer, _cs, _read):
+            pair = (producer.get_name(), consumer.get_name())
+            return "misread" if pair in misreads else None
+
+        with (
+            patch.object(coarse_tiling_module, "op_read_writes", read_writes),
+            patch.object(coarse_tiling_module, "tile_misread", misread),
+        ):
+            groups = derive_tiling_groups(_graph(ops), choices)
+        return [[o.get_name() for o in group] for group, _ in groups]
+
+    def test_a_misread_starts_a_new_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, {("p", "c")}),
+            [["p"], ["c"]],
+        )
+
+    def test_a_reader_in_step_shares_the_group(self):
+        self.assertEqual(
+            self._groups({"p": (2,), "c": (2,)}, {"c": ["p"]}, set()), [["p", "c"]]
+        )
+
+    def test_the_stretch_outlives_a_split(self):
+        # c misreads a, which is already in an earlier group; c still breaks.
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (2,), "c": (2,)},
+                {"b": ["a"], "c": ["a", "b"]},
+                {("a", "b"), ("a", "c")},
+            ),
+            [["a"], ["b"], ["c"]],
+        )
+
+    def test_a_nest_change_ends_the_stretch(self):
+        self.assertEqual(
+            self._groups(
+                {"a": (2,), "b": (4,), "c": (2,), "d": (2,)},
+                {"d": ["a", "c"]},
+                {("a", "d")},
+            ),
+            [["a"], ["b"], ["c", "d"]],
+        )
 
 
 class TestDerivedBases(unittest.TestCase):
@@ -11085,6 +11470,21 @@ class TestCoarseTilingPassEquivalence(unittest.TestCase):
         self.assertEqual(self._loop_fields(got), ref_fields)
         self.assertEqual(list(got.data.ranges), ref_ranges)
         self.assertEqual(list(got.data.ranges), [Integer(64), Integer(64)])
+
+    def test_two_equal_spec_runs_become_two_groups_with_distinct_hint_ids(self):
+        spec = TileSpec((TileAxis(0, 4),))
+        ops = [self._bare([256], n) for n in ("op0", "op1", "op2")]
+        g = _graph(ops)
+        CoarseTilingPass({"op0": spec, "op2": spec}).apply_pass(g)
+        hint_ids = [[h.hint_id for h in op.dim_hints] for op in (ops[0], ops[2])]
+        self.assertEqual(hint_ids, [[0], [1]])
+        self.assertNotEqual(
+            tuple(ops[0].loop_info.loop_group_id),
+            tuple(ops[2].loop_info.loop_group_id),
+        )
+        # op1 was never in a group, so it is untiled and unhinted.
+        self.assertEqual(getattr(ops[1], "dim_hints", []), [])
+        self.assertEqual(ops[1].data.ranges[0], Integer(256))
 
     def test_pass_inputs_match_hint_path_structurally(self):
         # Two independent ops in one group: prove the group derivation and
@@ -11241,13 +11641,26 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             _drain_lifetime_end_overrides,
         )
 
-        plan = SimpleNamespace(storage_name="buf2")
+        plan = SimpleNamespace(storage_name="buf2", collective=None)
         overrides = {"buf2": 3, "other": 9}
         _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 7)
         self.assertEqual(overrides, {"buf2": 7, "other": 9})
         # max(): a later shorter measurement never shrinks a longer end.
         _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 5)
         self.assertEqual(overrides["buf2"], 7)
+
+    def test_collective_drain_keeps_the_storage_lifetime(self):
+        """The collective reads the storage after the drain, so the storage's
+        own lifetime already covers the drain; extending it to the graph exit
+        would hold every layer's carry in LX until the last layer."""
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _drain_lifetime_end_overrides,
+        )
+
+        plan = SimpleNamespace(storage_name="buf2", collective=_SentinelOp("ar"))
+        overrides = {"buf2": 3}
+        _drain_lifetime_end_overrides(overrides, {"buf2": plan}, 7)
+        self.assertEqual(overrides, {"buf2": 3})
 
     def test_drain_lifetime_extension_rejects_stale_in_place_handoff(self):
         """A post-loop reader cannot reuse a carry kept live for its drain."""
@@ -11293,7 +11706,7 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
 
         allocator = CoOptimizingAllocator(MagicMock(), size=4096)
         allocator._validated_drain_plans = {
-            "carry": SimpleNamespace(storage_name="carry")
+            "carry": SimpleNamespace(storage_name="carry", collective=None)
         }
         divisions = {op.name: [CoreDivision(splits={})] for op in ops}
         with (
@@ -11318,12 +11731,15 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
             patch.object(
                 allocator, "_residency_by_buf", return_value=dict.fromkeys(by_name)
             ),
+            patch.object(allocator, "_parent_residency_edges", return_value={}),
             patch.object(allocator, "_cd_parent_matches", return_value={}),
             patch.object(allocator, "_cd_parent_relayouts", return_value={}),
         ):
             in_place = allocator._determine_in_place_division_invariant(graph)
             self.assertEqual(in_place["reader"], ["carry"])
-            built = allocator._build_cd_bound_buffers(graph, in_place, divisions)
+            built = allocator._build_cd_bound_buffers(
+                graph, in_place, allocator_module._DivisionMap(divisions, set())
+            )
 
         # Before the fix this raises: carry.end_time=4 != reader.start_time+1=3.
         _check_in_place_relationships(built)
@@ -11513,6 +11929,125 @@ class TestDrainPlanPushAndLifetime(unittest.TestCase):
         self.assertEqual(calls[1].args, (storage_op, []))
         self.assertEqual(calls[1].kwargs["lower_anchor"], plan.anchor_op)
         self.assertIs(plan.anchor_op, graph.operations[-1])
+
+
+class TestDrainedCollective(unittest.TestCase):
+    """A loop carry whose only post-loop use is a collective, drained for it.
+
+    The plan accepts only the shape the push can rewrite -- one collective
+    reading the storage directly, after the whole loop -- and the rewrite moves
+    only that collective onto the drain.  The solve around it is exercised in
+    ``test_work_division.py``.
+    """
+
+    @staticmethod
+    def _buffer(name, size=(8, 64)):
+        from torch._inductor.ir import ComputedBuffer
+
+        buf = MagicMock(spec=ComputedBuffer)
+        buf.get_name.return_value = name
+        buf.get_layout.return_value = SimpleNamespace(
+            dtype=torch.float16,
+            size=list(size),
+            stride=[size[1], 1],
+            offset=0,
+            device_layout="device_layout",
+        )
+        return buf
+
+    @staticmethod
+    def _collective(operand, cls=None, name="all_reduce"):
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+
+        cls = cls or AllReduceAsyncFallback
+        op = cls.__new__(cls)
+        op.name = name
+        op.inputs = [operand]
+        return op
+
+    def test_only_a_sole_direct_collective_after_the_loop_is_planned(self):
+        from torch._inductor.ir import ReinterpretView, StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllGatherAsyncFallback
+        from torch_spyre._inductor.scratchpad.allocator import (
+            _sole_post_loop_collective,
+        )
+
+        carry = self._buffer("carry")
+        anchor = _LoopOp("anchor", (0,))
+        all_reduce = self._collective(TensorBox(StorageBox(carry)))
+        reader = _LoopOp("reader")
+
+        def plan(operations, accessors):
+            graph = SimpleNamespace(operations=operations)
+            return _sole_post_loop_collective(graph, "carry", accessors, anchor)
+
+        with self.subTest("all_reduce after the loop"):
+            self.assertIs(plan([carry, anchor, all_reduce], [all_reduce]), all_reduce)
+        with self.subTest("a second post-loop reader"):
+            ops = [carry, anchor, all_reduce, reader]
+            self.assertIsNone(plan(ops, [all_reduce, reader]))
+        with self.subTest("all_reduce before the loop ends"):
+            self.assertIsNone(plan([carry, all_reduce, anchor], [all_reduce]))
+        with self.subTest("the reader is not a collective"):
+            self.assertIsNone(plan([carry, anchor, reader], [reader]))
+        with self.subTest("the operand is a view of the carry"):
+            view = MagicMock(spec=ReinterpretView)
+            through_view = self._collective(TensorBox(view))
+            self.assertIsNone(plan([carry, anchor, through_view], [through_view]))
+        with self.subTest("all_gather is not rewritten yet"):
+            gather = self._collective(
+                TensorBox(StorageBox(carry)), cls=AllGatherAsyncFallback
+            )
+            self.assertIsNone(plan([carry, anchor, gather], [gather]))
+
+    def test_rewrite_moves_only_the_collective_onto_the_drain(self):
+        """The all_reduce reads and mutates the drain; the carry's own wrappers
+        and its other users are untouched."""
+        from collections import defaultdict
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+
+        carry, drain = self._buffer("carry"), self._buffer("drain")
+        operand = TensorBox(StorageBox(carry))
+        all_reduce = self._collective(operand)
+        as_user = TensorBox(StorageBox(all_reduce))
+        other_user = TensorBox(StorageBox(self._buffer("other")))
+        editor = GraphEditor.__new__(GraphEditor)
+        editor.lowering = SimpleNamespace(
+            name_to_users=defaultdict(list, {"carry": [as_user, other_user]})
+        )
+        self.assertEqual(all_reduce.get_mutation_names(), ["carry"])
+
+        editor.replace_collective_operand(all_reduce, "carry", drain)
+
+        self.assertEqual(GraphEditor.collective_operand_name(all_reduce), "drain")
+        self.assertEqual(all_reduce.get_mutation_names(), ["drain"])
+        self.assertIsNot(all_reduce.inputs[0], operand)
+        self.assertIs(operand.data.data, carry)
+        self.assertEqual(editor.lowering.name_to_users["carry"], [other_user])
+        self.assertEqual(editor.lowering.name_to_users["drain"], [as_user])
+
+    def test_rewrite_rejects_a_drain_with_another_layout(self):
+        """The collective's plan is sized from its operand's layout."""
+        from collections import defaultdict
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+
+        carry = self._buffer("carry")
+        operand = TensorBox(StorageBox(carry))
+        all_reduce = self._collective(operand)
+        editor = GraphEditor.__new__(GraphEditor)
+        editor.lowering = SimpleNamespace(name_to_users=defaultdict(list))
+        with self.assertRaisesRegex(ValueError, "not addressing-equivalent"):
+            editor.replace_collective_operand(
+                all_reduce, "carry", self._buffer("drain", size=(16, 64))
+            )
+        self.assertIs(all_reduce.inputs[0], operand)
 
 
 class _LoopOp:
