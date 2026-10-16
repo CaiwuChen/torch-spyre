@@ -2787,3 +2787,29 @@ def test_nonstick_flat_dense_projection_collapses_outer_dims():
         atol=0.2,
         rtol=0.2,
     )
+
+
+# Regression coverage for bounded outer non-stick steps (issue #5388).
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape,step,start",
+    [
+        ((2, 97, 256), 3, 0),
+        ((2, 96, 256), 3, 0),
+        ((1, 97, 256), 3, 0),
+        ((2, 98, 256), 5, 0),
+        ((2, 97, 256), 3, 1),
+        ((2, 7, 3, 128), 3, 0),
+    ],
+)
+def test_bounded_nonstick_slice(shape, step, start, dtype):
+    # Small dyadic values survive device conversion exactly; a wrong row or
+    # batch must fail an exact comparison instead of hiding in a tolerance.
+    gen = torch.Generator().manual_seed(5388)
+    x = torch.randint(-16, 17, shape, generator=gen).to(dtype) / 8
+
+    def fn(t):
+        return t[:, start::step, ...] + 1
+
+    got = torch.compile(fn, dynamic=False, fullgraph=True)(x.to("spyre")).cpu()
+    torch.testing.assert_close(got, fn(x), atol=0, rtol=0)
