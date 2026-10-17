@@ -451,12 +451,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         leaves the axis untiled. Keyed on the axis rather than the nesting level, so the
         symbols do not depend on how a candidate orders its levels -- the cost
         of a nest (a product of per-level trip counts) does not either. Empty
-        while no candidate is tiled."""
+        while no candidate is tiled.
+
+        The SA co-optimizer generates its tilings from :attr:`division_space`
+        instead of listing them as candidates, so every output dim that space
+        may tile is declared too."""
         keys = dict.fromkeys(
             (axis.host_dim, axis.is_reduction)
             for cd in self.core_divisions
             for axis in cd.tiling.axes
         )
+        space = self.division_space
+        if space is not None and space.tiling is not None:
+            keys.update(dict.fromkeys((dim, False) for dim in space.tiling.output_dims))
         return {
             (dim, is_red): sympy.Symbol(
                 f"tile_{self.name}_{'r' if is_red else 'o'}{dim}",

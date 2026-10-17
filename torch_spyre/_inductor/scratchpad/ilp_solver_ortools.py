@@ -1292,6 +1292,55 @@ class _SympyExprToCpSat(Printer):
         self._model.add(charge == 0).only_enforce_if(lit.Not())
         return charge
 
+    def _print_AppliedUndef(self, expr):
+        """An implemented function of one buffer's splits (a functor of its work
+        division, e.g. ``cost_model._decode_delivery_price``) -> one ``element``
+        lookup of that buffer's division into the functor's ``_imp_`` evaluated
+        at each of its candidate divisions. The owner is the one
+        division-choosing buffer whose split symbols the arguments are written
+        in; a functor of no buffer of this solve, or a candidate leaving an
+        argument unresolved, prices 0. Memoized, since ``expand`` repeats the
+        term once per residency gate."""
+        key = f"_imp_{expr}"
+        if key in self._sym_map:
+            return self._sym_map[key]
+        imp = getattr(expr, "_imp_", None)
+        if imp is None:
+            raise NotImplementedError(f"not implemented. expr: {expr}")
+        if not expr.free_symbols:
+            return self._print(sympy.sympify(imp(*(int(a) for a in expr.args))))
+        owners = {
+            id(w): w
+            for w, _ in (
+                self._buffer_map.get(s.name, (None, None)) for s in expr.free_symbols
+            )
+            if w is not None
+        }
+        if len(owners) != 1:
+            return 0
+        (wrapper,) = owners.values()
+        buffer = wrapper.buffer
+        if not expr.free_symbols <= set(buffer.sym_core_divs.values()):
+            return 0
+        table = []
+        for cd in buffer.core_divisions:
+            subs = {
+                sym: sympy.Integer(cd.splits.get(key, 1))
+                for key, sym in buffer.sym_core_divs.items()
+            }
+            args = [a.xreplace(subs) for a in expr.args]
+            if not all(a.is_Integer for a in args):
+                return 0
+            table.append(int(imp(*(int(a) for a in args))))
+        if min(table) == max(table):
+            return table[0]
+        name = f"{expr.func.__name__}_{buffer.sym_division.name}_{self._count}"
+        self._count += 1
+        var = self._model.new_int_var(min(table), max(table), name)
+        self._model.add_element(wrapper.division, table, var)
+        self._sym_map[key] = var
+        return var
+
     def _print_Pow(self, expr):
         if expr.exp == 2:
             base = self._print(expr.base)
