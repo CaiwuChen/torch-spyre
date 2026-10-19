@@ -32,8 +32,10 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import (
     CoOptimizingAllocator,
     ScratchpadAllocator,
+    _coarse_tile_loop_trip_count,
     _lx_planning_size,
 )
+from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.scratchpad.plan_solver import (
     BufferType,
     CoreDivisionLayoutSolver,
@@ -51,13 +53,13 @@ from torch_spyre._inductor.scratchpad.exhaustive_search import ExhaustiveSearchS
 try:
     from ortools.sat.python import cp_model  # noqa: F401
 
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+    from torch_spyre._inductor.scratchpad.cpsat_expr_printer import (
         _CORE_INV_SCALE,
         _MAX_PRODUCT_BOUND,
-        CpSatLayoutSolver,
         _SympyExprToCpSat,
         _simplify_eq_conjunction,
     )
+    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import CpSatLayoutSolver
 
     _HAS_ORTOOLS = True
 except ImportError:
@@ -137,11 +139,8 @@ class TestExhaustiveSearchResidency(TestCase):
             residency_reason="no consumer reads it from LX",
         )
 
-        solver = ExhaustiveSearchSolver(
-            [producer, consumer, sink],
-            size=512,
-            inner_factory=GreedyLayoutSolver,
-            alignment=1,
+        solver = ExhaustiveSearchSolver.wrapping(GreedyLayoutSolver)(
+            [producer, consumer, sink], size=512, alignment=1
         )
         result = {
             buffer.name: buffer for buffer in solver.plan_layout_and_core_divisions()
@@ -199,6 +198,51 @@ class TestLxPlanningContract(TestCase):
                         ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
                     ):
                         _lx_planning_size()
+
+
+class TestCoarseTileLoopTripCount(TestCase):
+    """_coarse_tile_loop_trip_count: the same-group relayout cost multiplier
+    (cyang49's PR #5057 review -- a same-group candidate's price must scale
+    by the loop's real trip count, not price one tile's worth as if it ran
+    once).
+    """
+
+    @staticmethod
+    def _tiled(loop_count):
+        return CoarseTileInfo(
+            loop_group_id=(0,) * len(loop_count),
+            loop_count=loop_count,
+            loop_tiled_dims=[[] for _ in loop_count],
+            loop_tiled_reduction_dims=[[] for _ in loop_count],
+        )
+
+    def test_untiled_op_is_one_trip(self):
+        op = types.SimpleNamespace(loop_info=None)
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_single_level_concrete_count(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
+
+    def test_nested_levels_multiply(self):
+        op = types.SimpleNamespace(loop_info=self._tiled([2, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 8)
+
+    def test_symbolic_trip_count_falls_back_to_one_instead_of_crashing(self):
+        """A dynamic-shape loop bound (for_each_tile_lowering.py's
+        _extract_trip_count) can stamp an unresolved sympy.Symbol into
+        loop_count instead of a concrete int. int() on that raises TypeError;
+        the multiplier must fall back to 1 for that level rather than
+        propagate a symbolic value into RelayoutCandidate.cost_ns (annotated
+        float, consumed by min()/round() elsewhere in the solver)."""
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 1)
+
+    def test_symbolic_level_does_not_suppress_a_concrete_sibling_level(self):
+        n = sympy.Symbol("n", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_info=self._tiled([n, 4]))
+        self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
 
 
 class TestDrainLifetimeBoundary(TestCase):
@@ -2789,6 +2833,37 @@ class TestInvScale(TestCase):
         self.assertEqual([v for v in raw if scale % v], [7])
         self.assertEqual([v for v in raw if 864 % v], [7])
         self.assertEqual(self._max_error(raw, 864), self._max_error(raw, 288))
+
+    def test_tile_counts_past_the_core_count_keep_every_reciprocal(self):
+        # A tile count is any divisor of its axis, so it can pass the core
+        # count a _CORE_INV_SCALE-sized cap was sized for. 2048 used to trip
+        # the power-of-two assert; 1536 alone used to floor 1024 // v to 0.
+        for label, raw in {
+            "exact power of two": [1, 2048],
+            "power of two with a coprime": [1, 2048, 3, 7],
+            "no power of two past 1": [1, 1536],
+        }.items():
+            with self.subTest(label):
+                scale = self._scale(raw)
+                self.assertGreaterEqual(min(scale // v for v in raw), 1)
+                self.assertFalse([v for v in raw if not v & (v - 1) and scale % v])
+                self.assertLessEqual(self._max_error(raw, scale), self.MAX_ERROR)
+
+
+class TestObjectiveCostParams(TestCase):
+    """Every solver's objective drops the tile-height derates."""
+
+    def test_the_objective_neutralizes_the_derates(self):
+        from torch_spyre._inductor.cost_model import CostParams, coarse_underfill_eff
+        from torch_spyre._inductor.scratchpad.allocator import _COST_PARAMS
+
+        # A symbolic tile height leaves no fractional power behind.
+        is_lx, split = sympy.symbols("is_lx_buf0 split_buf0_d0", positive=True)
+        rpc = (256 * (1 - is_lx) + 1024 * is_lx) / split
+        eff = sympy.sympify(coarse_underfill_eff(rpc, 512, _COST_PARAMS))
+        self.assertFalse(eff.free_symbols)
+        self.assertEqual(float(eff), 1.0)
+        self.assertLess(coarse_underfill_eff(2.0, 512, CostParams()), 1)
 
 
 if __name__ == "__main__":
