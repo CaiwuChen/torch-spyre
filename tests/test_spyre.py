@@ -1105,6 +1105,42 @@ class TestSpyre(TestCase):
         x[3, 3, 3, 3] = y
         self.assertEqual(x.cpu()[3, 3, 3, 3], y, atol=1e-3, rtol=1e-3)
 
+    @parametrize("dtype", [torch.float16, torch.int64])
+    def test_eager_ne_scalar_runs_on_device(self, dtype):
+        """``x != scalar`` runs on device in eager mode, not on the CPU fallback.
+
+        ``aten.ne.Scalar`` decomposes to ``aten.ne.Scalar_out``; both overloads
+        must have a Spyre kernel (#5622). A ``FallbackWarning`` is raised as an
+        error so any CPU fallback fails the test.
+        """
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        x_cpu = torch.arange(8, dtype=dtype)
+        x = x_cpu.to("spyre")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            result = x != 3
+
+        self.assertEqual(result.dtype, torch.bool)
+        self.assertEqual(result.device.type, "spyre")
+        self.assertEqual(result.cpu(), x_cpu != 3)
+
+    def test_eager_ne_scalar_out_runs_on_device(self):
+        """``torch.ne(x, scalar, out=...)`` runs on device (``ne.Scalar_out``)."""
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        x_cpu = torch.arange(8, dtype=torch.float16)
+        x = x_cpu.to("spyre")
+        out = torch.empty(8, dtype=torch.bool, device="spyre")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            ret = torch.ne(x, 3.0, out=out)
+
+        self.assertIs(ret, out)
+        self.assertEqual(out.cpu(), torch.ne(x_cpu, 3.0))
+
 
 if __name__ == "__main__":
     run_tests()
