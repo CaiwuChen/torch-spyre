@@ -554,10 +554,18 @@ def _single_arg_op_layout(
                 # a staggered EA on the input still describes the output. When
                 # the reduction consumes the stick dim the stagger is gone and
                 # the output stays STANDARD. See #5553.
+                #
+                # Guard for DL16_TO_FP32: ea_restore requires the innermost
+                # device dim to hold exactly elems_per_stick elements (i.e. a
+                # full, non-folded stick). If the output layout has a smaller
+                # innermost device dim the stagger cannot be restored on D2H, so
+                # leave the EA as STANDARD (the reduction result is numerically
+                # correct regardless of element order).
                 if (
                     stl.element_arrangement in STAGGERED_EAS
                     and reduction_var is not None
                     and reduction_var not in x_stick_expr.free_symbols
+                    and out_stl.stride_map[-1] != -1
                 ):
                     out_stl = out_stl.with_element_arrangement(stl.element_arrangement)
                 return [out_stl]
