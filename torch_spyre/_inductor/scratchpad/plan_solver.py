@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
@@ -521,6 +521,21 @@ class RelayoutCharge(sympy.Function):
         i = int(round(division))
         return is_lx * (prices[i] if 0 <= i < len(prices) else 0)
 
+    def _sympystr(self, printer):
+        """``str()`` names the priced divisions only, ``prices={4: 65, 12: 147}``:
+        the table is mostly zeros (a copy is priced on few of its source's
+        divisions), and positional prices make the reader count to find which
+        division a price belongs to. ``srepr`` is untouched, so the dump stays
+        lossless."""
+        is_lx, division, *prices = self.args
+        priced = ", ".join(
+            f"{i}: {printer._print(p)}" for i, p in enumerate(prices) if p != 0
+        )
+        return (
+            f"{self.func.__name__}({printer._print(is_lx)}, "
+            f"{printer._print(division)}, prices={{{priced}}})"
+        )
+
 
 def solved_bindings(buffers: Sequence["LifetimeBoundBuffer"]) -> dict:
     """The objective's symbols as the solved plan fixes them: ``is_lx`` is 1
@@ -559,6 +574,8 @@ def cost_expr_record(
     bundle_terms: Sequence[tuple[list[str], sympy.Expr]],
     buffers: Sequence["LifetimeBoundBuffer"],
     params: object = None,
+    off_expression_ns: Mapping[str, float] | None = None,
+    score_ns: float | None = None,
     *,
     context: dict | None = None,
 ) -> dict:
@@ -567,6 +584,12 @@ def cost_expr_record(
     ``parse_expr`` restores them), the solved symbol bindings, and every term
     evaluated under them. ``buffers`` are the solver's returned buffers;
     ``buffers`` names (the graph's stores) are what a reader joins on.
+
+    ``objective_ns`` is ``cost_expr`` alone. ``off_expression_ns`` is what the
+    engine adds outside it for this plan
+    (:meth:`CoreDivisionLayoutSolver.off_expression_ns`), and ``score_ns`` the
+    total the engine minimized (:meth:`CoreDivisionLayoutSolver.score_ns`),
+    ``objective_ns`` for an engine that minimizes ``cost_expr`` itself.
 
     ``divisions`` carries each buffer's candidate core counts, the one chosen,
     its producers, its residency ``reason`` when one kept it out of LX, and the
@@ -682,6 +705,8 @@ def cost_expr_record(
         },
         "bindings": {str(k): v for k, v in bindings.items()},
         "objective_ns": objective_ns,
+        "off_expression_ns": dict(off_expression_ns or {}),
+        "score_ns": objective_ns if score_ns is None else score_ns,
     }
     # Additive only: context describes the record, it does not get to redefine
     # it. Without this a caller key named `bundles` would replace the terms.
@@ -1147,6 +1172,16 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
     @classmethod
     def chooses_core_divisions(cls) -> bool:
         return True
+
+    def off_expression_ns(self) -> dict[str, float]:
+        """The terms this engine's objective adds outside ``cost_expr`` for the
+        solved plan, by name, in ns as added; the cost dump reports them."""
+        return {}
+
+    def score_ns(self) -> Optional[float]:
+        """The total this engine minimized for the solved plan, in ns, where
+        that is not ``cost_expr`` alone; the cost dump reports it."""
+        return None
 
     @abstractmethod
     def plan_layout_and_core_divisions(
