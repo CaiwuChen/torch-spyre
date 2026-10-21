@@ -3189,10 +3189,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_ne_scalar_eager", "test_ne_scalar_eager_cpu"): {
             "expect_fail": {
                 "int64_above_2e24": _CMP_BIGINT_REASON,
-                "fp16_nan": "a NaN operand is false for ne on device, true on CPU",
+                "fp16_nan": (
+                    "a NaN operand gives False for ne on device, True on CPU: "
+                    "spyreop.compare predicates are IEEE-ordered, same as "
+                    "torch.compile (#5190)"
+                ),
             },
             "expect_raise": {
+                # 3798
                 "fp16_offset_view": "requires a stick-aligned storage_offset",
+                # 5383
+                "fp16_unaligned_slice_32": "requires a stick-aligned storage_offset",
             },
             "param_sets": {
                 "fp16_int_scalar": (torch.arange(8, dtype=torch.float16), 3),
@@ -3243,6 +3250,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.arange(128, dtype=torch.float16).reshape(8, 16),
                     3,
                     lambda x, s: x[1:] != s,
+                ),
+                "fp16_unaligned_slice_32": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    40,
+                    lambda x, s: x[:, 32:] != s,
+                ),
+                "fp16_aligned_slice_64": (
+                    torch.arange(256, dtype=torch.float16).reshape(2, 128),
+                    3,
+                    lambda x, s: x[:, 64:] != s,
                 ),
             },
         },
@@ -8891,8 +8908,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_ne_scalar_eager_cpu(self, x, scalar, fn=None):
         # Eager x != scalar must run on device. A CPU fallback gives the right
-        # values, so FallbackWarning is an error here; compile is off because the
-        # compiled int64 compare warns for its int64 -> fp32 cast (#5622).
+        # values, so FallbackWarning is an error here; compile is off because
+        # this test focuses specifically on eager execution.
         fn = fn or (lambda x, s: x != s)
 
         def no_fallback(x, s):
