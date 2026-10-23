@@ -9410,7 +9410,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=True,
             cpu_eager_result=fn(x, scalar),
         )
-        
+
     def test_cmp_cond_subgraph_cpu(self, op, n, x):
         # Regression: 0-dim int compare (eq/ne/le/gt/ge) inside a torch.cond
         # branch must not be erroneously skipped by the trip-counter carve-out.
