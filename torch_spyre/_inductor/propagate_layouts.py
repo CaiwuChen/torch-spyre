@@ -773,16 +773,21 @@ def _single_arg_op_layout(
         ]
         if out_stl is not None
     ]
-    if output_stls:
-        return output_stls
-    candidates = _candidate_output_stls(
-        out_coords,
-        output_dep,
-        c_size,
-        c_stride,
-        stick_expr,
-        out_dtype_for_layout,
+    candidates = (
+        list(output_stls)
+        if output_stls
+        else _candidate_output_stls(
+            out_coords,
+            output_dep,
+            c_size,
+            c_stride,
+            stick_expr,
+            out_dtype_for_layout,
+        )
     )
+    dense_stl = _generic_layout_for(output)
+    if dense_stl not in candidates:
+        candidates.append(dense_stl)
     sparse_stl = SpyreTensorLayout(
         [*c_size, get_elem_in_stick(out_dtype_for_layout)],
         [*c_stride, -1],

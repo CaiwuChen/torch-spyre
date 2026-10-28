@@ -1452,6 +1452,8 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     - A bare variable (symbol)
     - Zero
     """
+    if isinstance(stick_expr, sympy.floor) and len(stick_expr.args) == 1:
+        stick_expr = stick_expr.args[0]
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -2539,6 +2541,7 @@ def compute_restickify_needed(
         and bool(outer_axes_with_stick_var)
         and in_host.size != getattr(out_dep, "size", None)
         and not is_sparse_stl(out_stl)
+        and not is_sparse_stl(in_stl)
     )
     if (
         not factorized_layout_mismatch
@@ -2637,10 +2640,40 @@ def compute_restickify_needed(
             return True, expanded_stl
 
     if is_sparse_stl(out_stl) and not is_sparse_stl(in_stl):
+        # Use the consumer's flat dimension count (from out_stl or out_dep.ranges)
+        # to build a 1D Sparse target, matching the same logic as is_unaligned_view.
+        stick_size = in_stl.elems_per_stick()
+        # out_stl is already Sparse [N, stick_size] sm=[1,-1]; read N directly.
+        flat_n = (
+            int(out_stl.device_size[0])
+            if len(out_stl.device_size) == 2
+            else int(  # noqa: SIM210
+                math.prod(concretize_expr(r) for r in out_dep.ranges.values())
+            )
+        )
         sparse_in_stl = SpyreTensorLayout(
-            [int(concretize_expr(s)) for s in in_host.size]
-            + [in_stl.elems_per_stick()],
-            [int(concretize_expr(s)) for s in in_host.stride] + [-1],
+            [flat_n, stick_size],
+            [1, -1],
+            in_stl.device_dtype,
+        )
+        return True, sparse_in_stl
+
+    if is_unaligned_view:
+        # Produce a 1D Sparse layout sized to the *consumer's* flat view.
+        # Using in_host.size ([8, 65]) would give a 2D Sparse target
+        # ([8, 65, 64] sm=[65, 1, -1]) whose device_coordinates produce a
+        # non-integer coefficient (65*c0/64) when compacted to 1D Dense,
+        # causing a codegen error.  Instead derive the flat element count
+        # from out_stl (the consumer's Dense STL, e.g. [9,64] sm=[64,1])
+        # and build a 1D Sparse target ([N, stick_size] sm=[1, -1]) that
+        # both the ReStickify and the subsequent compact can handle cleanly.
+        stick_size = in_stl.elems_per_stick()
+        # Total elements in the consumer's Dense output (e.g. 9*64 - backgap).
+        # Use out_dep.ranges to get the exact flat iteration count directly.
+        flat_n = int(math.prod(concretize_expr(r) for r in out_dep.ranges.values()))
+        sparse_in_stl = SpyreTensorLayout(
+            [flat_n, stick_size],
+            [1, -1],
             in_stl.device_dtype,
         )
         return True, sparse_in_stl

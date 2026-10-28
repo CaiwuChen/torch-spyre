@@ -81,6 +81,7 @@ from .pass_utils import (
     host_coordinates,
     identify_matmul_inputs,
     is_restickify_coords,
+    is_sparse_stl,
     lower_pad_sequence,
     patch_env,
     redirect_computed_buffer_reads,
@@ -673,7 +674,7 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     write_dep = _write_dep(op)
     stl = out_layout.device_layout
 
-    if old_sym is None:
+    if old_sym is None or is_sparse_stl(stl):
         _pad_elided_dim(op)
         logger.debug(
             "insert_restickify_padding: grew size-1 output %s allocation",
