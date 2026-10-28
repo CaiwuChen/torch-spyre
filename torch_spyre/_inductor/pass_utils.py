@@ -2534,8 +2534,15 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
+    is_unaligned_view = (
+        bool(stick_syms)
+        and bool(outer_axes_with_stick_var)
+        and in_host.size != getattr(out_dep, "size", None)
+        and not is_sparse_stl(out_stl)
+    )
     if (
         not factorized_layout_mismatch
+        and not is_unaligned_view
         and in_stick_offset_free
         and stick_compatible([idc, out_idc])
     ):
@@ -2628,6 +2635,15 @@ def compute_restickify_needed(
         expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
         if expanded:
             return True, expanded_stl
+
+    if is_sparse_stl(out_stl) and not is_sparse_stl(in_stl):
+        sparse_in_stl = SpyreTensorLayout(
+            [int(concretize_expr(s)) for s in in_host.size]
+            + [in_stl.elems_per_stick()],
+            [int(concretize_expr(s)) for s in in_host.stride] + [-1],
+            in_stl.device_dtype,
+        )
+        return True, sparse_in_stl
 
     return True, compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc

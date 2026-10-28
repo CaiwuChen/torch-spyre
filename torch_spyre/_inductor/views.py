@@ -997,14 +997,21 @@ def align_tensors_pure(
         if var is None:
             # A constant/broadcast innermost coordinate has no stick loop to split.
             continue
-        has_outer_stick_coordinate = any(
-            term.var == var and term.den == physical_stick_size for term in terms[:-1]
-        )
-        if not has_outer_stick_coordinate:
+        outer_stick_mods = [
+            _concrete_alignment_value(term.mod)
+            for term in terms[:-1]
+            if term.var == var and term.den == physical_stick_size
+        ]
+        if not outer_stick_mods:
             continue
+        # The outer-stick coordinate's own ``mod`` ends its stick span, so a
+        # boundary there (for example 65 from a flattened [R, 65] fp32 tensor)
+        # only leaves a partial last stick, which is legal.  Only a boundary
+        # strictly inside the span cuts a stick.
+        outer_stick_span = max(outer_stick_mods)
         for boundary_expr in splits[var][1:-1]:
             boundary = _concrete_alignment_value(boundary_expr)
-            if boundary % int(physical_stick_size) != 0:
+            if boundary < outer_stick_span and boundary % int(physical_stick_size) != 0:
                 raise UnalignedStickSplit(
                     tensor_index,
                     var,
