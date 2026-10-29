@@ -15,6 +15,7 @@
 import copy
 import dataclasses
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import cast
@@ -29,7 +30,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import expand_sparse, is_sparse_stl, patch_env
+from .pass_utils import concretize_expr, expand_sparse, is_sparse_stl, patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -279,6 +280,69 @@ def _create_compact_node(
     return compact_buff
 
 
+def _create_tighten_node(sparse_buff: ComputedBuffer) -> ComputedBuffer:
+    """Copy a 2D Sparse buffer into a 1D Sparse one whose sticks are contiguous.
+
+    ``sparse_buff`` is the restickify output (for example host [8, 65], device
+    [8, 65, 64]).  Codegen writes each of its rows padded to a stick multiple
+    (65 -> 128 sticks), so consecutive rows sit 128 sticks apart.  The compact op
+    that follows reads the sticks as one flat run, which needs them 65 apart.  This
+    copy loops over the host dims, reads each stick at its padded position, and
+    writes it at ``65 * row + col`` in a [N, stick] sm=[1, -1] layout.
+    """
+    from torch._inductor.ir import Pointwise
+
+    graph_lowering = V.graph
+    fx_graph = graph_lowering.graph
+    patch_env(graph_lowering)
+
+    host_layout = sparse_buff.layout
+    size = [concretize_expr(s) for s in host_layout.size]
+    stride = [concretize_expr(s) for s in host_layout.stride]
+    loader = sparse_buff.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        tighten_fx_node = fx_graph.create_node(
+            "call_function", torch.ops.spyre.restickify.default, ()
+        )
+
+    with (
+        IRNode.current_origins(OrderedSet([tighten_fx_node])),
+        V.set_current_node(tighten_fx_node),
+    ):
+        pw = Pointwise.create(
+            device=host_layout.device,
+            dtype=host_layout.dtype,
+            inner_fn=inner_fn,
+            ranges=size,
+            origin_node=tighten_fx_node,
+        )
+        pw.realize()
+
+    tighten_buff = pw.data.data
+    assert isinstance(tighten_buff, ComputedBuffer)
+    tighten_buff.origins = OrderedSet([tighten_fx_node])
+    graph_lowering.env[tighten_fx_node] = pw
+
+    stick = host_layout.device_layout.elems_per_stick()
+    tighten_stl = SpyreTensorLayout(
+        [math.prod(size), stick], [1, -1], host_layout.device_layout.device_dtype
+    )
+    tighten_buff.layout = FixedTiledLayout(
+        host_layout.device,
+        host_layout.dtype,
+        size,
+        stride,
+        tighten_stl,
+        offset=host_layout.offset,
+    )
+    return tighten_buff
+
+
 def _create_restickify_node(
     restick_arg_info: RestickifyArgInfo, op: ComputedBuffer
 ) -> tuple[str, ComputedBuffer]:
@@ -407,8 +471,12 @@ def insert_restickify_on_node_inputs(
                 from torch_spyre._inductor.propagate_layouts import _generic_layout_for
 
                 dense_consumer_stl = _generic_layout_for(consumer_layout)
+                tighten_buff = _create_tighten_node(restick_buff)
+                operations.remove(tighten_buff)
+                operations.insert(op_index, tighten_buff)
+                op_index += 1
                 compact_buff = _create_compact_node(
-                    restick_buff, dense_consumer_stl, consumer_layout, op
+                    tighten_buff, dense_consumer_stl, consumer_layout, op
                 )
                 operations.remove(compact_buff)
                 operations.insert(op_index, compact_buff)
