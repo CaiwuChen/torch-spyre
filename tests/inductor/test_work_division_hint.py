@@ -1304,6 +1304,8 @@ def test_lx_relayout_planner_uses_projected_read_ownership(reader):
         mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
         mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
         mock_patch.object(lx_relayout_module, "Pointwise", SimpleNamespace),
+        # This fixture tests projected ownership with synthetic access geometry.
+        mock_patch.object(lx_relayout_module, "is_partial_lx_read", return_value=False),
         mock_patch.object(
             lx_relayout_module, "op_read_writes", side_effect=read_writes
         ),
@@ -1782,6 +1784,7 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     with (
         config.patch(lx_planner_relayout=enabled, core_id_k_fast_emission=True),
         _emitted_kernels() as kernels,
+        _capture_backend_output_dirs() as directories,
     ):
         actual, _ = run_and_get_code(
             torch.compile(
@@ -1804,6 +1807,34 @@ def test_unhinted_moe_down_route_preserves_the_chosen_split(enabled):
     assert [split for split in splits if split > 1] == [4, 4, 2]
     assert math.prod(splits) == config.sencores
     down_arg = next(arg for arg in bmm_specs[0].args if not arg.is_input)
+    # The two K halves of each output slice sit on neighbouring cores, so their
+    # partial sums cross one ring hop and the pairs never share a ring segment.
+    output_dims = [
+        dim
+        for dim, (_, split) in bmm_specs[0].iteration_space.items()
+        if split > 1
+        and any(
+            dim in coordinate.free_symbols for coordinate in down_arg.device_coordinates
+        )
+    ]
+    partners = {}
+    for core in range(config.sencores):
+        owner = tuple(
+            int(bmm_specs[0].core_id_to_work_slice[dim].subs(Symbol("core_id"), core))
+            for dim in output_dims
+        )
+        partners.setdefault(owner, []).append(core)
+    pairs = [[core, core + 1] for core in range(0, config.sencores, 2)]
+    assert sorted(partners.values()) == pairs
+    # The emitted SDSC gives K's split to `in`, not to the restored unit loop.
+    (bmm_sdsc,) = [
+        root
+        for directory in directories
+        for path in directory.glob("sdsc_*.json")
+        for name, root in json.loads(path.read_text()).items()
+        if name.endswith(BATCH_MATMUL_OP)
+    ]
+    assert bmm_sdsc["numWkSlicesPerDim_"]["in"] == 2
     if enabled:
         copies = [spec for spec in specs if spec.completed_producer_cores]
         assert len(copies) == 1
@@ -2479,6 +2510,8 @@ if __name__ == "__main__":
     "case", ["hole", "offset", "reversed", "overlap", "tail", "crossing", "dynamic"]
 )
 def test_factored_slice_rejects_inexact_products(case):
+    from torch_spyre._inductor.slice_ownership import factor_slice_axis
+
     h, f = Symbol("head"), Symbol("feature")
     coordinate, extents, size, split = 2 * h + floor(f / 64), {h: 2, f: 128}, 4, 4
     if case == "hole":
@@ -2495,10 +2528,7 @@ def test_factored_slice_rejects_inexact_products(case):
         coordinate, extents, size, split = 3 * h + f, {h: 2, f: 3}, 6, 3
     else:
         extents[f] = Symbol("dynamic")
-    assert (
-        lx_relayout_module.factor_slice_axis(coordinate, size, split, _CORE_ID, extents)
-        is None
-    )
+    assert factor_slice_axis(coordinate, size, split, _CORE_ID, extents) is None
 
 
 @pytest.mark.parametrize(
@@ -2613,3 +2643,22 @@ def test_relayout_operation_frame_keeps_tensor_domains(source_cores, destination
         assert [
             int(formula.subs(_CORE_ID, core)) for core in range(physical_count)
         ] == [int(expected.subs(_CORE_ID, core)) for core in range(physical_count)]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_local_read_rollout_declines_before_graph_access(enabled):
+    class GraphAccess(Exception):
+        pass
+
+    class Graph:
+        def get_buffer(self, name):
+            raise GraphAccess
+
+    with config.patch(lx_extended_ownership=enabled):
+        if enabled:
+            with pytest.raises(GraphAccess):
+                lx_relayout_module.local_lx_subrange_source(Graph(), "source", [])
+        else:
+            assert not lx_relayout_module.local_lx_subrange_source(
+                Graph(), "source", []
+            )
