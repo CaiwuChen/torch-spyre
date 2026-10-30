@@ -2700,12 +2700,18 @@ def compute_restickify_needed(
     )
     layouts_differ = in_stl != out_stl
     factorized_layout_mismatch = is_factorized and layouts_differ
+    # An unaligned-view case: a reshape flattens a multi-dim input with an
+    # unaligned innermost dim (e.g. [8, 65].reshape(-1)).  The idc then has a
+    # single flat variable (Mod(c0, 64)), but align_tensors would reject it with
+    # UnalignedStickSplit.  Detect: single-variable access (flat/reshape) AND
+    # multi-dim input with unaligned last dim.
+    stick_size_elems = in_stl.elems_per_stick()
     is_unaligned_view = (
-        bool(stick_syms)
-        and bool(outer_axes_with_stick_var)
-        and in_host.size != getattr(out_dep, "size", None)
-        and not is_sparse_stl(out_stl)
+        not is_sparse_stl(out_stl)
         and not is_sparse_stl(in_stl)
+        and len(in_host.size) >= 2
+        and len(in_dep.ranges) == 1
+        and int(concretize_expr(in_host.size[-1])) % stick_size_elems != 0
     )
     if (
         not factorized_layout_mismatch
