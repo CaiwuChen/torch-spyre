@@ -8490,6 +8490,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float16)),
                 "3d_dim0": (0, cached_randn((4, 8, 128), dtype=torch.float16)),
                 "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float16)),
+                # Odd fp32 stick count: 68 elements span 3 fp32 sticks (#5604).
+                "2d_dim0_68": (0, cached_randn((8, 68), dtype=torch.float16)),
+                "3d_dim1_68": (1, cached_randn((3, 7, 68), dtype=torch.float16)),
             },
         },
         # FP32_TO_DL16 input: fp32 downcast to fp16 in-graph (x.to(fp16)).
@@ -8561,6 +8564,43 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_reduce_nonstick": (
                     -1,
                     cached_randn((4, 8, 128), dtype=torch.float32),
+                ),
+            },
+        },
+        # The fp32 -> fp16 cast after the reduction reads the propagated EA: a
+        # DL16_TO_FP32 input casts to STANDARD. A STANDARD-tagged sum instead casts
+        # to FP32_TO_DL16 and reads back permuted (an fp32 mean pool over tokens).
+        (
+            "test_ea_reduction_dl16tofp32_round_trip",
+            "test_ea_reduction_dl16tofp32_round_trip_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "amax": torch.amax,
+            },
+            "param_sets": {
+                "2d_stick": (-1, cached_randn((8, 128), dtype=torch.float16)),
+                "2d_dim0": (0, cached_randn((8, 128), dtype=torch.float16)),
+                "3d_dim1": (1, cached_randn((4, 8, 128), dtype=torch.float16)),
+                "3d_dim1_384": (1, cached_randn((2, 64, 384), dtype=torch.float16)),
+            },
+        },
+        # A staggered reduction output added to a STANDARD fp32 operand needs an EA
+        # shuffle before the add (#5673, implemented by #5495).
+        (
+            "test_ea_reduction_dl16tofp32_then_add",
+            "test_ea_reduction_dl16tofp32_then_add_cpu",
+        ): {
+            "param_sets": {
+                "2d_dim0": (
+                    cached_randn((64, 128), dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float32),
+                ),
+            },
+            "expect_fail": {
+                "2d_dim0": (
+                    "the DL16_TO_FP32 sum and the STANDARD y are added element by "
+                    "element without a shuffle, so the result is permuted (#5673)"
                 ),
             },
         },
@@ -13679,6 +13719,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return op(z, dim=dim)
 
         self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_dl16tofp32_round_trip_cpu(self, op, dim, x):
+        def fn(op, dim, x):
+            return op(x.to(torch.float32), dim=dim).to(torch.float16)
+
+        self.compare_with_cpu(fn, op, dim, x, cpu_compile=False, run_eager=False)
+
+    def test_ea_reduction_dl16tofp32_then_add_cpu(self, x, y):
+        def fn(x, y):
+            return x.to(torch.float32).sum(dim=0) + y
+
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
     def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
         # x_dst is a native dst-dtype (STANDARD) graph input; y is the src-dtype
