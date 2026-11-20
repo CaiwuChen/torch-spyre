@@ -39,6 +39,7 @@ test_suite_config:
         - names:
             - LxPlanning.*::test_to_dtype.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_round_trip_to_dtype.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_ea_reduction.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_flatten.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_permute.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_unbind.*_lx_planning_(pointwise|reduction)
