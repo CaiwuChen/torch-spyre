@@ -359,6 +359,26 @@ stick, 44 columns) host columns 32..43 are mapped to device positions 4..7,
   rejected at compile time with `cannot rescale device layout`, before any
   copy. The shuffle does not see these tensors.
 
+### Reductions
+
+A reduction over a dim other than the stick dim leaves each stick's elements in
+place, so its output keeps the input's element arrangement and a D2H copy
+restores it. A reduction over the stick dim consumes the stagger (`sum`, `amax`
+and `amin` do not depend on element order), so its output is `STANDARD`. An
+output stick with no host dim, or only size-1 ones, holds a single element and
+stays `STANDARD`. See issue [#5553][issue-5553].
+
+| Input EA | Reduced dim | Output EA |
+| :--- | :--- | :--- |
+| `DL16_TO_FP32` or `FP32_TO_DL16` | the stick dim | `STANDARD` |
+| `DL16_TO_FP32` or `FP32_TO_DL16` | any other dim | the input's |
+| `STANDARD` | any | `STANDARD` |
+
+A cast back after the reduction then sees the right arrangement: the fp16
+result of `x.to(torch.float32).sum(dim=0).to(torch.float16)` is `STANDARD`.
+
+[issue-5553]: https://github.com/torch-spyre/torch-spyre/issues/5553
+
 ### Supported inputs
 
 | Conversion | Stick dim | Result |
